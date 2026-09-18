@@ -16,6 +16,12 @@ import { parseCommandLine } from './parse.js'
 /** Strictness order used to aggregate decisions. */
 const RANK = { allow: 0, prompt: 1, forbidden: 2 }
 
+/**
+ * Risks a stored `allow` rule may never cover: the argument is a program, so
+ * approving the interpreter once must not approve arbitrary code later.
+ */
+const UNREMEMBERABLE_RISKS = new Set(['code-execution'])
+
 /** Programs whose first non-flag argument names a subcommand. */
 const SUBCOMMAND_PROGRAMS = new Set([
   'git', 'gh', 'pnpm', 'npm', 'yarn', 'bun', 'cargo', 'go', 'docker', 'podman',
@@ -345,7 +351,10 @@ export function evaluateCommandLine(request) {
     const matched = rules.filter(rule => ruleMatches(rule, simple))
     if (builtin !== null && builtin.decision !== 'allow') triggers.push({ command: simple.source, ...builtin })
     const forbidden = builtin?.decision === 'forbidden' || matched.some(rule => rule.decision === 'forbidden')
-    const allowed = matched.some(rule => rule.decision === 'allow')
+    // Inline code execution is never rememberable: `node script.js` allowed
+    // once must not make `node -e '…'` allowed forever.
+    const unrememberable = builtin !== null && UNREMEMBERABLE_RISKS.has(builtin.risk)
+    const allowed = !unrememberable && matched.some(rule => rule.decision === 'allow')
     if (forbidden) {
       const source = builtin?.decision === 'forbidden' ? builtin : matched.find(rule => rule.decision === 'forbidden')
       consider('forbidden', source.reason ?? `forbidden by rule ${source.id ?? ''}`.trim(), source.id === undefined ? null : source)
@@ -359,7 +368,7 @@ export function evaluateCommandLine(request) {
     if (builtin !== null || matched.some(rule => rule.decision === 'prompt')) {
       const prompt = builtin ?? matched.find(rule => rule.decision === 'prompt')
       consider('prompt', prompt.reason ?? 'matched a prompt rule', prompt.id === undefined ? null : prompt)
-      if (suggestion === null) suggestion = suggestRule(simple)
+      if (suggestion === null && !unrememberable) suggestion = suggestRule(simple)
       continue
     }
     // Unremarkable: the sandbox remains the enforcement layer for this command.

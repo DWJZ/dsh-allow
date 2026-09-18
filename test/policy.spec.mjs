@@ -144,6 +144,15 @@ check('a plain program suggests only itself', policy.describeRule(policy.suggest
 check('a flag is never part of a suggestion', policy.describeRule(policy.suggestRule(parse.parseCommandLine('rm -rf build', { home: HOME }).commands[0])) === 'rm')
 check('a path is never part of a suggestion', policy.describeRule(policy.suggestRule(parse.parseCommandLine('node ./x.mjs', { home: HOME }).commands[0])) === 'node')
 
+console.log('inline code is never rememberable (§14)')
+const interpreterRules = [allowRule('python3'), allowRule('node')]
+check('python3 -c is not covered by a python3 rule', evaluate('python3 -c "print(1)"', interpreterRules).decision === 'prompt')
+check('and the card offers no rule to remember', evaluate('python3 -c "print(1)"', interpreterRules).suggestion === null)
+check('python3 script.py is covered', evaluate('python3 script.py', interpreterRules).decision === 'allow')
+check('node -e is not covered by a node rule', evaluate('node -e "x"', interpreterRules).decision === 'prompt')
+check('node script.js is covered', evaluate('node script.js', interpreterRules).decision === 'allow')
+check('shell -c is not covered by a shell rule', evaluate("bash -c 'rm -rf /'", [allowRule('bash')]).decision === 'forbidden')
+
 console.log('path normalization')
 check('~ resolves against home', policy.normalizePath('~/.ssh/id_rsa', CWD, HOME) === `${HOME}/.ssh/id_rsa`)
 check('.. collapses', policy.normalizePath('/tmp/..', CWD, HOME) === '/')
