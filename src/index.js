@@ -50,9 +50,12 @@ export function resolveHome(env = process.env) {
 /**
  * Reduce a shell command to the stable leading words a rule can match.
  *
- * Leading `cd … &&` chains and `VAR=value` assignments are dropped, then words
- * are kept until the first flag, path, assignment, or shell operator. The
- * result is what the dialog shows the user, so it stays short and readable.
+ * Leading `cd … &&` chains and `VAR=value` assignments are dropped. The first
+ * word is the program and is reduced to its basename, so a rule recorded for
+ * `/opt/homebrew/bin/gh repo view …` also covers a later `gh repo view …`; the
+ * remaining words are kept until the first flag, path, assignment, or shell
+ * operator. The result is what the dialog shows the user, so it stays short
+ * and readable.
  * @param command - the raw shell command.
  * @returns the prefix, or an empty string when nothing usable remains.
  */
@@ -70,6 +73,12 @@ export function commandPrefix(command) {
   const kept = []
   for (let index = start; index < words.length && kept.length < MAX_PREFIX_WORDS; index += 1) {
     const word = words[index]
+    if (kept.length === 0) {
+      const program = word.split(/[\\/]/u).pop() ?? ''
+      if (program === '' || program === '.' || program === '..' || /[;&|<>()]/u.test(program)) break
+      kept.push(program)
+      continue
+    }
     if (word.startsWith('-') || word.includes('/') || word.includes('=') || /[;&|<>()]/u.test(word)) break
     kept.push(word)
   }
@@ -246,7 +255,12 @@ export function createApprovalListener({ file, logger, questionsFor }) {
     const parsed = escalationOf(toolCallArguments(request?.agent?.session, request?.callId))
     if (parsed === null) return next()
     const prefix = commandPrefix(parsed.command)
-    if (prefix === '') return next()
+    if (prefix === '') {
+      // No rule can be offered for a command whose program is unreadable here;
+      // say so, so a delegation is diagnosable instead of silent.
+      logger.warn(`dsh-allow: no command prefix in ${JSON.stringify(parsed.command)} — delegating this approval`)
+      return next()
+    }
     const query = { tool: request.toolName, mode: parsed.mode, prefix }
     const hit = matchRule(readRules(file), query)
     if (hit !== null) {

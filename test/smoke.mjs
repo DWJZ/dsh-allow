@@ -60,6 +60,10 @@ const prefixes = [
   ['git push -u origin main', 'git push'],
   ['node /tmp/script.mjs 25000', 'node'],
   ['rm -rf /', 'rm'],
+  ['/opt/homebrew/bin/gh repo view DWJZ/dsh-allow --json name 2>&1 | head -3', 'gh repo view'],
+  ['/bin/rm -rf /tmp/x', 'rm'],
+  ['cd /tmp && /usr/local/bin/node script.mjs', 'node script.mjs'],
+  ['~/bin/tool --flag', 'tool'],
   ['   ', ''],
 ]
 for (const [command, expected] of prefixes) {
