@@ -100,6 +100,7 @@ function tokenize(text, home) {
   let dynamic = false
   let quote = null
   let started = false
+  let grouping = false
   let index = 0
   const push = () => {
     if (!started) return
@@ -149,6 +150,10 @@ function tokenize(text, home) {
       index += 1
       continue
     }
+    if (character === '(' || character === ')') {
+      // Unquoted parentheses are subshell or group syntax, which changes what runs.
+      grouping = true
+    }
     if (character === '$' || character === '`') dynamic = true
     if (character === '*' || character === '?' || character === '[' || character === '{') dynamic = true
     started = true
@@ -160,7 +165,7 @@ function tokenize(text, home) {
   if (words.length > 0 && words[0].value.startsWith('~')) {
     words[0] = { value: `${home}${words[0].value.slice(1)}`, dynamic: words[0].dynamic }
   }
-  return words
+  return { words, grouping }
 }
 
 /** Redirection operators, longest match first. */
@@ -173,8 +178,10 @@ const REDIRECTIONS = ['&>>', '&>', '>>', '<<<', '<<', '>&', '<&', '>', '<']
  * @returns the parsed command, or a reason it cannot be analysed.
  */
 function parseSegment(segment, home) {
-  const words = tokenize(segment, home)
-  if (words === null) return { ok: false, reason: 'unterminated quote' }
+  const tokenized = tokenize(segment, home)
+  if (tokenized === null) return { ok: false, reason: 'unterminated quote' }
+  if (tokenized.grouping) return { ok: false, reason: 'subshell or group syntax' }
+  const { words } = tokenized
   if (words.length === 0) return { ok: false, reason: 'empty segment' }
   const env = []
   const argv = []
@@ -206,12 +213,6 @@ function parseSegment(segment, home) {
     argv.push(word)
   }
   if (argv.length === 0) return { ok: false, reason: 'no executable' }
-  for (const word of argv) {
-    // Subshells and groups change what runs; do not guess their contents.
-    if (/[()]/u.test(word.value) || word.value === '{' || word.value === '}') {
-      return { ok: false, reason: 'subshell or group syntax' }
-    }
-  }
   const program = argv[0]
   if (!program.dynamic && CONTROL_KEYWORDS.has(program.value)) {
     return { ok: false, reason: `shell construct "${program.value}"` }
