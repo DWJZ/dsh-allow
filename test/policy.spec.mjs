@@ -187,6 +187,14 @@ check('and it is offered as an exact command', evaluate("python3 - <<'PY'\nprint
 check('a shell heredoc reader prompts too', evaluate('bash <<EOF\nrm -rf /\nEOF').decision === 'prompt')
 check('quoted << is not a heredoc', evaluate('echo "a << b"').decision === 'allow')
 
+console.log('syntax errors are denied, not prompted')
+for (const broken of ['echo "unterminated', 'if true; then', 'for x in a; do', '(( 1 +', 'cat <<EOF']) {
+  const outcome = evaluate(broken)
+  check(`"${broken}" is denied`, outcome.decision === 'forbidden', `${outcome.decision} (${outcome.reason})`)
+  check(`"${broken}" offers nothing to remember`, outcome.suggestions.length === 0, JSON.stringify(outcome.suggestions))
+}
+check('an opaque wrapper is still a prompt, not a syntax error', evaluate("bash -lc 'X=\$Y; \$X foo'").decision === 'prompt')
+
 console.log('everything can be pinned, directly or through the opt-in')
 check('a control structure is parsed now, so its commands are what the card names', evaluate('for f in a; do rm -rf /; done').suggestions.some(rule => !rule.exact), JSON.stringify(evaluate('for f in a; do rm -rf /; done').suggestions))
 check('a partly pinnable line offers both', (() => {

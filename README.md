@@ -48,7 +48,7 @@ process execution
 1. `src/parse.js` parses with **tree-sitter + tree-sitter-bash** — a real bash grammar — and only reads the tree it returns: statements, pipelines, `&&`/`||`/`;`, `for`/`if`/`while`/`case`, subshells, command substitution, redirections, here-documents. `echo "a && b"` is one command; the commands inside `for f in a b; do echo $f; done` are judged individually; a here-document body is its own node and is never read as shell source.
 2. `bash -lc '…'` / `sh -c '…'` are parsed **recursively** (depth 4) and their inner commands are judged with the same rules; an inner program the grammar cannot reduce leaves the whole call opaque, which prompts.
 3. `$(…)` and backticks join the same line: their commands run first and aggregate with it, and a **substituted program name** (`$(printf rm) -rf /`) makes the whole line unanalysable.
-4. Input the grammar reports an error on is unanalysable, so it prompts and can only be pinned by exact source.
+4. Input the grammar rejects (an unterminated quote, an `if` without `fi`) is **denied outright**: the shell could not run it either, so it is not worth an approval and gets no rule.
 
 5. Here-document bodies (`<<EOF … EOF`) are **stdin data, not shell source**, so they are removed before parsing — a Python line inside one is no longer read as a command. The reader is still judged: `python3 -` or a shell without `-c` takes its program from stdin, which is code execution — pinned only as the exact command text.
 4. `$(…)` and backticks are parsed recursively too: the substituted commands join the same line and are aggregated with it (`echo "$(rm -rf /)"` is forbidden). A substitution the parser cannot reduce makes the whole line a prompt, and a substituted **program name** is always unanalysable, so `$(printf rm) -rf /` is never allowed.
@@ -74,7 +74,7 @@ A capable interpreter may run, but its capability is never remembered broadly. O
 - **A mixed line gets both**: the parsable members keep their minimal capability rules and the whole line is added as an exact pin, so no command is left unsilenceable.
 - **Hard denials are the one exception**: the built-in catastrophic verdicts (`rm -rf /`, `mkfs`, `dd of=/dev/…`) are not rememberable by default. A deployment that wants to pin those exact lines sets `allowForbiddenSource: true` (default `false`); only then does the card offer the pin and honour it.
 
-**The built-in policy never hard-denies.** Every risk becomes a `prompt` with one concrete rule to remember; `forbidden` survives only for rules **you** write (`/allow add forbidden …`), and none are shipped.
+**The built-in policy hard-denies exactly one thing**: a line the grammar cannot parse, which could not run as written. Every other risk becomes a `prompt` with one concrete rule to remember; `forbidden` survives for rules **you** write (`/allow add forbidden …`), and none are shipped.
 
 **Broad rules that are refused** (the store throws on write; the reader ignores them):
 

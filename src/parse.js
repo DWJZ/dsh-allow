@@ -105,7 +105,9 @@ export function parseCommandLine(source, { home = '/', depth = 0 } = {}) {
   }
   const tree = parser.parse(source)
   if (tree.rootNode.hasError) {
-    return { analyzable: false, reason: 'shell syntax the grammar cannot parse', commands: [], operators: [] }
+    // The grammar rejected the line: the shell would too, so the policy denies
+    // it outright instead of asking anyone to approve a command that cannot run.
+    return { analyzable: false, syntaxError: true, reason: 'shell syntax error', commands: [], operators: [] }
   }
   const commands = []
   const operators = []

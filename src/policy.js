@@ -489,6 +489,21 @@ function firstWord(command) {
 export function evaluateCommandLine(request) {
   const { command, cwd, home, rules = [], defaultDecision = 'allow', allowForbiddenSource = false } = request
   const parsed = parseCommandLine(command, { home })
+  if (!parsed.analyzable && parsed.syntaxError === true) {
+    return {
+      decision: 'forbidden',
+      reason: 'the shell grammar cannot parse this line, so it can never run as written',
+      risk: 'syntax-error',
+      matchedRules: [],
+      triggers: [],
+      commands: [],
+      suggestion: null,
+      suggestions: [],
+      partial: false,
+      covered: false,
+      analyzable: false,
+    }
+  }
   if (!parsed.analyzable) {
     // The line cannot be reduced to commands, but it can still be pinned to its
     // own text: the same text runs the same program every time.
