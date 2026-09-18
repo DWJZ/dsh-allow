@@ -52,6 +52,33 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
 3. 每个简单命令的 argv 由内置表分类、与存储规则匹配，然后整条请求取最严：`forbidden > prompt > allow`。
 4. 无法分析的行是 `prompt`，并且**永远不会**命中 `allow` 规则——这就是对 parser 不理解的 shell 语法的 fail-closed。
 
+## 内联代码执行（shell wrapper 与解释器）
+
+高能力程序可以执行，但**不能把「任意代码执行」记成宽泛规则**。规则写不写得进去由 `validatePersistentRule()` 一处判定，`RuleStore` 写入前再判一次，读取时第三次过滤——所以 UI bug、未来调用方、手改配置都塞不进 `bash -c` / `python -c` 这类规则。
+
+| 命令 | 处理 |
+|---|---|
+| `bash -lc 'cargo test'` | **递归解析**内部 shell → 按 `cargo test` 判定；Always Allow 生成的是 `["cargo","test"]`，不是 `bash -lc` |
+| `bash -lc 'touch x && rm -rf /'` | 内部逐条判定后取最严 → `forbidden`（外层是 bash 不能绕过） |
+| `bash -lc 'X=$Y; $X foo'` | 内层解析失败 → 整个调用视为 **opaque** → `prompt` |
+| `python -c 'print(123)'` | 内联代码视为 **opaque 任意代码** → `prompt`；Always Allow 只能生成**精确到原文**的规则 `["python","-c","print(123)"]` |
+| `python tools/check.py` | 属于**脚本文件执行**，生成 `["python","tools/check.py"]`，之后 `… --verbose` 等不同参数照样命中 |
+| `python -` / `bash`（无 `-c`） | 程序来自 stdin → `prompt`，且**无法固定**，不给规则 |
+
+**被明确拒绝的宽泛规则**（写入时抛错，读取时忽略）：
+
+```
+bash · sh · zsh · dash · ksh · fish · pwsh        （单独出现）
+bash -c · bash -lc · sh -c · zsh -c …             （只有开关，没有代码文本）
+python · python3 · node · perl · ruby · lua · deno eval · php -r · osascript -e
+python - · node -                                 （从 stdin 读程序）
+eval · source · exec                              （单独出现）
+```
+
+判定规则：**规则必须把「将要运行的程序」钉死**——要么是内联开关后的那段代码文本，要么是脚本路径。`python -c 'print(123)'` 与 `python -c 'print(456)'` 是两条不同的能力，前者不会覆盖后者。`forbidden` 永远优先：即使存在精确 allow 规则，`rm -rf /` 仍然拒绝（`bash -lc 'rm -rf /'` 也一样）。
+
+卡片上的文案也跟着区分：内联代码给的是「**总是允许这条完全相同的命令**」，解析成功的外层则显示内层命令（`总是允许「cargo test」`）。
+
 ## 内置策略
 
 看参数，不看名字黑名单：

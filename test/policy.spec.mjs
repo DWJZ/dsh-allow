@@ -36,6 +36,9 @@ const allowRule = (executable, argvPrefix = []) => ({ id: `r-${executable}-${arg
  */
 const evaluate = (command, rules = [], cwd = CWD) => policy.evaluateCommandLine({ command, cwd, home: HOME, rules })
 
+/** Evaluate with everything unmatched prompting, so rule matching is observable. */
+const evaluateStrict = (command, rules = [], cwd = CWD) => policy.evaluateCommandLine({ command, cwd, home: HOME, rules, defaultDecision: 'prompt' })
+
 console.log('§23 required cases')
 let result = evaluate('touch foo', [allowRule('touch')])
 check('1. allow rule covers a simple command', result.decision === 'allow', result.decision)
@@ -142,16 +145,14 @@ console.log('suggestions stay narrow')
 check('a subcommand program keeps its subcommand', policy.describeRule(policy.suggestRule(parse.parseCommandLine('git status --short', { home: HOME }).commands[0])) === 'git status')
 check('a plain program suggests only itself', policy.describeRule(policy.suggestRule(parse.parseCommandLine('touch foo', { home: HOME }).commands[0])) === 'touch')
 check('a flag is never part of a suggestion', policy.describeRule(policy.suggestRule(parse.parseCommandLine('rm -rf build', { home: HOME }).commands[0])) === 'rm')
-check('a path is never part of a suggestion', policy.describeRule(policy.suggestRule(parse.parseCommandLine('node ./x.mjs', { home: HOME }).commands[0])) === 'node')
+check('a script run is pinned to the script', policy.describeRule(policy.suggestRule(parse.parseCommandLine('node ./x.mjs', { home: HOME }).commands[0])) === 'node ./x.mjs')
 
-console.log('inline code is never rememberable (§14)')
+console.log('a code-execution rule is only ever pinned')
 const interpreterRules = [allowRule('python3'), allowRule('node')]
-check('python3 -c is not covered by a python3 rule', evaluate('python3 -c "print(1)"', interpreterRules).decision === 'prompt')
-check('and the card offers no rule to remember', evaluate('python3 -c "print(1)"', interpreterRules).suggestion === null)
-check('python3 script.py is covered', evaluate('python3 script.py', interpreterRules).decision === 'allow')
-check('node -e is not covered by a node rule', evaluate('node -e "x"', interpreterRules).decision === 'prompt')
-check('node script.js is covered', evaluate('node script.js', interpreterRules).decision === 'allow')
-check('shell -c is not covered by a shell rule', evaluate("bash -c 'rm -rf /'", [allowRule('bash')]).decision === 'forbidden')
+check('a stale python3 rule is ignored by the reader', evaluate('python3 script.py', interpreterRules).decision === 'allow')
+check('and a stale bash rule cannot allow a wrapper', evaluateStrict("bash -c 'touch x'", [allowRule('bash')]).decision === 'prompt')
+check('while the same wrapper with a pinned rule is allowed', evaluate("bash -c 'touch x'", [allowRule('bash', ['-c', 'touch x'])]).decision === 'allow')
+check('a stale python rule cannot cover inline code', evaluateStrict('python3 -c "print(1)"', [allowRule('python3', [])]).decision === 'prompt')
 
 console.log('whole-line coverage and suggestions')
 const lineRules = [allowRule('cp'), allowRule('echo')]
@@ -181,6 +182,66 @@ check('the python heredoc reader prompts as code execution', evaluate("python3 -
 check('and it is offered no rule', evaluate("python3 - <<'PY'\nprint(1)\nPY").suggestions.length === 0)
 check('a shell heredoc reader prompts too', evaluate('bash <<EOF\nrm -rf /\nEOF').decision === 'prompt')
 check('quoted << is not a heredoc', evaluate('echo "a << b"').decision === 'allow')
+
+console.log('inline execution: shell wrappers')
+let shell = evaluate("bash -lc 'git status'")
+check('a shell wrapper is parsed into its inner command', shell.commands.some(argv => argv.join(' ') === 'git status'), JSON.stringify(shell.commands))
+check('and that inner command is what a rule would name', policy.describeRule(policy.suggestRule(parse.parseCommandLine("bash -lc 'git status'", { home: HOME }).commands[0])) === 'git status')
+check('a dangerous inner command is forbidden', evaluate("bash -lc 'touch foo && rm -rf /'").decision === 'forbidden')
+check('an allowed inner command plus a dangerous one is forbidden', evaluate("bash -lc 'touch foo && rm -rf /'", [allowRule('touch')]).decision === 'forbidden')
+shell = evaluate("bash -lc 'X=$Y; $X foo'")
+check('an unparsable shell program is opaque and prompts', shell.decision === 'prompt' && shell.analyzable === true, `${shell.decision}/${shell.analyzable}`)
+check('and opaqueness is reported as a partial line', shell.partial === true || shell.suggestions.length > 0, JSON.stringify(shell.suggestions))
+
+console.log('inline execution: interpreter code')
+const pythonInline = evaluate("python -c 'print(123)'")
+check('inline interpreter code prompts', pythonInline.decision === 'prompt', pythonInline.decision)
+check('and the suggestion pins the exact code', pythonInline.suggestions[0]?.argvPrefix.join(' ') === '-c print(123)', JSON.stringify(pythonInline.suggestions))
+check('flagged as an exact rule', pythonInline.suggestions[0]?.exact === true)
+check('a stdin program offers nothing to remember', evaluate('python - <<PY\nprint(1)\nPY').suggestions.length === 0)
+
+console.log('persistent rule validation')
+const invalid = [
+  ['bash', []], ['bash', ['-c']], ['bash', ['-lc']], ['sh', []], ['sh', ['-c']], ['zsh', ['-c']],
+  ['python', []], ['python', ['-c']], ['python3', ['-c']], ['python', ['-']],
+  ['node', ['-e']], ['perl', ['-e']], ['ruby', ['-e']], ['lua', ['-e']], ['deno', ['eval']],
+  ['eval', []], ['source', []],
+]
+for (const [executable, argvPrefix] of invalid) {
+  const verdict = policy.validatePersistentRule({ decision: 'allow', executable, argvPrefix })
+  check(`"${[executable, ...argvPrefix].join(' ')}" cannot be an always-allow rule`, verdict.ok === false, JSON.stringify(verdict))
+}
+const valid = [
+  ['bash', ['-lc', 'cargo test']], ['python', ['-c', 'print(123)']], ['node', ['-e', 'console.log(1)']],
+  ['python', ['tools/check.py']], ['bash', ['script.sh']], ['python', ['-u', 'tools/check.py']],
+]
+for (const [executable, argvPrefix] of valid) {
+  const verdict = policy.validatePersistentRule({ decision: 'allow', executable, argvPrefix })
+  check(`"${[executable, ...argvPrefix].join(' ')}" is a valid pinned rule`, verdict.ok === true, JSON.stringify(verdict))
+}
+check('a prompt rule for a shell is not a capability grant', policy.validatePersistentRule({ decision: 'prompt', executable: 'bash', argvPrefix: [] }).ok === true)
+check('a forbidden rule for a shell is not a capability grant', policy.validatePersistentRule({ decision: 'forbidden', executable: 'python', argvPrefix: ['-c'] }).ok === true)
+
+console.log('exact inline rules match only their own text')
+const exactInline = [allowRule('python', ['-c', 'print(123)'])]
+check('the identical inline command is allowed', evaluate("python -c 'print(123)'", exactInline).decision === 'allow')
+check('different inline text is not', evaluateStrict("python -c 'print(456)'", exactInline).decision === 'prompt')
+check('and neither is a dangerous one', evaluateStrict("python -c 'import os; os.system(\"x\")'", exactInline).decision === 'prompt')
+const exactShell = [allowRule('bash', ['-lc', 'FOO=bar ./script.sh'])]
+check('the identical shell program is allowed', evaluate("bash -lc 'FOO=bar ./script.sh'", exactShell).decision === 'allow')
+check('a longer program with the same head is not', evaluateStrict("bash -lc 'FOO=bar ./script.sh; other'", exactShell).decision === 'prompt')
+
+console.log('script files are a different capability')
+const scriptRule = [allowRule('python', ['tools/check.py'])]
+check('the pinned script runs with other flags', evaluate('python tools/check.py --verbose', scriptRule).decision === 'allow')
+check('another script is not covered', evaluateStrict('python tools/evil.py', scriptRule).decision === 'prompt')
+check('and inline code is never covered by a script rule', evaluateStrict("python -c 'print(1)'", scriptRule).decision === 'prompt')
+const shellScriptRule = [allowRule('bash', ['script.sh'])]
+check('a shell script rule does not cover -c', evaluateStrict("bash -lc 'anything'", shellScriptRule).decision === 'prompt')
+
+console.log('hard safety still wins')
+check('an exact allow rule cannot cover a catastrophic command', evaluate('rm -rf /', [allowRule('rm', ['-rf', '/'])]).decision === 'forbidden')
+check('not even inside a shell wrapper', evaluate("bash -lc 'rm -rf /'", [allowRule('bash', ['-lc', 'rm -rf /'])]).decision === 'forbidden')
 
 console.log('command substitution is analysed, not guessed')
 check('a substitution runs its own command', evaluate('echo "$(rm -rf /)"').decision === 'forbidden')

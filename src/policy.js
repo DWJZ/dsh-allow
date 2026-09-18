@@ -17,10 +17,82 @@ import { parseCommandLine } from './parse.js'
 const RANK = { allow: 0, prompt: 1, forbidden: 2 }
 
 /**
- * Risks a stored `allow` rule may never cover: the argument is a program, so
- * approving the interpreter once must not approve arbitrary code later.
+ * Programs whose arguments can BE a program. A rule for one of these is only
+ * ever safe when it pins the program text (a script path) or the exact code
+ * string — never the interpreter alone.
  */
-const UNREMEMBERABLE_RISKS = new Set(['code-execution'])
+const CODE_PROGRAMS = {
+  sh: { shell: true }, bash: { shell: true }, zsh: { shell: true }, dash: { shell: true },
+  ksh: { shell: true }, ash: { shell: true }, fish: { shell: true },
+  pwsh: { shell: true }, powershell: { shell: true },
+  python: { inline: ['-c'] }, python3: { inline: ['-c'] }, pypy: { inline: ['-c'] }, pypy3: { inline: ['-c'] },
+  node: { inline: ['-e', '-p', '--eval', '--print'] },
+  perl: { inline: ['-e'] }, ruby: { inline: ['-e'] }, lua: { inline: ['-e'] },
+  php: { inline: ['-r'] }, osascript: { inline: ['-e'] }, deno: { inline: ['eval'] },
+  eval: { inline: [] }, exec: { inline: [] }, source: { inline: [] }, '.': { inline: [] },
+}
+
+/** Shell flags that make the next argument a program (`-c`, `-lc`, `-ic`, …). */
+const SHELL_INLINE_FLAG = /^-[A-Za-z]*c[A-Za-z]*$/u
+
+/**
+ * Whether one argv token asks a program to run code from its arguments.
+ * @param executable - the program name.
+ * @param token - the argv token.
+ * @returns whether the token is that program's inline-code flag.
+ */
+function isInlineFlag(executable, token) {
+  const spec = CODE_PROGRAMS[executable]
+  if (spec === undefined) return false
+  if (spec.shell === true) return SHELL_INLINE_FLAG.test(token)
+  return spec.inline.includes(token)
+}
+
+/**
+ * Decide whether one persistent rule may be stored.
+ *
+ * This is the single authority for "broad rule that hands out a code-execution
+ * capability". It is called by the rule builder and again by the store, so a UI
+ * bug, a future caller, or an imported config cannot write `bash -c` or
+ * `python -c` as an always-allow rule.
+ * @param rule - the rule about to be stored.
+ * @returns whether it is storable, with the reason when it is not.
+ */
+export function validatePersistentRule(rule) {
+  if (rule?.decision !== 'allow') return { ok: true }
+  const executable = basename(String(rule.executable ?? ''))
+  if (CODE_PROGRAMS[executable] === undefined) return { ok: true }
+  const prefix = Array.isArray(rule.argvPrefix) ? rule.argvPrefix : []
+  if (prefix.length === 0) {
+    return { ok: false, reason: `允许「${executable}」本身就等于允许它执行任意代码` }
+  }
+  for (const [index, token] of prefix.entries()) {
+    if (isInlineFlag(executable, token)) {
+      return index + 1 < prefix.length
+        ? { ok: true }
+        : { ok: false, reason: `「${executable} ${token}」没有把内联代码固定到具体文本` }
+    }
+    if (token === '-') return { ok: false, reason: `「${executable} -」从 stdin 读程序，无法固定` }
+    if (!String(token).startsWith('-')) return { ok: true }
+  }
+  return { ok: false, reason: `「${executable} ${prefix.join(' ')}」没有固定将要运行的程序` }
+}
+
+/**
+ * The prefix that pins one code-bearing invocation: leading flags up to and
+ * including the first non-flag token (a script path), or the whole argv when
+ * the code lives in an argument (inline code).
+ * @param executable - the program name.
+ * @param args - argv without the program.
+ * @returns the prefix, or null when the invocation cannot be pinned.
+ */
+function codePrefix(executable, args) {
+  for (const [index, token] of args.entries()) {
+    if (isInlineFlag(executable, token)) return args.slice(0, index + 2)
+    if (!String(token).startsWith('-') && token !== '-') return args.slice(0, index + 1)
+  }
+  return null
+}
 
 /** Programs whose first non-flag argument names a subcommand. */
 const SUBCOMMAND_PROGRAMS = new Set([
@@ -147,6 +219,10 @@ export function classifyBuiltin(command, context) {
     if (pathRisk(path, home) !== null) {
       return { decision: 'prompt', risk: 'filesystem-write', reason: `writing to ${path}` }
     }
+  }
+
+  if (command.opaque === true) {
+    return { decision: 'prompt', risk: 'code-execution', reason: 'the shell program could not be parsed, so its effect is unknown' }
   }
 
   if (command.background) {
@@ -282,6 +358,9 @@ export function classifyBuiltin(command, context) {
  */
 export function ruleMatches(rule, command) {
   if (basename(command.argv[0] ?? '') !== rule.executable) return false
+  // Defense in depth: even a rule this engine was handed directly may not grant
+  // a code-execution capability, so an invalid allow rule matches nothing.
+  if (rule.decision === 'allow' && !validatePersistentRule(rule).ok) return false
   const args = command.argv.slice(1)
   const dynamic = command.dynamicArgv.slice(1)
   // Only an unresolved expansion blocks a rule; a command substitution whose
@@ -306,12 +385,29 @@ export function suggestRule(command) {
   const executable = basename(command.argv[0] ?? '')
   const args = command.argv.slice(1)
   const dynamic = command.dynamicArgv.slice(1)
+  const literal = !dynamic.some(flag => flag === true)
+  if (command.opaque === true || CODE_PROGRAMS[executable] !== undefined) {
+    // Never the interpreter alone, and never a truncated code argument: pin the
+    // invocation to the script it runs or the exact text the user is looking at.
+    if (!literal) return null
+    const pinned = codePrefix(executable, args)
+    if (pinned === null) return null
+    const inline = args.some(token => isInlineFlag(executable, token))
+    const exact = {
+      decision: 'allow',
+      executable,
+      argvPrefix: pinned,
+      exact: inline,
+    }
+    return validatePersistentRule(exact).ok ? exact : null
+  }
   const argvPrefix = []
-  if (SUBCOMMAND_PROGRAMS.has(executable) && args.length > 0 && dynamic[0] !== true
+  if (SUBCOMMAND_PROGRAMS.has(executable) && args.length > 0 && literal
     && !args[0].startsWith('-') && !args[0].includes('/')) {
     argvPrefix.push(args[0])
   }
-  return { decision: 'allow', executable, argvPrefix }
+  const suggestion = { decision: 'allow', executable, argvPrefix }
+  return validatePersistentRule(suggestion).ok ? suggestion : null
 }
 
 /**
@@ -363,25 +459,26 @@ export function evaluateCommandLine(request) {
   }
   let suggestion = null
   for (const simple of parsed.commands) {
+    // A wrapper whose program was parsed contributes its inner commands; only
+    // an opaque wrapper is a command in its own right.
+    if (simple.nested === true && simple.opaque !== true) continue
     const builtin = classifyBuiltin(simple, { cwd, home })
     const matched = rules.filter(rule => ruleMatches(rule, simple))
     if (builtin !== null && builtin.decision !== 'allow') triggers.push({ command: simple.source, ...builtin })
     const forbidden = builtin?.decision === 'forbidden' || matched.some(rule => rule.decision === 'forbidden')
-    // Inline code execution is never rememberable: `node script.js` allowed
-    // once must not make `node -e '…'` allowed forever.
-    const unrememberable = builtin !== null && UNREMEMBERABLE_RISKS.has(builtin.risk)
-    const allowed = !unrememberable && matched.some(rule => rule.decision === 'allow')
+    const allowed = matched.some(rule => rule.decision === 'allow')
     if (forbidden) forbiddenSeen = true
-    if (forbidden || unrememberable) {
+    if (forbidden) {
       suggestionBlocked = true
       covered = false
     }
     else if (!allowed) {
       covered = false
     }
-    if (!forbidden && !unrememberable) {
+    if (!forbidden) {
       const candidate = suggestRule(simple)
-      if (!suggestions.some(rule => rule.executable === candidate.executable
+      if (candidate === null) suggestionBlocked = true
+      else if (!suggestions.some(rule => rule.executable === candidate.executable
         && rule.argvPrefix.join('\u0000') === candidate.argvPrefix.join('\u0000'))) {
         suggestions.push(candidate)
       }

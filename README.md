@@ -52,6 +52,33 @@ process execution
 5. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
 6. Unanalysable lines are `prompt` and can never match an `allow` rule — the fail-closed rule for shell syntax this parser does not model.
 
+## Inline execution: shell wrappers and interpreters
+
+A capable interpreter may run, but its capability is never remembered broadly. One function, `validatePersistentRule()`, decides what may be stored; `RuleStore` re-checks on write and again on read, so a UI bug, a future caller, or a hand-edited file cannot persist `bash -c` or `python -c` as an always-allow rule.
+
+| Command | Handling |
+|---|---|
+| `bash -lc 'cargo test'` | the inner shell source is parsed recursively and judged as `cargo test`; Always allow stores `["cargo","test"]`, never `bash -lc` |
+| `bash -lc 'touch x && rm -rf /'` | the inner commands are judged and aggregated → `forbidden`; the outer shell cannot hide them |
+| `bash -lc 'X=$Y; $X foo'` | the inner source cannot be parsed → the invocation is **opaque** → `prompt` |
+| `python -c 'print(123)'` | inline code is **opaque arbitrary execution** → `prompt`; the only rule offered pins the exact text: `["python","-c","print(123)"]` |
+| `python tools/check.py` | a script file, pinned as `["python","tools/check.py"]`, which also covers `… --verbose` |
+| `python -` / `bash` without `-c` | the program comes from stdin → `prompt`, and no rule can pin it |
+
+**Broad rules that are refused** (the store throws on write; the reader ignores them):
+
+```
+bash · sh · zsh · dash · ksh · fish · pwsh        (alone)
+bash -c · bash -lc · sh -c · zsh -c …             (a flag with no program text)
+python · python3 · node · perl · ruby · lua · deno eval · php -r · osascript -e
+python - · node -                                 (program from stdin)
+eval · source · exec                              (alone)
+```
+
+The test is whether the rule pins the program that will run — the code string after an inline flag, or a script path. `python -c 'print(123)'` and `python -c 'print(456)'` are different capabilities. `forbidden` always wins: an exact allow rule never covers `rm -rf /`, not even inside `bash -lc 'rm -rf /'`.
+
+The card says which one it is: inline code gets **Always allow this exact command**, while a parsed wrapper names the inner command (`Always allow "cargo test"`).
+
 ## Built-in policy
 
 Argument-aware, not a name blacklist. Destructive shapes are recognised from the flags and targets:

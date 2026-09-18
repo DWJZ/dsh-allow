@@ -9,6 +9,7 @@
 import { appendFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { validatePersistentRule } from './policy.js'
 
 /** Default file name for stored rules below the harness home. */
 const RULES_FILE_NAME = 'dsh-allow.json'
@@ -85,6 +86,10 @@ export function readRules(file) {
   return rules.filter(rule => typeof rule?.id === 'string'
     && ['allow', 'prompt', 'forbidden'].includes(rule?.decision)
     && typeof rule?.executable === 'string')
+    // A rule that hands out a code-execution capability is ignored even when it
+    // was written by an older version or by hand: the store refuses new ones,
+    // and the reader refuses old ones.
+    .filter(rule => validatePersistentRule(rule).ok)
 }
 
 /**
@@ -106,6 +111,13 @@ export function writeRules(file, rules) {
  * @returns the stored rule.
  */
 export function addRule(file, fields) {
+  // Second line of defense: the builder already validates, and the store
+  // validates again so no path (UI bug, future caller, imported config) can
+  // persist a rule that hands out arbitrary code execution.
+  const check = validatePersistentRule(fields)
+  if (!check.ok) {
+    throw new TypeError(`dsh-allow: 拒绝写入宽泛规则 — ${check.reason}`)
+  }
   const rules = readRules(file)
   const same = rules.find(rule => rule.decision === fields.decision
     && rule.executable === fields.executable
@@ -118,6 +130,7 @@ export function addRule(file, fields) {
     argvPrefix: [...(fields.argvPrefix ?? [])],
     hits: 0,
     createdAt: new Date().toISOString(),
+    ...(fields.exact === true ? { exact: true } : {}),
     ...(fields.note === undefined ? {} : { note: fields.note }),
   }
   writeRules(file, [...rules, stored])

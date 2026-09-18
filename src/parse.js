@@ -442,7 +442,10 @@ export function parseCommandLine(source, { home = '/', depth = 0 } = {}) {
     if (evaluated !== null) {
       const inner = parseCommandLine(evaluated, { home, depth: depth + 1 })
       if (!inner.analyzable) {
-        return { analyzable: false, reason: `eval program: ${inner.reason}`, commands: [], operators }
+        // The program text is opaque but the argv is still readable, so the
+        // invocation is judged as one opaque command rather than dropped.
+        commands.push({ ...command, nested: true, opaque: true, nestedSource: evaluated, opaqueReason: inner.reason })
+        continue
       }
       commands.push(...inner.commands, { ...command, nested: true, nestedSource: evaluated })
       continue
@@ -451,7 +454,8 @@ export function parseCommandLine(source, { home = '/', depth = 0 } = {}) {
     if (wrapped !== null) {
       const inner = parseCommandLine(wrapped, { home, depth: depth + 1 })
       if (!inner.analyzable) {
-        return { analyzable: false, reason: `shell wrapper program: ${inner.reason}`, commands: [], operators }
+        commands.push({ ...command, nested: true, opaque: true, nestedSource: wrapped, opaqueReason: inner.reason })
+        continue
       }
       commands.push(...inner.commands, { ...command, nested: true, nestedSource: wrapped })
       continue

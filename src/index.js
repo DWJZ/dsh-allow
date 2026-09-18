@@ -111,6 +111,7 @@ function remember(pendings, exec, decision, command, cwd) {
     labels: decision.suggestions.map(describeRule),
     suggestions: decision.suggestions,
     partial: decision.partial === true,
+    exact: decision.suggestions.length > 0 && decision.suggestions.every(rule => rule.exact === true),
     triggers: decision.triggers.map(trigger => trigger.command),
   })
   return true
@@ -307,6 +308,7 @@ export function createPendingHandler({ pendings }) {
       decision: record.decision,
       triggers: record.triggers,
       partial: record.partial === true,
+      exact: record.exact === true,
     })
   }
 }
@@ -394,8 +396,13 @@ export function runAllowCommand(file, rawInput) {
     if (!['allow', 'prompt', 'forbidden'].includes(decision) || executable === undefined) {
       return { kind: 'error', text: '用法：/allow add <allow|prompt|forbidden> <程序> [参数前缀…]，例如 /allow add allow git status' }
     }
-    const stored = addRule(file, { decision, executable: basename(executable), argvPrefix })
-    return { kind: 'success', text: `已记住：${stored.decision} · ${describeRule(stored)}` }
+    try {
+      const stored = addRule(file, { decision, executable: basename(executable), argvPrefix })
+      return { kind: 'success', text: `已记住：${stored.decision} · ${describeRule(stored)}` }
+    }
+    catch (error) {
+      return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+    }
   }
   return { kind: 'error', text: '用法：/allow [list|add <决策> <程序> [参数…]|remove <编号>|clear]' }
 }

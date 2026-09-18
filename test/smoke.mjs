@@ -4,7 +4,8 @@
  *
  * Usage: `node test/smoke.mjs`.
  */
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -29,6 +30,7 @@ const check = (name, condition, detail = '') => {
   }
 }
 
+const require = createRequire(import.meta.url)
 const logger = { info: () => {}, warn: () => {}, error: () => {} }
 const session = { id: 's1', header: { cwd: CWD } }
 const exec = (command, { name = 'bash', callId = 'c1', workdir } = {}) => ({
@@ -243,10 +245,39 @@ console.log('escalation listener')
 
   const inlinePendings = store.createPendingStore()
   const inlineListener = host.createApprovalListener({ config: listenerConfig, home: HOME, pendings: inlinePendings, logger })
-  store.addRule(escalationFile, { decision: 'allow', executable: 'node', argvPrefix: [] })
   outcome = await inlineListener(call('node -e "x"', 'c4'), delegate)
-  check('an inline-code escalation is never auto-approved', outcome === 'delegated', outcome)
-  check('and it offers no rule', (inlinePendings.get('s1', 'c4')?.labels ?? []).length === 0, JSON.stringify(inlinePendings.get('s1', 'c4')?.labels))
+  check('an unpinned inline escalation reaches the card', outcome === 'delegated', outcome)
+  check('and the card offers an exact rule', inlinePendings.get('s1', 'c4')?.exact === true && inlinePendings.get('s1', 'c4')?.labels?.[0] === 'node -e x', JSON.stringify(inlinePendings.get('s1', 'c4')?.labels))
+  store.addRule(escalationFile, { decision: 'allow', executable: 'node', argvPrefix: ['-e', 'x'] })
+  outcome = await inlineListener(call('node -e "x"', 'c6'), delegate)
+  check('the same inline command is then approved silently', outcome === 'allowed-once', outcome)
+  outcome = await inlineListener(call('node -e "y"', 'c7'), delegate)
+  check('different inline code still asks', outcome === 'delegated', outcome)
+}
+
+console.log('broad capability rules are refused')
+{
+  const broadFile = join(root, 'broad.json')
+  for (const [executable, argvPrefix] of [['bash', []], ['bash', ['-c']], ['python', ['-c']], ['node', ['-e']], ['python', ['-']]]) {
+    let refused = false
+    try {
+      store.addRule(broadFile, { decision: 'allow', executable, argvPrefix })
+    }
+    catch {
+      refused = true
+    }
+    check(`the store refuses "${[executable, ...argvPrefix].join(' ')}"`, refused)
+  }
+  store.addRule(broadFile, { decision: 'allow', executable: 'python', argvPrefix: ['tools/check.py'] })
+  check('and accepts a pinned one', store.readRules(broadFile).length === 1, JSON.stringify(store.readRules(broadFile)))
+  check('a broad rule already on disk is ignored by the reader', (() => {
+    const { writeFileSync } = require('node:fs')
+    writeFileSync(broadFile, JSON.stringify({ version: 2, rules: [
+      { id: 'stale', decision: 'allow', executable: 'python', argvPrefix: ['-c'] },
+      { id: 'good', decision: 'allow', executable: 'python', argvPrefix: ['tools/check.py'] },
+    ] }))
+    return store.readRules(broadFile).length === 1 && store.readRules(broadFile)[0].id === 'good'
+  })())
 }
 
 console.log('/allow command')
@@ -255,7 +286,12 @@ check('an empty list explains itself', host.runAllowCommand(rulesFile, '').text.
 check('add stores a structured rule', host.runAllowCommand(rulesFile, 'add allow git status').kind === 'success' && store.readRules(rulesFile)[0]?.argvPrefix?.[0] === 'status')
 check('list renders it', host.runAllowCommand(rulesFile, 'list').text.includes('allow · git status'), host.runAllowCommand(rulesFile, 'list').text)
 check('an invalid decision is refused', host.runAllowCommand(rulesFile, 'add sometimes git').kind === 'error')
-check('remove drops it', host.runAllowCommand(rulesFile, 'remove 1').kind === 'success' && store.readRules(rulesFile).length === 0)
+check('a broad interpreter rule is refused with a reason', (() => {
+  const result = host.runAllowCommand(rulesFile, 'add allow python -c')
+  return result.kind === 'error' && result.text.includes('内联代码')
+})(), JSON.stringify(host.runAllowCommand(rulesFile, 'add allow python -c')))
+check('a pinned interpreter rule is accepted', host.runAllowCommand(rulesFile, 'add allow python tools/check.py').kind === 'success')
+check('remove drops the pinned rule', host.runAllowCommand(rulesFile, 'remove 2').kind === 'success' && store.readRules(rulesFile).length === 1, JSON.stringify(store.readRules(rulesFile)))
 check('an unknown verb explains the usage', host.runAllowCommand(rulesFile, 'wat').kind === 'error')
 
 console.log('apply')

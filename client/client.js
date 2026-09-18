@@ -54,6 +54,7 @@ window.__ModuleLoader__.load({
 			allowOnce: "允许一次",
 			alwaysOne: "总是允许「{rule}」开头的命令",
 			alwaysMany: "总是允许 {rules} 这类命令",
+			alwaysExact: "总是允许这条完全相同的命令",
 			remembering: "正在记住…",
 			rememberFailed: "没记住:{message}",
 			cannotRemember: "这条命令不会被记住:{reason}",
@@ -69,6 +70,7 @@ window.__ModuleLoader__.load({
 			allowOnce: "Allow once",
 			alwaysOne: "Always allow commands starting with \u201c{rule}\u201d",
 			alwaysMany: "Always allow commands like {rules}",
+			alwaysExact: "Always allow this exact command",
 			remembering: "Remembering…",
 			rememberFailed: "Not remembered: {message}",
 			cannotRemember: "This command cannot be remembered: {reason}",
@@ -119,7 +121,8 @@ window.__ModuleLoader__.load({
 		 * @param labels - rule descriptions.
 		 * @returns the button label.
 		 */
-		function alwaysLabelText(t, labels) {
+		function alwaysLabelText(t, labels, exact) {
+			if (exact === true) return t("alwaysExact");
 			if (labels.length <= 3) return alwaysLabel(t, labels);
 			return t("alwaysMany", { rules: labels.slice(0, 3).join(" + ") + " +" + String(labels.length - 3) + "\u2026" });
 		}
