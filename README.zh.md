@@ -10,6 +10,9 @@ description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / creat
 
 ```
 cat README.md                  →  允许    (workspace 内 read)
+cat ~/.ssh/id_ed25519          →  拒绝    (用户数据区被围住,谁读都一样)
+python3 -c 'open("~/.ssh/id_ed25519").read()'
+                               →  被内核拒绝,而不是被解析器发现
 echo x > out.md                →  允许    (workspace 内 create)
 rm -rf build                   →  询问    (workspace 默认不授予 delete)
 python3 -c 'os.remove(…)'      →  delete 未授权时由内核拒绝
@@ -92,7 +95,9 @@ workspace 内:`read`、`write`、`create`、`execute` 允许,`delete` 默认拒�
 
 临时目录五种全允许。系统路径给 macOS 必需的部分:`/bin`、`/sbin`、`/usr/bin`、`/usr/sbin`、`/usr/lib`、`/usr/libexec`、`/System`、`/Library/Apple`、`/Library/Developer` 给 `read` + `execute`;`/etc`、`/var`、`/usr`、`/usr/share`、`/Library`、`/Applications`、`/dev`、`/opt/homebrew` 只给 `read`。
 
-其余位置(包括 workspace 之外的 `$HOME`)在你打开之前都是关着的。`read-only` 会话会把基线按沙箱模式收窄:workspace 只保留 `read` + `execute`,而且在只读会话里没有任何规则能把写权限加回来。
+home 目录之下还会额外放开两类:`read` + `execute` 给用户自己装的工具链(`~/.nvm`、`~/.local`、`~/.cargo`、`~/.rustup`、`~/.bun`、`~/.deno`、`~/.volta`、`~/.pyenv`、`~/.rbenv`、`~/.sdkman`、`~/.go`、`~/.asdf`、`~/.gem`、`~/Library/pnpm`),只给 `read` 给程序启动必需的少量配置(`~/.gitconfig`、`~/.config/git`、`~/.gitignore`)。这些路径是「程序要跑起来就非读不可」的,里面放的是程序与设置,不是凭据。
+
+其余位置(workspace 之外的 `$HOME`、`~/Documents`、`~/Library`,以及其中所有凭据库)在你打开之前都是关着的,同时读围栏会扣住它们的内容。`read-only` 会话会把基线按沙箱模式收窄:workspace 只保留 `read` + `execute`,而且在只读会话里没有任何规则能把写权限加回来。
 
 ## Homebrew 与符号链接可执行文件
 
@@ -106,7 +111,7 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 
 ## 看不清效果的程序,只在沙箱撑得住时才直接跑
 
-`python3 -c '…'`、`node -e '…'`、`eval`,以及解析器无法还原的 shell 程序,既不会按文本判定,也不会被固定成原文规则。只有当进程沙箱真能按策略管住它们时才直接执行:要么内核把五种能力都围住了,要么工作目录本身已经授予了全部五种 —— 也就是没有任何东西可以被藏起来。其余情况(没有 `sandbox-exec`、profile 应用不上、当前模式不隔离进程)一律先问,卡片上的那颗按钮就是为这个目录授予五种能力。
+`python3 -c '…'`、`node -e '…'`、`eval`,以及解析器无法还原的 shell 程序,既不会按文本判定,也不会被固定成原文规则。只有当进程沙箱真能按策略管住它们时才直接执行:要么内核把五种能力都围住了(`guarded` 就算 —— 用户数据区的读、写、执行都在里面),要么工作目录本身已经授予了全部五种 —— 也就是没有任何东西可以被藏起来。其余情况(没有 `sandbox-exec`、profile 应用不上、当前模式不隔离进程)一律先问,卡片上的那颗按钮就是为这个目录授予五种能力。
 
 「操作可见但路径是算出来的」是另一回事:`rm -rf "$DIR"` 明确是一次 delete,但路径无法核对,所以它会问,而不是搭上一条已有授权。一旦该操作在工作目录上被授予,它就不再询问,而沙箱会把运行期路径限制在你打开的范围里。
 
@@ -159,6 +164,19 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
 
 `enforce: 'auto'` 从上到下取探测通过的第一个层级 —— 普通 macOS 上就是 `guarded`;`enforce: full` 只接受 `full`,内核做不到就报告 `off`。编译失败会被报告而不是被吞掉,也不会被一个更宽的 profile 顶替。
 
+## `/allow`
+
+```
+/allow                          列出已记住的规则
+/allow status                   默认权限、当前围栏层级,以及逐能力的强制情况
+/allow add delete,write build folder
+/allow add execute /opt/homebrew/bin/gh file
+/allow remove 2
+/allow clear
+```
+
+`add` 的相对路径按会话 workspace 解析;`folder`(默认)覆盖整棵子树,`file` 只覆盖那一个路径。这里写的都是持久用户规则,与卡片上「总是允许」写入的形状一致。
+
 ## 配置
 
 ```yaml
@@ -185,7 +203,17 @@ npm run test:unit     # 策略、效果推导、强制层、决策
 npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的宿主)
 ```
 
-`test/sandbox.integration.mjs` 跑的是真内核,覆盖:权限库对任何写入者都拒绝;`rm` / `rmdir` / `rename` / `python -c 'os.remove'` / `node -e 'fs.rmSync'` 全部被拒而写和建正常;再授予 delete 后又能删;单独关闭 write 与 create;读围栏让 `cat` 和 `open().read()` 失败;execute 围栏拒绝未授权二进制;`python → sh` 与 `node → sh` 的孙进程继承全部限制;内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。当 `sandbox-exec` 无法应用 profile 时(包括测试本身跑在另一层 Seatbelt 沙箱里),它会打印明显的 SKIP —— 要在真内核上验证,请从普通终端运行。
+`test/sandbox.integration.mjs` 跑的是真内核,覆盖:权限库对任何写入者都拒绝;`rm` / `rmdir` / `rename` / `python -c 'os.remove'` / `node -e 'fs.rmSync'` 全部被拒而写和建正常;再授予 delete 后又能删;单独关闭 write 与 create;读围栏让 `cat` 和 `open().read()` 失败;execute 围栏拒绝未授权二进制;`python → sh` 与 `node → sh` 的孙进程继承全部限制;内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。覆盖的内容包括:
+
+- 权限库对任何写入者都拒绝 —— 即使有规则把它所在的目录整个开放,依然拒绝;
+- `rm`、`rmdir`、`rename`、`python -c 'os.remove'`、`node -e 'fs.rmSync'` 全部被拒而写入与新建正常,再授予 delete 后又能删;
+- 单独关闭 write、单独关闭 create,以及「只有 create」时能新建并写入内容;
+- 读被拒:`cat`、`python`、`node`、`bash`,以及 `python → sh`、`python → cat` 孙进程;给一条读授权后又能读;
+- 同一份读围栏下 `/bin/sh`、`python3`、`node`、`git --version`、`gh --version` 全部正常运行;
+- execute 围栏拒绝未授权的二进制;给符号链接授权后它能启动指向的那个二进制;
+- 内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。
+
+当 `sandbox-exec` 无法应用 profile 时(包括测试本身跑在另一层 Seatbelt 沙箱里),它会打印明显的 SKIP —— 要在真内核上验证,请从普通终端运行。
 
 ## 限制
 
@@ -197,7 +225,7 @@ npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的�
 - 两个较弱的 Seatbelt 结论:不可读的路径仍然可被解析(metadata 始终放行);通配拒绝必须逐操作写出来。
 - 改名需要源的 `delete` 加目标的 `create`。
 - 读效果只为固定的一张程序表推导;真正的边界是围栏,不是这张表。
-- 一次性授权存活期间,同会话里并发运行的另一次调用可能用上它:沙箱按会话拿授权,判定按调用拿授权。
+- 「允许一次」是按会话串行、而不是按调用并行的:授权存活期间,同会话的其它调用会等被批准的那次结算。若核心把 callId 传进 sandbox policy,这个等待就能去掉 —— 目前核心不传。
 - profile runner 固定为 `/usr/bin/sandbox-exec`;Seatbelt 不在这个位置的宿主会退回到 harness 自己的 profile 并报告 `off`。
 
 ## 许可证

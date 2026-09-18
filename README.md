@@ -10,12 +10,15 @@ A filesystem permission layer for DSH. A command is judged by the filesystem cap
 
 ```
 cat README.md                  →  allow    (read inside the workspace)
+cat ~/.ssh/id_ed25519          →  refused  (user data is fenced, whoever reads it)
+python3 -c 'open("~/.ssh/id_ed25519").read()'
+                               →  refused by the kernel, not found by the parser
 echo x > out.md                →  allow    (create inside the workspace)
 rm -rf build                   →  prompt   (delete is not granted in the workspace)
-python3 -c 'os.remove(…)'      →  denied by the kernel while delete is ungranted
+python3 -c 'os.remove(…)'      →  refused by the kernel while delete is ungranted
 gh pr list                     →  prompt   (execute is not granted for that binary)
 echo x > /Users/me/other/o     →  prompt   (create outside the workspace)
-echo x > ~/.dsh/dsh-allow.json →  refuse   (the permission store is never writable)
+echo x > ~/.dsh/dsh-allow.json →  refused  (the permission store is never writable)
 ```
 
 ## Where it hooks in
@@ -92,7 +95,9 @@ Inside the workspace: `read`, `write`, `create` and `execute` are allowed, `dele
 
 The temp areas grant all five. System paths grant what macOS itself needs: `read` + `execute` for `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/usr/lib`, `/usr/libexec`, `/System`, `/Library/Apple` and `/Library/Developer`; `read` for `/etc`, `/var`, `/usr`, `/usr/share`, `/Library`, `/Applications`, `/dev` and `/opt/homebrew`.
 
-Everything else — including `$HOME` outside the workspace — is closed until the user opens it. A `read-only` session narrows the baseline the same way the sandbox mode does: the workspace keeps `read` + `execute` and loses the rest, and no rule may hand a write back inside a read-only session.
+Below the home directory, `read` + `execute` are also granted for the toolchains a user installs (`~/.nvm`, `~/.local`, `~/.cargo`, `~/.rustup`, `~/.bun`, `~/.deno`, `~/.volta`, `~/.pyenv`, `~/.rbenv`, `~/.sdkman`, `~/.go`, `~/.asdf`, `~/.gem`, `~/Library/pnpm`) and `read` alone for the configuration a tool needs to start (`~/.gitconfig`, `~/.config/git`, `~/.gitignore`). These are paths a program must read to run at all; they hold programs and settings, not secrets.
+
+Everything else — `$HOME` outside the workspace, `~/Documents`, `~/Library`, and every credential store in it — is closed until the user opens it, and the read fence withholds its contents meanwhile. A `read-only` session narrows the baseline the same way the sandbox mode does: the workspace keeps `read` + `execute` and loses the rest, and no rule may hand a write back inside a read-only session.
 
 ## Homebrew and symlinked executables
 
@@ -106,7 +111,7 @@ Nothing is inferred from a program's name beyond that reading, and only the exec
 
 ## Inline programs run only behind a fence that can back them
 
-`python3 -c '…'`, `node -e '…'`, `eval` and a shell program the parser cannot reduce are not judged by their text and are not pinned to it. They are allowed only when the process sandbox can actually hold them to the policy: either the kernel fences all five capabilities, or the working directory already grants all five, so there is nothing left to withhold. Anything else — no `sandbox-exec`, a profile that would not apply, a mode that does not confine — makes them ask, with one button that grants the five capabilities for that directory.
+`python3 -c '…'`, `node -e '…'`, `eval` and a shell program the parser cannot reduce are not judged by their text and are not pinned to it. They are allowed only when the process sandbox can actually hold them to the policy: either the kernel fences all five capabilities — the `guarded` level does, because it withholds user-data reads, writes and executions — or the working directory already grants all five, so there is nothing left to withhold. Anything else — no `sandbox-exec`, a profile that would not apply, a mode that does not confine — makes them ask, with one button that grants the five capabilities for that directory.
 
 A computed path for a visible operation is different: `rm -rf "$DIR"` states a delete whose target cannot be checked, so it asks rather than riding on a grant. Once the operation is granted for the working directory the line stops asking, and the sandbox bounds the run-time path to what was opened.
 
@@ -159,6 +164,19 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
 
 `enforce: 'auto'` walks that list strongest first and keeps the first level the probe accepts — on a normal macOS that is `guarded`. `enforce: full` accepts nothing less than `full` and reports `off` if the kernel refuses it. A compilation failure is reported rather than swallowed, and it does not replace the profile with a wider one.
 
+## `/allow`
+
+```
+/allow                           list the stored rules
+/allow status                    the defaults, the fence level, and per-capability flags
+/allow add delete,write build folder
+/allow add execute /opt/homebrew/bin/gh file
+/allow remove 2
+/allow clear
+```
+
+`add` resolves a relative path against the session workspace; `folder` (the default) covers the subtree and `file` covers exactly that path. Every rule written here is a persistent user rule, the same shape the card's `always allow` stores.
+
 ## Configuration
 
 ```yaml
@@ -185,19 +203,28 @@ npm run test:unit     # policy, effects, enforcement, decisions
 npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start sandbox-exec)
 ```
 
-`test/sandbox.integration.mjs` runs the real kernel and covers: the permission store refusing every writer, `rm` / `rmdir` / `rename` / `python -c 'os.remove'` / `node -e 'fs.rmSync'` all denied while writes and creates succeed, delete granted again, write and create withheld on their own, the read fence denying `cat` and `open().read()`, an execute fence denying ungranted binaries, `python → sh` and `node → sh` grandchildren inheriting every restriction, a malformed profile running nothing, and writes outside the workspace refused unless granted. It skips with a notice when `sandbox-exec` cannot apply a profile — including when the test itself runs inside another Seatbelt sandbox — so run it from a plain terminal.
+`test/sandbox.integration.mjs` runs the real kernel and covers:
+
+- the permission store refusing every writer, and refusing them again while a rule grants the folder around it;
+- `rm`, `rmdir`, `rename`, `python -c 'os.remove'` and `node -e 'fs.rmSync'` all denied while writes and creates succeed, and delete granted again;
+- write and create withheld on their own, and `create` alone creating and filling a new file;
+- reads refused for `cat`, `python`, `node` and `bash`, for `python → sh` and `python → cat` grandchildren, and re-opened by a single read grant;
+- `/bin/sh`, `python3`, `node`, `git --version` and `gh --version` all running under the same read fence;
+- an execute fence denying ungranted binaries, and a grant for a symlink running the binary it points at;
+- a malformed profile running nothing, and writes outside the workspace refused unless granted.
+
+It skips with a notice when `sandbox-exec` cannot apply a profile — including when the test itself runs inside another Seatbelt sandbox — so run it from a plain terminal.
 
 ## Limits
 
 - Path resolution still works inside the fenced areas: `stat` and directory listing leak metadata, only file contents are withheld.
 - A tool that keeps its configuration and its token together under the home needs one read grant for that directory: `gh`, `aws`, `docker` and friends report their own error until `~/.config/<tool>` is granted. Denying `hosts.yml`, `credentials` and `id_ed25519` by default is the point; granting them is a deliberate act.
-- Effects the command line does not show are judged by the sandbox, not by the parser: an effect the program table does not know is left to the fence rather than guessed.
-- `create` alone lets a process create and fill a new file; changing a file that already exists needs `write`.
-- The strongest read fence (`enforce: full`) is expressible but not survivable on this host: macOS reads more than the policy baseline names, so `/bin/sh` aborts under it. The guarded fence is what `auto` settles on.
-- The weaker seatbelt findings: an unreadable path still resolves (metadata stays allowed), and a wildcard denial needs its operations named.
-- Renaming needs `delete` for the source plus `create` for the target.
+- The strongest read fence (`enforce: full`) is expressible but not survivable on this host: macOS reads more than the policy baseline names, so `/bin/sh` aborts under it. `auto` settles on `guarded`.
+- Other Seatbelt findings: a wildcard denial loses to a specific allowance, so refusals name their operations; an unreadable path still resolves, so metadata is not hidden.
+- Renaming needs `delete` for the source plus `create` for the target, and `create` alone lets a process fill the file it creates.
 - Read effects are derived for a fixed table of programs; the fence, not the table, is the boundary.
-- While a one-shot grant is live, a concurrently running call in the same session could use it: the sandbox is told by session, the decision by call.
+- Effects the command line does not show are judged by the sandbox, not by the parser: an effect the program table does not know is left to the fence rather than guessed.
+- `allow once` is serialized per session rather than per call: while the grant is live, another call in that session waits for the approved call to settle. A call id carried into the sandbox policy would remove the wait, and the core does not pass one today.
 - The macOS profile runner path is `/usr/bin/sandbox-exec`; a host where Seatbelt lives elsewhere falls back to the harness's own profile and reports `off`.
 
 ## License
