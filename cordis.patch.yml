@@ -1,8 +1,6 @@
 # dsh-allow bundle 层:一个宿主插件行(浏览器半由 package.json 的 dsh.client 声明注入)。
 # 安装: dsh plugin --profile web add link:<本目录>
-# 可选配置:
-#   - id: dsh-allow
-#     config:
+# 可选配置(写在 insert 的 config 下,或在你自己的 profile patch 里按 id 覆盖):
 #       rulesFile: /path/to/rules.json        # 默认 $DSH_HOME/dsh-allow.json
 #       auditFile: /path/to/audit.ndjson      # 默认 $DSH_HOME/dsh-allow-audit.ndjson
 #       audit: true                           # 关掉审计写 false
@@ -12,6 +10,17 @@
 #         - path: /opt/homebrew
 #           recursive: true
 #           access: { read: true, execute: true }
+#       autoReview:                           # 可选:让模型替用户回答「允许一次」
+#         enabled: true                       # 默认 false;关掉就完全回到人工卡片
+#         timeoutMs: 10000                    # 超时按 ASK 处理
+#         # provider: inherit                 # 默认继承会话最近一次 model/selection
+#         # model: inherit
+# 这里默认打开 autoReview:它只能在「用户刚说的话里明确要求」时产生一次性的
+# allow once,其余(不确定/超时/报错/格式不对/没有模型路由)全部落回人工卡片。
 - insert:
     - id: dsh-allow
       name: dsh-allow
+      config:
+        autoReview:
+          enabled: true
+          timeoutMs: 10000

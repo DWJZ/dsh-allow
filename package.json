@@ -1,7 +1,7 @@
 {
   "name": "dsh-allow",
   "version": "0.1.0",
-  "description": "DeepSeek Harness 文件系统权限插件：按 read/write/create/delete/execute 授权路径，而不是按命令名。 / Filesystem permissions for DSH shell calls, granted per path and capability instead of per command name.",
+  "description": "DeepSeek Harness \u6587\u4ef6\u7cfb\u7edf\u6743\u9650\u63d2\u4ef6\uff1a\u6309 read/write/create/delete/execute \u6388\u6743\u8def\u5f84\uff0c\u800c\u4e0d\u662f\u6309\u547d\u4ee4\u540d\u3002 / Filesystem permissions for DSH shell calls, granted per path and capability instead of per command name.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -20,8 +20,8 @@
   ],
   "main": "src/index.js",
   "scripts": {
-    "test": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/enforce.spec.mjs && node test/decide.spec.mjs && node test/smoke.mjs && node test/client.smoke.mjs && node test/sandbox.integration.mjs",
-    "test:unit": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/enforce.spec.mjs && node test/decide.spec.mjs",
+    "test": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/enforce.spec.mjs && node test/reviewer.spec.mjs && node test/decide.spec.mjs && node test/smoke.mjs && node test/client.smoke.mjs && node test/sandbox.integration.mjs",
+    "test:unit": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/enforce.spec.mjs && node test/reviewer.spec.mjs && node test/decide.spec.mjs",
     "test:sandbox": "node test/sandbox.integration.mjs"
   },
   "exports": {

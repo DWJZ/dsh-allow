@@ -94,6 +94,26 @@ export function resolveConfig(config, home) {
   if (!['auto', 'full', 'guarded', 'process', 'writes', 'off'].includes(enforce)) {
     throw new TypeError(`dsh-allow: config enforce must be "auto", "full", "guarded", "process", "writes" or "off", got ${JSON.stringify(enforce)}`)
   }
+  const autoReviewRaw = config?.autoReview ?? {}
+  if (typeof autoReviewRaw !== 'object' || autoReviewRaw === null) {
+    throw new TypeError('dsh-allow: config autoReview must be an object')
+  }
+  const timeoutMs = autoReviewRaw.timeoutMs ?? 10000
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError(`dsh-allow: config autoReview.timeoutMs must be a positive number, got ${JSON.stringify(timeoutMs)}`)
+  }
+  const routeField = (value, field) => {
+    if (value === undefined || value === 'inherit') return undefined
+    if (typeof value !== 'string' || value === '') {
+      throw new TypeError(`dsh-allow: config autoReview.${field} must be a non-empty string or "inherit", got ${JSON.stringify(value)}`)
+    }
+    return value
+  }
+  const reviewProvider = routeField(autoReviewRaw.provider, 'provider')
+  const reviewModel = routeField(autoReviewRaw.model, 'model')
+  if ((reviewProvider === undefined) !== (reviewModel === undefined)) {
+    throw new TypeError('dsh-allow: config autoReview.provider and autoReview.model are configured together')
+  }
   const rulesFile = text(config?.rulesFile, 'rulesFile', join(home, RULES_FILE_NAME))
   const auditFile = text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME))
   return {
@@ -106,6 +126,13 @@ export function resolveConfig(config, home) {
     // `auto` takes the strongest fence a probe proves this host can hold:
     // writes and execution always, user-data reads when macOS survives it.
     enforce,
+    // The optional reviewer only ever answers "allow once" for one call; it is
+    // off unless a deployment asks for it, and it never writes a rule.
+    autoReview: {
+      enabled: autoReviewRaw.enabled === true,
+      timeoutMs,
+      ...(reviewProvider === undefined ? {} : { provider: reviewProvider, model: reviewModel }),
+    },
     // Nothing the agent runs may change the rules that judge it. The paths are
     // canonical so they match the paths a decision compares, whatever spelling
     // the configuration used.

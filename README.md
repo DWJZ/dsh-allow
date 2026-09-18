@@ -133,6 +133,54 @@ Sandbox:   workspace-write
 
 A `sandbox_permissions` escalation is a wider process fence, not a filesystem capability, so it is **never** approved automatically — not even for a command whose capabilities are all granted. One approval lets a command run outside its mode; that decision belongs to the user.
 
+## Auto review (optional)
+
+A permission request the policy cannot settle normally waits for a click. With `autoReview.enabled` it goes to the session's own model first:
+
+```
+missing (path, capability)
+        ↓
+   auto reviewer  ── ALLOW → the same one-shot grant the card writes → run
+        ↓ ASK / timeout / error / anything else
+   the card: deny / always allow / allow once
+```
+
+The reviewer is not a security boundary and has exactly two answers:
+
+| verdict | what happens |
+| --- | --- |
+| `ALLOW` | only when the request clearly follows from the user's latest message and is narrowly scoped. It reuses the existing call-scoped one-shot grant — the same path the card's `allow once` takes — so the call is bound, the profile carries it by command, and it is spent when the call settles. |
+| `ASK` | everything else: uncertainty, a wider path than the request implies, a sensitive path the user never mentioned, no model route, no LLM service, a timeout, a transport error, a non-JSON answer, or a verdict that is not one of the two. |
+
+It can never deny, never write a rule, never widen the workspace, never touch the permission store or the sandbox profile, and it has no memory of past approvals: persistent rules are still the user's decision alone, and the deterministic policy runs first, so an existing rule never reaches the reviewer.
+
+What it is told is only the analyzed request and the user's own words:
+
+```json
+{
+  "command": "cp report.pdf ~/Downloads/report.pdf",
+  "cwd": "/Users/me/project",
+  "workspace": "/Users/me/project",
+  "requestedPermissions": [
+    { "operation": "create", "path": "/Users/me/Downloads/report.pdf" },
+    { "operation": "write", "path": "/Users/me/Downloads/report.pdf" }
+  ],
+  "userMessages": ["把报告保存到 Downloads"]
+}
+```
+
+`userMessages` holds at most three messages, and only events whose source is the user: a `user/message` injected by a plugin, a notice, a tool result, the command line, repository text, a web page and the agent's own claims are never treated as authorization, and the system prompt says so explicitly. No conversation history, no tool output, and no approval history is sent.
+
+```yaml
+    autoReview:
+      enabled: false        # off by default; the card stays in charge
+      timeoutMs: 10000      # a timeout is an ASK
+      # provider: inherit   # default: the session's latest model/selection route
+      # model: inherit
+```
+
+Every review is logged and audited with the command, the requested capabilities, the verdict, the reason, the latency and the model route — never with file contents, secrets, or hidden reasoning.
+
 ## The macOS backend
 
 `src/macos.js` compiles a rule set into a Seatbelt (`sandbox-exec`) profile, and the mapping was measured against the kernel, not assumed:
@@ -187,6 +235,9 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
     audit: true                             # false turns the audit log off
     sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
     enforce: auto                           # auto | full | guarded | process | writes | off
+    autoReview:                             # optional: let the model answer "allow once"
+      enabled: false                        # the card stays in charge when off
+      timeoutMs: 10000
     grants:                                 # deployment grants, same shape as a stored rule
       - path: /opt/homebrew
         recursive: true
@@ -199,9 +250,11 @@ A `rules.json` written by dsh-allow 0.1 (the command-prefix model) reads as empt
 
 ```sh
 npm test              # units, host wiring, card render, and the real-sandbox suite
-npm run test:unit     # policy, effects, enforcement, decisions
+npm run test:unit     # policy, effects, enforcement, reviewer, decisions
 npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start sandbox-exec)
 ```
+
+`test/reviewer.spec.mjs` injects the model and covers what the reviewer is told (only real user messages, the analyzed permissions, the fixed prompt), every answer shape (`ALLOW`, `ASK`, fenced JSON, prose, an unknown verdict, an empty answer), and every failure path (no route, no LLM service, a provider throw, a terminal error chunk, a timeout, an invalid answer). `test/smoke.mjs` covers the gate integration: an `ALLOW` runs the call through the existing call-scoped one-shot grant and leaves the rules file untouched, while an `ASK`, a failing reviewer and a disabled reviewer all leave the card in charge.
 
 `test/sandbox.integration.mjs` runs the real kernel and covers:
 
@@ -226,6 +279,8 @@ It skips with a notice when `sandbox-exec` cannot apply a profile — including 
 - Effects the command line does not show are judged by the sandbox, not by the parser: an effect the program table does not know is left to the fence rather than guessed.
 - `allow once` is serialized per session rather than per call: while the grant is live, another call in that session waits for the approved call to settle. A call id carried into the sandbox policy would remove the wait, and the core does not pass one today.
 - The macOS profile runner path is `/usr/bin/sandbox-exec`; a host where Seatbelt lives elsewhere falls back to the harness's own profile and reports `off`.
+- Auto review is a convenience, not a boundary: a wrong or manipulated model can allow a request the user would have denied. What bounds it is what it can allow — one call, the narrowest rules for that request — and that the kernel still enforces the policy underneath.
+- The reviewer adds one model call in front of a prompt, so a card can appear up to `timeoutMs` later than it otherwise would.
 
 ## License
 

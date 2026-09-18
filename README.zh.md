@@ -133,6 +133,54 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 
 `sandbox_permissions` 提权是「更宽的进程围栏」,不是文件能力,所以**永不自动批准** —— 即使这条命令需要的能力全都已授权。一次批准就等于让命令跑到模式之外,这个决定属于用户。
 
+## 自动复核(可选)
+
+策略定不下来的权限请求,正常要等人点一下。打开 `autoReview.enabled` 后,它先交给本会话自己的模型:
+
+```
+缺少的 (路径, 能力)
+        ↓
+   自动复核  ── ALLOW → 与卡片「允许一次」完全相同的那条一次性授权 → 执行
+        ↓ ASK / 超时 / 报错 / 其它任何情况
+   卡片:拒绝 / 总是允许 / 允许一次
+```
+
+复核不是安全边界,它只有两个答案:
+
+| 判定 | 行为 |
+| --- | --- |
+| `ALLOW` | 仅当这次请求明显来自用户最新那句话、且范围很窄时。它复用已有的「按调用绑定的一次性授权」—— 和卡片上「允许一次」走同一条路 —— 所以调用被绑定、profile 按命令认领、调用结束即回收。 |
+| `ASK` | 其余一切:不确定、路径比用户要求宽、用户从没提过的敏感路径、没有模型路由、没有 LLM 服务、超时、传输错误、不是 JSON、判定不是这两个值之一。 |
+
+它**永不**拒绝、永不写规则、永不扩大 workspace、永不碰权限库或 sandbox profile,也没有任何审批记忆:持久规则仍然只由用户决定;确定性策略先跑,所以已有规则根本不会走到复核。
+
+送给它的只有「分析过的请求」和「用户自己的话」:
+
+```json
+{
+  "command": "cp report.pdf ~/Downloads/report.pdf",
+  "cwd": "/Users/me/project",
+  "workspace": "/Users/me/project",
+  "requestedPermissions": [
+    { "operation": "create", "path": "/Users/me/Downloads/report.pdf" },
+    { "operation": "write", "path": "/Users/me/Downloads/report.pdf" }
+  ],
+  "userMessages": ["把报告保存到 Downloads"]
+}
+```
+
+`userMessages` 最多三条,而且只取 source 为用户的 `user/message`:插件注入的 user/message、notice、工具结果、命令行文本、仓库内容、网页、以及主 agent 自己的声明,都不算授权 —— system prompt 里写死了这条。会话历史、工具输出、历史审批次数都不会发出去。
+
+```yaml
+    autoReview:
+      enabled: false        # 默认关闭;关着时一切照旧由卡片决定
+      timeoutMs: 10000      # 超时按 ASK 处理
+      # provider: inherit   # 默认继承会话最近一次 model/selection 路由
+      # model: inherit
+```
+
+每次复核都会写日志与审计:命令、请求的能力、判定、理由、耗时、模型路由 —— 不写文件内容、凭据、或隐藏推理。
+
 ## macOS 后端
 
 `src/macos.js` 会把规则集编译成 Seatbelt(`sandbox-exec`)profile,映射是对内核实测出来的,不是照抄的:
@@ -187,6 +235,9 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
     audit: true                             # false 关闭审计
     sessionGrantTtlMs: 600000               # 「允许一次」的兜底有效期
     enforce: auto                           # auto | full | guarded | process | writes | off
+    autoReview:                             # 可选:让模型替你回答「允许一次」
+      enabled: false                        # 关着时卡片说了算
+      timeoutMs: 10000
     grants:                                 # 部署级授权,字段与持久规则一致
       - path: /opt/homebrew
         recursive: true
@@ -199,9 +250,11 @@ dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,�
 
 ```sh
 npm test              # 单元 + 宿主接线 + 卡片渲染 + 真实沙箱
-npm run test:unit     # 策略、效果推导、强制层、决策
+npm run test:unit     # 策略、效果推导、强制层、复核、决策
 npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的宿主)
 ```
+
+`test/reviewer.spec.mjs` 注入模型,覆盖「告诉复核什么」(只有真实用户消息、分析过的权限、固定的 prompt)、各种答案形态(`ALLOW`、`ASK`、带围栏的 JSON、自然语言、未知判定、空答案),以及所有失败路径(没有路由、没有 LLM 服务、provider 抛错、终止错误块、超时、答案不合法)。`test/smoke.mjs` 覆盖闸门接线:`ALLOW` 走既有的按调用一次性授权、规则文件一个字节不改;`ASK`、复核失败、以及复核关闭时,都由卡片接管。
 
 `test/sandbox.integration.mjs` 跑的是真内核,覆盖:权限库对任何写入者都拒绝;`rm` / `rmdir` / `rename` / `python -c 'os.remove'` / `node -e 'fs.rmSync'` 全部被拒而写和建正常;再授予 delete 后又能删;单独关闭 write 与 create;读围栏让 `cat` 和 `open().read()` 失败;execute 围栏拒绝未授权二进制;`python → sh` 与 `node → sh` 的孙进程继承全部限制;内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。覆盖的内容包括:
 
@@ -227,6 +280,8 @@ npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的�
 - 读效果只为固定的一张程序表推导;真正的边界是围栏,不是这张表。
 - 「允许一次」是按会话串行、而不是按调用并行的:授权存活期间,同会话的其它调用会等被批准的那次结算。若核心把 callId 传进 sandbox policy,这个等待就能去掉 —— 目前核心不传。
 - profile runner 固定为 `/usr/bin/sandbox-exec`;Seatbelt 不在这个位置的宿主会退回到 harness 自己的 profile 并报告 `off`。
+- 自动复核是便利,不是边界:一个错误或被诱导的模型可能放行用户本会拒绝的请求。限制它的是「它能放行什么」—— 一次调用、只针对该请求的最窄规则 —— 以及底下仍有内核在强制策略。
+- 复核会在卡片前多一次模型调用,所以卡片最多可能晚 `timeoutMs` 出现。
 
 ## 许可证
 

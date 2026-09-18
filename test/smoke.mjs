@@ -13,6 +13,7 @@ const PLUGIN = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const host = await import(pathToFileURL(join(PLUGIN, 'src/index.js')).href)
 const store = await import(pathToFileURL(join(PLUGIN, 'src/store.js')).href)
 const fspolicy = await import(pathToFileURL(join(PLUGIN, 'src/fspolicy.js')).href)
+const reviewerModule = await import(pathToFileURL(join(PLUGIN, 'src/reviewer.js')).href)
 
 const root = mkdtempSync(join(tmpdir(), 'dsh-allow-smoke-'))
 const rulesFile = join(root, 'rules.json')
@@ -290,6 +291,92 @@ console.log('a checked-in workspace rule grants nothing')
   check('reading a host secret still asks', repoDecision.kind === 'ask', JSON.stringify(repoDecision))
   const repoWrite = await repoGate(exec('echo x >> /Users/tester/.ssh/authorized_keys', { callId: 'r2' }), next)
   check('and writing one does too', repoWrite.kind === 'ask', JSON.stringify(repoWrite))
+}
+
+console.log('auto reviewer')
+{
+  const reviewSession = {
+    id: 'sr1',
+    seq: 2,
+    header: { cwd: CWD },
+    eventAt: seq => [
+      { type: 'user/message', data: { id: 'm1', role: 'user', content: [{ type: 'text', text: '删除 review-only 目录' }], source: { kind: 'user' } } },
+      { type: 'model/selection', data: { provider: 'test-provider', model: 'test-model' } },
+    ][seq],
+  }
+  const reviewConfig = { ...store.resolveConfig({ rulesFile, auditFile, autoReview: { enabled: true, timeoutMs: 500 } }, root), harnessHome: root, home: HOME }
+  const reviewGrants = store.createGrantStore()
+  const reviewPendings = store.createPendingStore()
+  const reviewAudit = join(root, 'review.ndjson')
+  const reviewEngine = host.createEngine({
+    config: { ...reviewConfig, auditFile: reviewAudit },
+    home: HOME,
+    grants: reviewGrants,
+    pendings: reviewPendings,
+    ctx,
+  })
+  const scripted = text => ({
+    calls: [],
+    async *stream(options) { this.calls.push(options); yield { type: 'text-delta', index: 0, text }; yield { type: 'finish', reason: { kind: 'stop' } } },
+  })
+  const gateWith = (llm) => host.createGate({
+    engine: reviewEngine,
+    pendings: reviewPendings,
+    logger,
+    config: { ...reviewConfig, auditFile: reviewAudit },
+    grants: reviewGrants,
+    reviewer: reviewerModule.createReviewer({ config: reviewConfig, logger, llmOf: () => llm }),
+  })
+
+  const rulesBeforeReview = store.readRules(rulesFile).length
+  let llm = scripted('{"verdict":"ALLOW","reason":"the user asked to delete build"}')
+  let gateReview = gateWith(llm)
+  let reviewDecision = await gateReview(exec('rm -rf review-only', { callId: 'rc1', agent: { session: reviewSession } }), next)
+  check('an ALLOW runs the call without a card', reviewDecision.kind === 'allow', JSON.stringify(reviewDecision))
+  check('J: no persistent rule was written', store.readRules(rulesFile).length === rulesBeforeReview)
+  check('K: the existing one-shot grant was used', reviewGrants.rulesFor('sr1', 'rc1').length === 1
+    && reviewGrants.rulesFor('sr1', 'rc1')[0].source === 'session', JSON.stringify(reviewGrants.rulesFor('sr1', 'rc1')))
+  check('K: and it is bound to that call only', reviewGrants.rulesFor('sr1', 'rc2').length === 0
+    && reviewGrants.holder('sr1', 'rc2') === 'rc1')
+  check('no card record was left behind', reviewPendings.get('sr1', 'rc1') === null)
+  check('the LLM saw the user message and the missing capability',
+    llm.calls[0].messages[0].content[0].text.includes('删除 review-only 目录')
+    && llm.calls[0].messages[0].content[0].text.includes('delete'), llm.calls[0].messages[0].content[0].text.slice(0, 200))
+  const reviewLines = readFileSync(reviewAudit, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  check('the audit records the verdict and the route',
+    reviewLines.some(line => line.decision === 'allow' && line.review?.verdict === 'ALLOW' && line.review?.route?.model === 'test-model'),
+    JSON.stringify(reviewLines.at(-1)))
+  const reviewSettle = host.createSettleListener({ grants: reviewGrants, logger })
+  await reviewSettle(exec('rm -rf review-only', { callId: 'rc1', agent: { session: reviewSession } }), { kind: 'accepted' }, next)
+  check('K: the grant is spent when the call settles', reviewGrants.rulesFor('sr1', 'rc1').length === 0)
+
+  llm = scripted('{"verdict":"ASK","reason":"the request is not clearly the user\'s"}')
+  gateReview = gateWith(llm)
+  reviewDecision = await gateReview(exec('rm -rf review-only', { callId: 'rc2', agent: { session: reviewSession } }), next)
+  check('an ASK falls back to the card', reviewDecision.kind === 'ask'
+    && String(reviewDecision.reason).startsWith(host.POLICY_REASON_PREFIX), JSON.stringify(reviewDecision))
+  check('and the card has its record', reviewPendings.get('sr1', 'rc2') !== null)
+  check('and no grant was created', reviewGrants.rulesFor('sr1', 'rc2').length === 0)
+
+  const failing = { async *stream() { throw new Error('provider down') } }
+  reviewDecision = await gateWith(failing)(exec('rm -rf review-only', { callId: 'rc3', agent: { session: reviewSession } }), next)
+  check('a failing reviewer falls back to the card too', reviewDecision.kind === 'ask', JSON.stringify(reviewDecision))
+
+  const plainConfig = { ...store.resolveConfig({ rulesFile, auditFile }, root), harnessHome: root, home: HOME }
+  const plainPendings = store.createPendingStore()
+  const plainEngine = host.createEngine({ config: plainConfig, home: HOME, grants: store.createGrantStore(), pendings: plainPendings, ctx })
+  let unusedLlm = scripted('{"verdict":"ALLOW","reason":"should never be called"}')
+  const plainGate = host.createGate({
+    engine: plainEngine,
+    pendings: plainPendings,
+    logger,
+    config: plainConfig,
+    grants: store.createGrantStore(),
+    reviewer: reviewerModule.createReviewer({ config: plainConfig, logger, llmOf: () => unusedLlm }),
+  })
+  reviewDecision = await plainGate(exec('rm -rf review-only', { callId: 'rc4', agent: { session: reviewSession } }), next)
+  check('a disabled reviewer leaves the card in charge', reviewDecision.kind === 'ask' && unusedLlm.calls.length === 0,
+    JSON.stringify(reviewDecision))
 }
 
 console.log('/allow')

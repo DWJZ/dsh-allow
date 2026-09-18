@@ -20,6 +20,7 @@ import { homedir } from 'node:os'
 import { canonicalPath, describeRule, protectedRefusal } from './fspolicy.js'
 import { evaluateCommandLine } from './decide.js'
 import { createEnforcer } from './enforce.js'
+import { createReviewer } from './reviewer.js'
 import {
   addRule, appendAudit, clearRules, countHit, createGrantStore, createPendingStore, readRules,
   removeRule, resolveConfig, resolveHome,
@@ -227,11 +228,15 @@ export function fileTargetOf(exec) {
  * A confinement knows its session but not its call, so while one call holds an
  * "allow once" grant every other call in that session waits for it to settle:
  * that is what keeps a second call from running under the first one's grant.
+ * A permission request the policy could not settle goes to the optional auto
+ * reviewer first: `ALLOW` becomes the same one-shot grant the card's "allow
+ * once" writes and the call proceeds, everything else leaves the card in front
+ * of the user.
  * @param options - the engine, the pending store, the configuration, the session
- *   grants, and the logger.
+ *   grants, the reviewer, and the logger.
  * @returns the waterfall listener.
  */
-export function createGate({ engine, pendings, logger, config = null, grants = null }) {
+export function createGate({ engine, pendings, logger, config = null, grants = null, reviewer = null }) {
   return async (exec, next) => {
     if (grants !== null) await waitForGrantHolder(grants, exec, logger)
     const command = commandOf(exec)
@@ -251,6 +256,35 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
     const context = engine.decide({ exec, command, cwd })
     const { decision } = context
     if (decision.decision === 'allow') return next()
+    if (decision.decision === 'prompt' && reviewer !== null && reviewer.enabled === true) {
+      const review = await reviewer.review({
+        exec,
+        command,
+        cwd,
+        workspace: context.workspaceRoot,
+        missing: decision.missing,
+      })
+      const record = {
+        tool: exec?.name ?? 'unknown',
+        cwd,
+        command,
+        review: {
+          verdict: review.verdict,
+          reason: review.reason,
+          latencyMs: review.latencyMs,
+          route: review.route,
+        },
+      }
+      if (review.verdict === 'ALLOW' && decision.suggestions.length > 0 && grants !== null) {
+        // The same one-shot grant the card would write: bound to this call,
+        // carried into the profile by its command, spent when the call settles.
+        grants.grant(exec?.agent?.session?.id, exec?.callId, command, decision.suggestions)
+        appendAudit(config?.auditFile ?? null, { ...record, decision: 'allow', reason: `auto review allowed this call once: ${review.reason}` })
+        logger.info(`dsh-allow: auto review allowed this call once — ${review.reason}`)
+        return next()
+      }
+      appendAudit(config?.auditFile ?? null, { ...record, decision: 'prompt', reason: `auto review deferred to the user: ${review.reason}` })
+    }
     remember(pendings, exec, context, command, cwd)
     if (decision.decision === 'forbidden') {
       logger.warn(`dsh-allow: denied ${JSON.stringify(command.slice(0, 120))} — ${decision.reason}`)
@@ -657,7 +691,12 @@ export function apply(ctx, pluginConfig) {
     return () => { enforcement.uninstall() }
   }, 'dsh-allow: process fence')
   const engine = createEngine({ config, home, grants, pendings, ctx, enforcement })
-  const gate = createGate({ engine, pendings, logger: ctx.logger, config, grants })
+  const reviewer = createReviewer({
+    config,
+    logger: ctx.logger,
+    llmOf: () => ctx.get('llm'),
+  })
+  const gate = createGate({ engine, pendings, logger: ctx.logger, config, grants, reviewer })
   // Ahead of every other pre-execute listener: a protected path must be refused
   // before any other policy can allow it.
   ctx.on('tools/pre-execute', (exec, next) => gate(exec, next), { prepend: true })
