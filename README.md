@@ -45,12 +45,15 @@ process execution
 
 ## How a command is analysed
 
-1. `src/parse.js` splits the line on unquoted `&&`, `||`, `;`, `|`, `&`, and newlines, then tokenizes each segment with quoting and escapes intact. `echo "a && b"` is one command; `$(…)`, backticks, globs, subshells, groups, control keywords, here-documents, and dynamic executables all make the line **unanalysable**.
-2. `sh -c '…'`, `bash -lc '…'`, and `eval '…'` are parsed **recursively** (depth 4). A wrapper whose program is dynamic is unanalysable.
-3. Here-document bodies (`<<EOF … EOF`) are **stdin data, not shell source**, so they are removed before parsing — a Python line inside one is no longer read as a command. The reader is still judged: `python3 -` or a shell without `-c` takes its program from stdin, which is code execution — pinned only as the exact command text.
+1. `src/parse.js` parses with **tree-sitter + tree-sitter-bash** — a real bash grammar — and only reads the tree it returns: statements, pipelines, `&&`/`||`/`;`, `for`/`if`/`while`/`case`, subshells, command substitution, redirections, here-documents. `echo "a && b"` is one command; the commands inside `for f in a b; do echo $f; done` are judged individually; a here-document body is its own node and is never read as shell source.
+2. `bash -lc '…'` / `sh -c '…'` are parsed **recursively** (depth 4) and their inner commands are judged with the same rules; an inner program the grammar cannot reduce leaves the whole call opaque, which prompts.
+3. `$(…)` and backticks join the same line: their commands run first and aggregate with it, and a **substituted program name** (`$(printf rm) -rf /`) makes the whole line unanalysable.
+4. Input the grammar reports an error on is unanalysable, so it prompts and can only be pinned by exact source.
+
+5. Here-document bodies (`<<EOF … EOF`) are **stdin data, not shell source**, so they are removed before parsing — a Python line inside one is no longer read as a command. The reader is still judged: `python3 -` or a shell without `-c` takes its program from stdin, which is code execution — pinned only as the exact command text.
 4. `$(…)` and backticks are parsed recursively too: the substituted commands join the same line and are aggregated with it (`echo "$(rm -rf /)"` is forbidden). A substitution the parser cannot reduce makes the whole line a prompt, and a substituted **program name** is always unanalysable, so `$(printf rm) -rf /` is never allowed.
-5. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
-6. Unanalysable lines are `prompt` and match no per-command rule — the fail-closed rule for shell syntax this parser does not model. They can still be pinned as one exact command, which is the only rule that reaches them.
+6. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
+7. Unanalysable lines are `prompt` and match no per-command rule — the fail-closed rule for shell syntax this parser does not model. They can still be pinned as one exact command, which is the only rule that reaches them.
 
 ## Inline execution: shell wrappers and interpreters
 
@@ -70,6 +73,8 @@ A capable interpreter may run, but its capability is never remembered broadly. O
 
 - **A mixed line gets both**: the parsable members keep their minimal capability rules and the whole line is added as an exact pin, so no command is left unsilenceable.
 - **Hard denials are the one exception**: the built-in catastrophic verdicts (`rm -rf /`, `mkfs`, `dd of=/dev/…`) are not rememberable by default. A deployment that wants to pin those exact lines sets `allowForbiddenSource: true` (default `false`); only then does the card offer the pin and honour it.
+
+**The built-in policy never hard-denies.** Every risk becomes a `prompt` with one concrete rule to remember; `forbidden` survives only for rules **you** write (`/allow add forbidden …`), and none are shipped.
 
 **Broad rules that are refused** (the store throws on write; the reader ignores them):
 
@@ -107,6 +112,8 @@ Argument-aware, not a name blacklist. Destructive shapes are recognised from the
 | paths | `rm -rf .` at `/` or `$HOME`; `~`, `..`, and `/x/..` are normalized before comparison | forbidden / prompt by cwd |
 
 When one member of a line can never be remembered (inline code, a substituted program name), the other members still get their suggestions and the card says that part of the line keeps asking; a line containing a forbidden command suggests nothing at all.
+
+Suggestions are parameter-aware without pinning the whole line: a destructive program keeps a couple of arguments (`rm -rf build` → `["-rf","build"]`, so `rm -rf other` still asks), `chmod 777 /etc/x` keeps `["777","/etc/x"]`, and `git reset --hard` keeps `["reset"]`. A prompt caused by a redirection offers both the minimal rule and the whole-line exact pin.
 
 A command nothing matches defers to the sandbox (`defaultDecision: allow`); set `defaultDecision: prompt` to gate everything.
 

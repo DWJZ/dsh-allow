@@ -103,7 +103,8 @@ check('and a pending record exists for the card', gatePendings.get('s1', 'c1')?.
 check('the suggested rule keeps the subcommand', gatePendings.get('s1', 'c1')?.label === 'git reset', String(gatePendings.get('s1', 'c1')?.label))
 
 decision = await gate(exec('rm -rf /'), next)
-check('a catastrophic command is denied outright', decision.kind === 'deny', JSON.stringify(decision))
+check('a catastrophic command asks instead of denying', decision.kind === 'ask', JSON.stringify(decision))
+check('and the card is offered a concrete rule', String(decision.reason).includes('rm -rf /'), decision.reason)
 
 const before = nextCalls
 decision = await gate(exec('ls', { name: 'read' }), next)
@@ -115,12 +116,12 @@ check('a stored rule allows the covered command', decision.kind === 'allow', JSO
 check('and counts the hit', store.readRules(rulesFile)[0]?.hits === 1, JSON.stringify(store.readRules(rulesFile)[0]))
 
 decision = await gate(exec('touch x && rm -rf /'), next)
-check('a chained catastrophic command is still denied', decision.kind === 'deny', JSON.stringify(decision))
+check('a chained catastrophic command still asks', decision.kind === 'ask', JSON.stringify(decision))
 
 console.log('audit log')
 const lines = readFileSync(auditFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
 check('every decision is logged', lines.length >= 5, String(lines.length))
-check('the log records the decision and the parsed commands', lines.some(line => line.decision === 'forbidden' && Array.isArray(line.commands)), JSON.stringify(lines.at(-1)))
+check('the log records the decision and the parsed commands', lines.some(line => line.decision === 'prompt' && Array.isArray(line.commands)), JSON.stringify(lines.at(-1)))
 const secretGate = host.createGate({
   config: { ...config, auditFile: join(root, 'secret.ndjson') },
   home: HOME,
@@ -239,9 +240,12 @@ console.log('escalation listener')
   outcome = await manualListener(call('cp /a /b && echo copied', 'c5'), delegate)
   check('the escalation can be kept manual by configuration', outcome === 'delegated', outcome)
 
-  store.addRule(escalationFile, { decision: 'allow', executable: 'rm', argvPrefix: [] })
+  store.addRule(escalationFile, { decision: 'allow', executable: 'rm', argvPrefix: ['-rf', '/'] })
   outcome = await listener(call('rm -rf /', 'c3'), delegate)
-  check('a catastrophic escalation is rejected outright', outcome === 'rejected', outcome)
+  check('a remembered catastrophic command is approved silently', outcome === 'allowed-once', outcome)
+  store.addRule(escalationFile, { decision: 'forbidden', executable: 'dd', argvPrefix: [] })
+  outcome = await listener(call('dd if=/dev/zero of=/dev/sda', 'c8'), delegate)
+  check('a user-authored deny rule rejects the escalation', outcome === 'rejected', outcome)
 
   const inlinePendings = store.createPendingStore()
   const inlineListener = host.createApprovalListener({ config: listenerConfig, home: HOME, pendings: inlinePendings, logger })

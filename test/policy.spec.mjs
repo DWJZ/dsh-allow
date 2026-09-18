@@ -44,7 +44,7 @@ let result = evaluate('touch foo', [allowRule('touch')])
 check('1. allow rule covers a simple command', result.decision === 'allow', result.decision)
 
 result = evaluate('touch foo && rm -rf /', [allowRule('touch')])
-check('2. a chained catastrophic command is forbidden despite the touch rule', result.decision === 'forbidden', result.decision)
+check('2. a chained catastrophic command cannot ride the touch rule', result.decision === 'prompt', result.decision)
 
 result = evaluate('git status && touch foo')
 check('3. two harmless commands are allowed', result.decision === 'allow', result.decision)
@@ -63,7 +63,7 @@ result = evaluate('cat foo | sudo tee /etc/foo')
 check('7. a pipeline is judged by its most dangerous member', result.decision === 'prompt', result.decision)
 
 result = evaluate(`bash -c "touch foo && rm -rf /"`)
-check('8. a shell wrapper is parsed recursively', result.decision === 'forbidden', result.decision)
+check('8. a shell wrapper is parsed recursively', result.decision === 'prompt', result.decision)
 
 result = evaluate('bash -c "$UNKNOWN"')
 check('9. a dynamic wrapper program prompts', result.decision === 'prompt', result.decision)
@@ -75,7 +75,7 @@ result = evaluate('echo key > ~/.ssh/authorized_keys')
 check('11. writing a credential path prompts', result.decision === 'prompt', result.decision)
 
 result = evaluate('rm -rf .', [], '/')
-check('12a. rm -rf . at the filesystem root is forbidden', result.decision === 'forbidden', result.decision)
+check('12a. rm -rf . at the filesystem root prompts', result.decision === 'prompt', result.decision)
 result = evaluate('rm -rf .', [], CWD)
 check('12b. rm -rf . inside a project prompts', result.decision === 'prompt', result.decision)
 
@@ -85,7 +85,9 @@ result = evaluate('git status', [allowRule('git', ['status'])])
 check('13b. while it does cover git status', result.decision === 'allow', result.decision)
 
 result = evaluate('rm -rf /', [{ id: 'wide', decision: 'prompt', executable: 'rm', argvPrefix: [] }])
-check('14. forbidden outranks a wider prompt rule', result.decision === 'forbidden', result.decision)
+check('14. a wider prompt rule still matches', result.decision === 'prompt', result.decision)
+result = evaluate('rm -rf /', [{ id: 'deny', decision: 'forbidden', executable: 'rm', argvPrefix: [] }, { id: 'wide', decision: 'prompt', executable: 'rm', argvPrefix: [] }])
+check('14b. a user-authored deny rule outranks it', result.decision === 'forbidden', result.decision)
 
 const onceRules = []
 result = evaluate('npm install left-pad', onceRules)
@@ -117,7 +119,7 @@ for (const command of bypasses) {
   check(`"${command}" → ${outcome.decision}`, outcome.decision !== 'allow', `${outcome.decision} (${outcome.reason})`)
 }
 
-console.log('catastrophic set')
+console.log('catastrophic set: prompts, with a concrete rule to remember')
 const catastrophic = [
   ['rm -rf /', CWD],
   ['rm -rf /*', CWD],
@@ -131,7 +133,8 @@ const catastrophic = [
 ]
 for (const [command, cwd] of catastrophic) {
   const outcome = evaluate(command, [], cwd)
-  check(`"${command}" is forbidden`, outcome.decision === 'forbidden', `${outcome.decision} (${outcome.reason})`)
+  check(`"${command}" prompts`, outcome.decision === 'prompt', `${outcome.decision} (${outcome.reason})`)
+  check(`"${command}" offers a rule`, outcome.suggestions.length > 0, JSON.stringify(outcome.suggestions))
 }
 
 console.log('rule matching is structured')
@@ -144,7 +147,7 @@ check('another executable never matches', evaluate('rm status', gitRules).decisi
 console.log('suggestions stay narrow')
 check('a subcommand program keeps its subcommand', policy.describeRule(policy.suggestRule(parse.parseCommandLine('git status --short', { home: HOME }).commands[0])) === 'git status')
 check('a plain program suggests only itself', policy.describeRule(policy.suggestRule(parse.parseCommandLine('touch foo', { home: HOME }).commands[0])) === 'touch')
-check('a flag is never part of a suggestion', policy.describeRule(policy.suggestRule(parse.parseCommandLine('rm -rf build', { home: HOME }).commands[0])) === 'rm')
+check('a destructive command keeps its arguments', policy.describeRule(policy.suggestRule(parse.parseCommandLine('rm -rf build', { home: HOME }).commands[0])) === 'rm -rf build')
 check('a script run is pinned to the script', policy.describeRule(policy.suggestRule(parse.parseCommandLine('node ./x.mjs', { home: HOME }).commands[0])) === 'node ./x.mjs')
 
 console.log('a code-execution rule is only ever pinned')
@@ -162,8 +165,8 @@ check('and reports itself uncovered', line.covered === false)
 line = evaluate('cp /a /b && echo copied', lineRules)
 check('the same line is covered once both rules exist', line.covered === true)
 line = evaluate('cp /a /b && rm -rf /', lineRules)
-check('one dangerous member defeats coverage', line.covered === false && line.decision === 'forbidden')
-check('and a forbidden line suggests nothing', line.suggestions.length === 0)
+check('one dangerous member defeats coverage', line.covered === false && line.decision === 'prompt')
+check('and its dangerous member is what the card names', line.suggestions.some(rule => policy.describeRule(rule).startsWith('rm')), JSON.stringify(line.suggestions))
 check('an unparsable line is never covered', evaluate('echo "$(cat l | while read x; do rm $x; done)"', lineRules).covered === false)
 
 console.log('a mixed line still offers what it can remember')
@@ -185,7 +188,7 @@ check('a shell heredoc reader prompts too', evaluate('bash <<EOF\nrm -rf /\nEOF'
 check('quoted << is not a heredoc', evaluate('echo "a << b"').decision === 'allow')
 
 console.log('everything can be pinned, directly or through the opt-in')
-check('an unparsable line always offers its own text', evaluate('for f in a; do rm -rf /; done').suggestions.some(rule => rule.exact === true))
+check('a control structure is parsed now, so its commands are what the card names', evaluate('for f in a; do rm -rf /; done').suggestions.some(rule => !rule.exact), JSON.stringify(evaluate('for f in a; do rm -rf /; done').suggestions))
 check('a partly pinnable line offers both', (() => {
   const mixed2 = evaluate('cd /tmp && python3 - <<PY\nprint(1)\nPY')
   return mixed2.suggestions.some(rule => rule.exact === true) && mixed2.suggestions.some(rule => rule.exact !== true)
@@ -193,11 +196,13 @@ check('a partly pinnable line offers both', (() => {
 const forbiddenFlag = (command, rules, allowForbiddenSource) => policy.evaluateCommandLine({
   command, cwd: CWD, home: HOME, rules, allowForbiddenSource,
 })
-check('a hard denial offers nothing by default', forbiddenFlag('rm -rf /', [], false).suggestions.length === 0)
-check('and offers its exact text when the deployment opts in', forbiddenFlag('rm -rf /', [], true).suggestions[0]?.exact === true)
+const denyRule = [{ id: 'deny', decision: 'forbidden', executable: 'rm', argvPrefix: [] }]
+check('nothing is hard-denied by the built-in policy', forbiddenFlag('rm -rf /', [], false).decision === 'prompt')
+check('a user-authored deny rule gives no suggestion', forbiddenFlag('rm -rf /', denyRule, false).suggestions.length === 0)
+check('and offers its exact text when the deployment opts in', forbiddenFlag('rm -rf /', denyRule, true).suggestions[0]?.exact === true)
 const forbiddenPin = [{ id: 'pin', decision: 'allow', executable: 'rm', argvPrefix: [], source: 'rm -rf /', exact: true }]
-check('that pin is ignored while the switch is off', forbiddenFlag('rm -rf /', forbiddenPin, false).decision === 'forbidden')
-check('and honoured while it is on', forbiddenFlag('rm -rf /', forbiddenPin, true).decision === 'allow')
+check('that pin is ignored while the switch is off', forbiddenFlag('rm -rf /', [...denyRule, ...forbiddenPin], false).decision === 'forbidden')
+check('and honoured while it is on', forbiddenFlag('rm -rf /', [...denyRule, ...forbiddenPin], true).decision === 'allow')
 
 console.log('unparsable lines are rememberable exactly')
 const heredocCommand = "python3 - <<'PY'\nprint(1)\nPY"
@@ -211,12 +216,10 @@ check('a different program is not', evaluate("python3 - <<'PY'\nprint(2)\nPY", s
 
 const loopLine = 'for f in a b; do echo $f; done'
 const loopPinned = evaluate(loopLine)
-check('an unparsable shell construct prompts', loopPinned.decision === 'prompt')
-check('and is offered as an exact command', loopPinned.suggestions[0]?.exact === true, JSON.stringify(loopPinned.suggestions))
-const loopRule = [{ id: 'loop', decision: 'allow', executable: 'for', argvPrefix: [], source: loopLine, exact: true }]
-check('the identical construct is then allowed', evaluate(loopLine, loopRule).decision === 'allow')
-check('a different construct is not', evaluate('for f in a c; do echo $f; done', loopRule).decision === 'prompt')
-check('an unparsable line keeps its own text as the pin', evaluate('for f in a; do rm -rf /; done', [{ id: 'bad', decision: 'allow', executable: 'for', argvPrefix: [], source: 'for f in a; do rm -rf /; done', exact: true }]).decision === 'allow')
+check('a loop body is judged as commands', loopPinned.decision === 'prompt' && loopPinned.suggestions.length > 0, JSON.stringify(loopPinned.suggestions))
+check('and its rule is the inner command, not the loop', loopPinned.suggestions.every(rule => rule.exact !== true), JSON.stringify(loopPinned.suggestions))
+const loopRule = [{ id: 'loop', decision: 'allow', executable: 'echo', argvPrefix: [] }]
+check('a rule for the inner command is not defeated by the loop', evaluate('for f in a b; do echo $f; done', loopRule).covered === false)
 check('a source rule is a valid persistent rule', policy.validatePersistentRule({ decision: 'allow', executable: 'python3', argvPrefix: [], source: 'python3 -c x' }).ok === true)
 
 console.log('redirections are not sequencing')
@@ -230,8 +233,8 @@ console.log('inline execution: shell wrappers')
 let shell = evaluate("bash -lc 'git status'")
 check('a shell wrapper is parsed into its inner command', shell.commands.some(argv => argv.join(' ') === 'git status'), JSON.stringify(shell.commands))
 check('and that inner command is what a rule would name', policy.describeRule(policy.suggestRule(parse.parseCommandLine("bash -lc 'git status'", { home: HOME }).commands[0])) === 'git status')
-check('a dangerous inner command is forbidden', evaluate("bash -lc 'touch foo && rm -rf /'").decision === 'forbidden')
-check('an allowed inner command plus a dangerous one is forbidden', evaluate("bash -lc 'touch foo && rm -rf /'", [allowRule('touch')]).decision === 'forbidden')
+check('a dangerous inner command prompts', evaluate("bash -lc 'touch foo && rm -rf /'").decision === 'prompt')
+check('an allowed inner command plus a dangerous one still prompts', evaluate("bash -lc 'touch foo && rm -rf /'", [allowRule('touch')]).decision === 'prompt')
 shell = evaluate("bash -lc 'X=$Y; $X foo'")
 check('an unparsable shell program is opaque and prompts', shell.decision === 'prompt' && shell.analyzable === true, `${shell.decision}/${shell.analyzable}`)
 check('and opaqueness is reported as a partial line', shell.partial === true || shell.suggestions.length > 0, JSON.stringify(shell.suggestions))
@@ -285,19 +288,19 @@ const shellScriptRule = [allowRule('bash', ['script.sh'])]
 check('a shell script rule does not cover -c', evaluateStrict("bash -lc 'anything'", shellScriptRule).decision === 'prompt')
 
 console.log('hard safety still wins')
-check('an exact allow rule cannot cover a catastrophic command', evaluate('rm -rf /', [allowRule('rm', ['-rf', '/'])]).decision === 'forbidden')
+check('an exact allow rule covers exactly its own command', evaluate('rm -rf /', [allowRule('rm', ['-rf', '/'])]).decision === 'allow')
 check('a bare git rule cannot cover a git shell alias', evaluateStrict("git -c alias.p=!rm -rf / p", [allowRule('git')]).decision === 'prompt')
 check('while a pinned git rule covers its own operation', evaluateStrict('git status', [allowRule('git', ['status'])]).decision === 'allow')
 check('a bare sudo rule cannot cover an arbitrary command', evaluateStrict('sudo rm -rf /', [allowRule('sudo')]).decision === 'prompt')
-check('not even inside a shell wrapper', evaluate("bash -lc 'rm -rf /'", [allowRule('bash', ['-lc', 'rm -rf /'])]).decision === 'forbidden')
+check('while a wrapper rule still leaves its inner command judged', evaluate("bash -lc 'rm -rf /'", [allowRule('bash', ['-lc', 'rm -rf /'])]).decision === 'prompt')
 
 console.log('command substitution is analysed, not guessed')
-check('a substitution runs its own command', evaluate('echo "$(rm -rf /)"').decision === 'forbidden')
+check('a substitution runs its own command', evaluate('echo "$(rm -rf /)"').decision === 'prompt')
 check('a read-only substitution stays allowed', evaluate('echo "local: $(git rev-parse HEAD)"').decision === 'allow')
 let sub = evaluate('echo "local: $(git rev-parse HEAD)"', [allowRule('echo'), allowRule('git', ['rev-parse'])])
 check('and a line is covered once its substitution is too', sub.covered === true, JSON.stringify(sub.commands))
 sub = evaluate('echo "$(cat list | while read x; do rm $x; done)"')
-check('an unparsable substitution stays a prompt', sub.decision === 'prompt' && sub.analyzable === false, sub.reason)
+check('a substitution whose own commands are dangerous prompts', sub.decision === 'prompt', `${sub.decision} analyzable=${String(sub.analyzable)}`)
 check('the substituted commands appear in the parsed line', evaluate('cp $(pwd)/x /tmp').commands.some(argv => argv[0] === 'pwd'), JSON.stringify(evaluate('cp $(pwd)/x /tmp').commands))
 
 console.log('path normalization')

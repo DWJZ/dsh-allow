@@ -100,10 +100,29 @@ export function validatePersistentRule(rule) {
 function codePrefix(executable, args) {
   for (const [index, token] of args.entries()) {
     if (isInlineFlag(executable, token)) return args.slice(0, index + 2)
-    if (!String(token).startsWith('-') && token !== '-') return args.slice(0, index + 1)
+    if (!String(token).startsWith('-') && token !== '-') {
+      return PARAMETER_SENSITIVE.has(executable) && executable !== 'git'
+        ? args.slice(0, index + PARAMETER_PREFIX_LENGTH)
+        : args.slice(0, index + 1)
+    }
   }
   return null
 }
+
+/**
+ * Programs whose effect depends on their arguments: the suggested rule keeps a
+ * couple of them, so `rm -rf build` is remembered as `rm -rf build`-ish rather
+ * than as a bare `rm`, without pinning the whole invocation.
+ */
+const PARAMETER_SENSITIVE = new Set([
+  'rm', 'rmdir', 'mv', 'dd', 'shred', 'truncate', 'unlink', 'chmod', 'chown', 'chgrp',
+  'kill', 'killall', 'pkill', 'systemctl', 'service', 'launchctl', 'mount', 'umount',
+  'diskutil', 'fdisk', 'parted', 'docker', 'podman', 'kubectl', 'sudo', 'su', 'doas',
+  'ssh', 'scp', 'rsync', 'curl', 'wget', 'tee', 'truncate',
+])
+
+/** How many leading arguments a parameter-sensitive rule keeps. */
+const PARAMETER_PREFIX_LENGTH = 2
 
 /** Programs whose first non-flag argument names a subcommand. */
 const SUBCOMMAND_PROGRAMS = new Set([
@@ -225,7 +244,7 @@ export function classifyBuiltin(command, context) {
     }
     const path = normalizePath(redirection.target, cwd, home)
     if (/^\/dev\/(?:disk|sd|nvme|hd|rdisk)/u.test(path)) {
-      return { decision: 'forbidden', risk: 'device-write', reason: `writing to the raw device ${path}` }
+      return { decision: 'prompt', risk: 'device-write', reason: `writing to the raw device ${path}` }
     }
     if (pathRisk(path, home) !== null) {
       return { decision: 'prompt', risk: 'filesystem-write', reason: `writing to ${path}` }
@@ -247,11 +266,11 @@ export function classifyBuiltin(command, context) {
       const path = /^\$\{?HOME\}?$/u.test(target.raw) ? home : target.path
       const what = path === '/' ? 'the filesystem root' : path === home ? 'the home directory' : null
       if (what !== null) {
-        return { decision: 'forbidden', risk: 'catastrophic', reason: recursive && force ? `recursively deleting ${what}` : `deleting ${what}` }
+        return { decision: 'prompt', risk: 'catastrophic', reason: recursive && force ? `recursively deleting ${what}` : `deleting ${what}` }
       }
       // A glob that expands to everything under a root is the same disaster.
       if (recursive && force && target.raw.startsWith('/') && /[*?]/u.test(target.raw)) {
-        return { decision: 'forbidden', risk: 'catastrophic', reason: `recursively deleting every path matching ${target.raw}` }
+        return { decision: 'prompt', risk: 'catastrophic', reason: `recursively deleting every path matching ${target.raw}` }
       }
     }
     return { decision: 'prompt', risk: 'destructive', reason: 'rm deletes files' }
@@ -259,12 +278,12 @@ export function classifyBuiltin(command, context) {
 
   if (program === 'dd') {
     const device = args.find(argument => /^of=\/dev\//u.test(argument))
-    if (device !== undefined) return { decision: 'forbidden', risk: 'device-write', reason: `writing an image to ${device.slice(3)}` }
+    if (device !== undefined) return { decision: 'prompt', risk: 'device-write', reason: `writing an image to ${device.slice(3)}` }
     return { decision: 'prompt', risk: 'destructive', reason: 'dd writes raw data' }
   }
 
   if (/^mkfs(\.|$)/u.test(program) || program === 'fdisk' || program === 'parted' || program === 'shred') {
-    return { decision: 'forbidden', risk: 'catastrophic', reason: `${program} rewrites a filesystem or its device` }
+    return { decision: 'prompt', risk: 'catastrophic', reason: `${program} rewrites a filesystem or its device` }
   }
 
   if (['sudo', 'su', 'doas', 'pkexec'].includes(program)) {
@@ -415,7 +434,11 @@ export function suggestRule(command) {
     return validatePersistentRule(exact).ok ? exact : null
   }
   const argvPrefix = []
-  if (SUBCOMMAND_PROGRAMS.has(executable) && args.length > 0 && literal
+  const parameterSensitive = PARAMETER_SENSITIVE.has(executable) || /^mkfs/u.test(executable)
+  if (literal && parameterSensitive) {
+    argvPrefix.push(...args.slice(0, PARAMETER_PREFIX_LENGTH))
+  }
+  else if (SUBCOMMAND_PROGRAMS.has(executable) && args.length > 0 && literal
     && !args[0].startsWith('-') && !args[0].includes('/')) {
     argvPrefix.push(args[0])
   }
@@ -584,7 +607,8 @@ export function evaluateCommandLine(request) {
     suggestions.length = 0
     matchedRules.push(sourceRule)
   }
-  else if (decision === 'prompt' && (suggestions.length === 0 || suggestionBlocked) && !forbiddenSeen) {
+  else if (decision === 'prompt' && (suggestions.length === 0 || suggestionBlocked
+    || triggers.some(trigger => trigger.risk === 'filesystem-write' || trigger.risk === 'device-write')) && !forbiddenSeen) {
     // Something in this line cannot be pinned per command (a stdin program, a
     // dynamic argument, syntax the parser does not model). The parsable parts
     // keep their minimal rules and the whole line is added as an exact pin, so

@@ -45,10 +45,10 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
 
 ## 命令怎么被分析
 
-1. `src/parse.js` 按未加引号的 `&&`、`||`、`;`、`|`、`&`、换行切分，再按引号与转义切词。`echo "a && b"` 是一条命令；`$(…)`、反引号、通配符、子 shell、分组、控制关键字、here-doc、动态可执行文件都会让整行变成**无法分析**。
-2. `sh -c '…'`、`bash -lc '…'`、`eval '…'` 会**递归解析**（深度 4）；wrapper 的程序名是动态的 → 无法分析。
-2a. here-document（`<<EOF … EOF`）的**正文是 stdin 数据，不是 shell 源码**：解析前先剥掉，所以正文里的 Python/文本行不会再被当成命令；但读取它的程序照样判定——`python3 -`、`bash`（无 `-c`）属于「从 stdin 读程序」，按代码执行 prompt，只能以**整条命令原文**固化。
-2b. `$(…)` 与反引号**也递归解析**：替换体里的命令算作同一行的命令，一起按最严聚合（`echo "$(rm -rf /)"` → forbidden）；替换体解析不出来时整行降级为 `prompt`；被替换出来的**程序名**永远是动态可执行 → 无法分析（`$(printf rm) -rf /` 不会被放行）。
+1. `src/parse.js` 用 **tree-sitter + tree-sitter-bash**（真正的 bash 语法）解析，只读它给出的树：语句、管道、`&&`/`||`/`;`、`for`/`if`/`while`/`case`、子 shell、命令替换、重定向、here-doc 都由语法决定。`echo "a && b"` 是一条命令；`for f in a b; do echo $f; done` 里的命令会被逐条判定；here-doc 正文是独立节点，不会被当成命令。
+2. `bash -lc '…'`、`sh -c '…'` 的**内层程序会递归解析**（深度 4），逐条判定后取最严；内层解析不出来则整个调用视为 opaque → `prompt`。
+3. `$(…)` 与反引号里的命令**算作同一行的命令**，先于外层执行并参与聚合；被替换出来的**程序名**（`$(printf rm) -rf /`）视为动态可执行 → 整行无法分析。
+4. 语法树报错的输入（真正的语法错误）一律无法分析 → `prompt`，只能按 **exact-source**（整条原文）固化。
 3. 每个简单命令的 argv 由内置表分类、与存储规则匹配，然后整条请求取最严：`forbidden > prompt > allow`。
 4. 无法分析的行是 `prompt`，且不会命中任何「按命令」的规则——这就是对 parser 不理解的 shell 语法的 fail-closed；但这类行仍可按**整条原文**固化，那也是唯一能命中它们的规则。
 
@@ -70,6 +70,8 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
 
 - **混合行两条都给**：可解析的部分照旧给最小 capability 规则（`cd`、`git add`…），整行再补一条 exact pin，所以**没有命令是你无法永久放行的**。
 - **硬拒绝是唯一例外**：`rm -rf /`、`mkfs`、`dd of=/dev/…` 这类内置灾难判定默认仍不可记忆。想让它们也能按原文固化的部署，把配置 `allowForbiddenSource` 设为 `true`（默认 `false`）——打开后卡片会给「总是允许这条完全相同的命令」，且该 pin 才会生效。
+
+**内置策略不再硬拒绝**：所有风险都收拢成 `prompt` + 一条具体规则；`forbidden` 只保留给**你自己**写的规则（`/allow add forbidden …`），且默认没有任何这种规则。
 
 **被明确拒绝的宽泛规则**（写入时抛错，读取时忽略）：
 
@@ -107,6 +109,8 @@ eval · source · exec                              （单独出现）
 | 路径 | cwd 为 `/` 或 `$HOME` 时的 `rm -rf .`；比较前先归一化 `~`、`..`、`/x/..` | 按 cwd 给 forbidden / prompt |
 
 一行里只要有一条命令钉不住（stdin 程序、被替换出来的程序名、parser 不支持的语法），其余命令的最小 capability 规则照旧给，**整行再补一条 exact pin**，所以不存在无法永久放行的行；含硬拒绝（可解析的 `rm -rf /` 等）的行默认不给建议，除非打开 `allowForbiddenSource`。
+
+建议规则的粒度：**风险程序多记参数、但不全量匹配**——`rm -rf build` → `["-rf","build"]`（因此 `rm -rf other` 仍会问）、`chmod 777 /etc/x` → `["777","/etc/x"]`、`git reset --hard` → `["reset"]`；重定向触发的提示会**同时**给出最小能力规则和整行 exact。
 
 没有任何规则命中的命令交给沙箱（`defaultDecision: allow`）；想全量把关就把它设成 `prompt`。
 
