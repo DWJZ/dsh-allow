@@ -64,6 +64,7 @@ check('a non-approval interaction is ignored', client.escalationOf({ kind: 'ques
 check('an absent interaction is ignored', client.escalationOf(undefined) === null)
 
 console.log('always label')
+check('a pinned line says so', client.alwaysLabelText((key) => key, ['cd', 'npm test'], true) === 'alwaysExact')
 check('one rule names itself', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, ['gh repo view']) === 'alwaysOne:{"rule":"gh repo view"}')
 check('several rules are listed', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, ['cp', 'echo']) === 'alwaysMany:{"rules":"cp + echo"}')
 const manyLabels = ['cd', 'npm', 'test', 'grep', 'head', 'git add', 'git log', 'git push', 'tail', 'cat', 'echo']

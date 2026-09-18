@@ -112,6 +112,9 @@ function remember(pendings, exec, decision, command, cwd) {
     suggestions: decision.suggestions,
     partial: decision.partial === true,
     exact: decision.suggestions.length > 0 && decision.suggestions.every(rule => rule.exact === true),
+    // A source pin silences the exact line; the other rules cover the parts
+    // that can be named. The card says so instead of listing only the parts.
+    pinsLine: decision.suggestions.some(rule => typeof rule.source === 'string'),
     triggers: decision.triggers.map(trigger => trigger.command),
   })
   return true
@@ -311,6 +314,7 @@ export function createPendingHandler({ pendings }) {
       triggers: record.triggers,
       partial: record.partial === true,
       exact: record.exact === true,
+      pinsLine: record.pinsLine === true,
     })
   }
 }
