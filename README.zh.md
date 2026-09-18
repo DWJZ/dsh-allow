@@ -63,7 +63,10 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
 | `bash -lc 'X=$Y; $X foo'` | 内层解析失败 → 整个调用视为 **opaque** → `prompt` |
 | `python -c 'print(123)'` | 内联代码视为 **opaque 任意代码** → `prompt`；Always Allow 只能生成**精确到原文**的规则 `["python","-c","print(123)"]` |
 | `python tools/check.py` | 属于**脚本文件执行**，生成 `["python","tools/check.py"]`，之后 `… --verbose` 等不同参数照样命中 |
-| `python -` / `bash`（无 `-c`） | 程序来自 stdin → `prompt`，且**无法固定**，不给规则 |
+| `python -` / `bash`（无 `-c`）、heredoc 程序 | 程序来自 stdin，argv 钉不住 → `prompt`；但可以**把整条命令原文钉死**（exact-source 规则） |
+| 无法解析的行（`for …; do …; done` 等） | `prompt`；同样可以按原文钉死 |
+
+**exact-source 规则**：当 per-command 钉不住（stdin 程序、heredoc、parser 不支持的语法）时，卡片给的是「总是允许这条完全相同的命令」——规则记录**整条命令文本**，只有文本完全相同（忽略首尾空白）才命中。同文本 ⇒ 同能力。安全兜底：parser 无法分析的行若含递归 `rm` / `mkfs` / `dd of=/dev/` / 写裸设备，**不给**这条规则，也不被这类规则命中（只能拒绝，永远不会放行）。
 
 **被明确拒绝的宽泛规则**（写入时抛错，读取时忽略）：
 

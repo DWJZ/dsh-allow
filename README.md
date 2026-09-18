@@ -63,7 +63,10 @@ A capable interpreter may run, but its capability is never remembered broadly. O
 | `bash -lc 'X=$Y; $X foo'` | the inner source cannot be parsed → the invocation is **opaque** → `prompt` |
 | `python -c 'print(123)'` | inline code is **opaque arbitrary execution** → `prompt`; the only rule offered pins the exact text: `["python","-c","print(123)"]` |
 | `python tools/check.py` | a script file, pinned as `["python","tools/check.py"]`, which also covers `… --verbose` |
-| `python -` / `bash` without `-c` | the program comes from stdin → `prompt`, and no rule can pin it |
+| `python -` / `bash` without `-c`, here-documents | the program comes from stdin, so argv cannot pin it → `prompt`, but the whole line can be pinned to its own text (an exact-source rule) |
+| Anything the parser cannot reduce (`for …; do …; done`) | `prompt`, likewise pinnable to its own text |
+
+**Exact-source rules**: when nothing per-command can be pinned (stdin programs, here-documents, syntax the parser does not model), the card offers *Always allow this exact command*. The rule stores the whole command text and matches only byte-identical text (surrounding whitespace ignored) — the same text runs the same program. Refuse-only guard: an unparsable line containing a recursive `rm`, `mkfs`, `dd of=/dev/`, or a raw-device redirect is neither offered nor matched by such a rule.
 
 **Broad rules that are refused** (the store throws on write; the reader ignores them):
 

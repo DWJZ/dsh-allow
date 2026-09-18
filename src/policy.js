@@ -68,6 +68,9 @@ function isInlineFlag(executable, token) {
  */
 export function validatePersistentRule(rule) {
   if (rule?.decision !== 'allow') return { ok: true }
+  // An exact-source rule pins the whole command line: whatever it runs, it runs
+  // the same thing every time, which is the same guarantee as an exact argv pin.
+  if (typeof rule.source === 'string' && rule.source.trim() !== '') return { ok: true }
   const executable = basename(String(rule.executable ?? ''))
   if (CODE_PROGRAMS[executable] === undefined) return { ok: true }
   const prefix = Array.isArray(rule.argvPrefix) ? rule.argvPrefix : []
@@ -365,6 +368,8 @@ export function classifyBuiltin(command, context) {
  * @returns whether the rule matches.
  */
 export function ruleMatches(rule, command) {
+  // Source-pinned rules match only their own text, never a program name.
+  if (typeof rule.source === 'string') return false
   if (basename(command.argv[0] ?? '') !== rule.executable) return false
   // Defense in depth: even a rule this engine was handed directly may not grant
   // a code-execution capability, so an invalid allow rule matches nothing.
@@ -424,7 +429,55 @@ export function suggestRule(command) {
  * @returns the human label.
  */
 export function describeRule(rule) {
+  if (typeof rule.source === 'string') {
+    const text = rule.source.replace(/\s+/gu, ' ')
+    return text.length > 48 ? `${text.slice(0, 47)}…` : text
+  }
   return [rule.executable, ...(rule.argvPrefix ?? [])].join(' ')
+}
+
+/**
+ * Normalize one command line for exact-source comparison: the text must be the
+ * same command, so only surrounding whitespace is ignored.
+ * @param text - raw command line.
+ * @returns the comparable text.
+ */
+export function normalizeSource(text) {
+  return String(text ?? '').trim()
+}
+
+/**
+ * Catastrophe hints for lines the parser cannot reduce.
+ *
+ * Refuse-only belt and braces: when one of these appears in a line the parser
+ * could not analyse, the line is never pinned to its own text, so the user
+ * cannot put a catastrophic command behind one click. It can only refuse a
+ * rule, never grant one.
+ */
+const CATASTROPHIC_HINTS = [
+  /\brm\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*[rR]/u,
+  /\bmkfs(?:\.\w+)?\b/iu,
+  /\bdd\b[^\n]*\bof=\/dev\//iu,
+  />\s*\/dev\/(?:disk|sd|nvme|hd|rdisk)/iu,
+]
+
+/**
+ * Whether a line the parser could not analyse looks catastrophic.
+ * @param command - raw command line.
+ * @returns whether the line must not be pinned to its own text.
+ */
+export function looksCatastrophic(command) {
+  return CATASTROPHIC_HINTS.some(pattern => pattern.test(String(command ?? '')))
+}
+
+/**
+ * The program word an exact-source suggestion names on a card.
+ * @param command - the raw command line.
+ * @returns the first whitespace-separated word, or the whole text.
+ */
+function firstWord(command) {
+  const match = /^\s*(\S+)/u.exec(String(command ?? ''))
+  return match?.[1] ?? ''
 }
 
 /**
@@ -436,16 +489,41 @@ export function evaluateCommandLine(request) {
   const { command, cwd, home, rules = [], defaultDecision = 'allow' } = request
   const parsed = parseCommandLine(command, { home })
   if (!parsed.analyzable) {
+    // The line cannot be reduced to commands, but it can still be pinned to its
+    // own text: the same text runs the same program every time.
+    const source = normalizeSource(command)
+    const remembered = rules.find(rule => rule.decision === 'allow'
+      && typeof rule.source === 'string'
+      && normalizeSource(rule.source) === source)
+    if (remembered !== undefined && !looksCatastrophic(source)) {
+      return {
+        decision: 'allow',
+        reason: 'an exact-source rule matches this command line',
+        risk: 'none',
+        matchedRules: [remembered],
+        triggers: [],
+        commands: [],
+        suggestion: null,
+        suggestions: [],
+        partial: false,
+        covered: true,
+        analyzable: false,
+      }
+    }
+    const pinned = looksCatastrophic(source)
+      ? null
+      : { decision: 'allow', executable: firstWord(command), argvPrefix: [], source, exact: true }
+    const suggestion = pinned !== null && validatePersistentRule(pinned).ok ? pinned : null
     return {
       decision: 'prompt',
-      reason: `cannot be analysed statically (${parsed.reason}); a stored rule never covers it`,
+      reason: `cannot be analysed statically (${parsed.reason}); only this exact command can be remembered`,
       risk: 'unanalysable',
       matchedRules: [],
       triggers: [],
       commands: [],
-      suggestion: null,
-      suggestions: [],
-      partial: false,
+      suggestion,
+      suggestions: suggestion === null ? [] : [suggestion],
+      partial: suggestion === null,
       covered: false,
       analyzable: false,
     }
@@ -512,6 +590,26 @@ export function evaluateCommandLine(request) {
   // A denied line is never stored: remembering the rest of it would only
   // pre-approve a command that can never run.
   if (forbiddenSeen) suggestions.length = 0
+  const sourceRule = rules.find(rule => rule.decision === 'allow'
+    && typeof rule.source === 'string'
+    && normalizeSource(rule.source) === normalizeSource(command))
+  if (sourceRule !== undefined && !forbiddenSeen && decision !== 'forbidden') {
+    decision = 'allow'
+    reason = 'an exact-source rule matches this command line'
+    covered = true
+    suggestions.length = 0
+    matchedRules.push(sourceRule)
+  }
+  else if (decision === 'prompt' && suggestions.length === 0 && !forbiddenSeen) {
+    // Nothing per-command could be pinned (stdin programs, dynamic arguments):
+    // offer the whole line, exactly.
+    const source = normalizeSource(command)
+    const pinned = { decision: 'allow', executable: firstWord(command), argvPrefix: [], source, exact: true }
+    if (validatePersistentRule(pinned).ok) {
+      suggestions.push(pinned)
+      suggestionBlocked = false
+    }
+  }
   const rememberable = suggestions.length > 0
   return {
     decision,

@@ -179,9 +179,30 @@ check('the same commands without inline code are fully rememberable', clean.part
 console.log('here-documents: the body is data, the reader is still judged')
 check('a here-doc body is not parsed as commands', evaluate('cat > /tmp/x <<EOF\nrm -rf /\nEOF').decision === 'allow')
 check('the python heredoc reader prompts as code execution', evaluate("python3 - <<'PY'\nprint(1)\nPY").decision === 'prompt')
-check('and it is offered no rule', evaluate("python3 - <<'PY'\nprint(1)\nPY").suggestions.length === 0)
+check('and it is offered as an exact command', evaluate("python3 - <<'PY'\nprint(1)\nPY").suggestions[0]?.exact === true)
 check('a shell heredoc reader prompts too', evaluate('bash <<EOF\nrm -rf /\nEOF').decision === 'prompt')
 check('quoted << is not a heredoc', evaluate('echo "a << b"').decision === 'allow')
+
+console.log('unparsable lines are rememberable exactly')
+const heredocCommand = "python3 - <<'PY'\nprint(1)\nPY"
+let pinnedLine = evaluate(heredocCommand)
+check('a heredoc program prompts', pinnedLine.decision === 'prompt')
+check('and offers an exact-source rule', pinnedLine.suggestions[0]?.exact === true && pinnedLine.suggestions[0]?.source === heredocCommand, JSON.stringify(pinnedLine.suggestions[0]?.source))
+const sourceRule = [{ id: 'src', decision: 'allow', executable: 'python3', argvPrefix: [], source: heredocCommand, exact: true }]
+check('the identical line is then allowed', evaluate(heredocCommand, sourceRule).decision === 'allow')
+check('surrounding whitespace does not matter', evaluate(`  ${heredocCommand}  `, sourceRule).decision === 'allow')
+check('a different program is not', evaluate("python3 - <<'PY'\nprint(2)\nPY", sourceRule).decision === 'prompt')
+
+const loopLine = 'for f in a b; do echo $f; done'
+const loopPinned = evaluate(loopLine)
+check('an unparsable shell construct prompts', loopPinned.decision === 'prompt')
+check('and is offered as an exact command', loopPinned.suggestions[0]?.exact === true, JSON.stringify(loopPinned.suggestions))
+const loopRule = [{ id: 'loop', decision: 'allow', executable: 'for', argvPrefix: [], source: loopLine, exact: true }]
+check('the identical construct is then allowed', evaluate(loopLine, loopRule).decision === 'allow')
+check('a different construct is not', evaluate('for f in a c; do echo $f; done', loopRule).decision === 'prompt')
+check('a catastrophic unparsable line is never offered', evaluate('for f in a; do rm -rf /; done').suggestions.length === 0)
+check('nor matched by a source rule', evaluate('for f in a; do rm -rf /; done', [{ id: 'bad', decision: 'allow', executable: 'for', argvPrefix: [], source: 'for f in a; do rm -rf /; done', exact: true }]).decision === 'prompt')
+check('a source rule is a valid persistent rule', policy.validatePersistentRule({ decision: 'allow', executable: 'python3', argvPrefix: [], source: 'python3 -c x' }).ok === true)
 
 console.log('redirections are not sequencing')
 let redirect = evaluate('dd if=/dev/zero of=/dev/null bs=1 count=1 2>&1 | head -5')
@@ -205,7 +226,7 @@ const pythonInline = evaluate("python -c 'print(123)'")
 check('inline interpreter code prompts', pythonInline.decision === 'prompt', pythonInline.decision)
 check('and the suggestion pins the exact code', pythonInline.suggestions[0]?.argvPrefix.join(' ') === '-c print(123)', JSON.stringify(pythonInline.suggestions))
 check('flagged as an exact rule', pythonInline.suggestions[0]?.exact === true)
-check('a stdin program offers nothing to remember', evaluate('python - <<PY\nprint(1)\nPY').suggestions.length === 0)
+check('a stdin program is offered as an exact command', evaluate('python - <<PY\nprint(1)\nPY').suggestions[0]?.exact === true)
 
 console.log('persistent rule validation')
 const invalid = [
