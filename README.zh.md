@@ -124,7 +124,7 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 
 「总是允许」只写卡片上念出来的那几条最窄规则 —— 命令行里每个路径一条,只有路径本身是已存在的目录时才带 `/**`,绝不顺手把路径所在的文件夹打开;想主动打开文件夹就明确写 `/allow add delete . folder`。
 
-「允许一次」是真的只允许一次:它绑定到你批准的那一次调用,只交给那一次调用的沙箱,`tools/post-execute` 在该调用结束的瞬间就把它丢掉(另有十分钟过期作为兜底)。它绝不写规则文件,下一次调用仍然会问。
+「允许一次」是真的只允许一次,而且有两道机制防止它横向泄漏:授权绑定到你批准的那一次调用,判定层只在那次调用看得见它;profile 构建时则靠「那次调用正在跑的命令行」再认一次 —— 因为一次 confinement 只知道会话、不知道调用。此外,只要有一条一次性授权还活着,同会话的其它调用都会先等它结算再被判定,所以两次重叠的调用不可能共用一条授权。调用结束时 `tools/post-execute` 立刻丢掉它(十分钟过期只是兜底);它绝不写规则文件,下一次调用仍然会问。
 
 `sandbox_permissions` 提权是「更宽的进程围栏」,不是文件能力,所以**永不自动批准** —— 即使这条命令需要的能力全都已授权。一次批准就等于让命令跑到模式之外,这个决定属于用户。
 
@@ -142,17 +142,22 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 
 macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `file-write-data` 与 `file-write-create`、同时不授予 `file-write-unlink`,进程就能改写和新建文件,而 `rm`、`rmdir`、`rename`、`python -c 'os.remove(…)'`、`node -e 'fs.rmSync(…)'` 全部 EPERM —— 本进程、子进程、孙进程都一样。单独的 `create` 就足以新建并把内容写进去;管「改动已存在的文件」的是 `write`。Seatbelt 的过滤器匹配内核解析后的路径,所以渲染前必须先规范化;一条规则会同时记住「用户写的那个名字」和它解析到的路径,所以 `/opt/homebrew/bin/gh` 的授权也覆盖它指向的 Cellar 二进制 —— 反之亦然。
 
-有两个 Seatbelt 细节决定了 profile 的写法:通配的拒绝会被具体的允许压过去(`(deny file-write* …)` 拦不住 `(allow file-write-data …)`),所以权限库是逐操作写出拒绝的;而一个扣掉 macOS 运行所必需读取的 profile 会让 `/bin/sh` 在跑任何东西之前直接 abort,所以读围栏是探测出来的,不是假设的。
+有两个 Seatbelt 细节决定了 profile 的写法:通配的拒绝会被具体的允许压过去(`(deny file-write* …)` 拦不住 `(allow file-write-data …)`),所以权限库是逐操作写出拒绝的;而一个扣掉**所有**读取的 profile 会让 `/bin/sh` 在跑任何东西之前直接 abort。
+
+所以读围栏采用 macOS 运行时扛得住的形式:在规则之前先写 `(deny file-read-data (subpath "/Users"))`(以及 `/Volumes`),再由规则把 workspace、临时目录、harness home、用户装的工具链、几个 home 配置文件,以及每一条读授权重新打开。平台自己需要读的东西照读;home 里没有被任何规则点名的文件 —— `~/.ssh/id_ed25519`、`~/.aws/credentials`、`~/.config/gh/hosts.yml` —— 无论用 `python3 -c`、`node -e` 还是 `bash -c` 去读,都由内核直接拒绝。
 
 策略有多少真正下沉到内核,会在每个「模式 + workspace」的首次调用上**实测**:用真实 profile 跑真实命令,结果缓存下来并由 `/allow status` 报告:
 
-| 状态 | 含义 |
+| 层级 | 含义 |
 | --- | --- |
-| `full` | write/create/delete/read/execute 全部在内核层 |
-| `partial` | write/create/delete 在内核层;execute/read 不在(内核拒绝了更强的 profile) |
-| `off` | 这份策略完全没有下沉;这时决策层不会假设「有沙箱」而放行看不清效果的命令 |
+| `full` | 所有读取都扣掉、逐条规则再打开;macOS 会在它下面 abort |
+| `guarded` | write/create/delete/execute,以及用户数据区域的读取 |
+| `process` | write/create/delete/execute |
+| `writes` | 只有 write/create/delete |
 
-`enforce: 'auto'` 依次试 `full`、write+execute 围栏、只围 write,绝不会退到比 harness 原有更宽的围栏;`enforce: all` 只接受 `full`,内核做不到就报告 `off`。编译失败会被报告而不是被吞掉,也不会被一个更宽的 profile 顶替。
+`/allow status` 会把层级报告成 `full`/`partial`/`off`,并逐能力给出是否在内核层。
+
+`enforce: 'auto'` 从上到下取探测通过的第一个层级 —— 普通 macOS 上就是 `guarded`;`enforce: full` 只接受 `full`,内核做不到就报告 `off`。编译失败会被报告而不是被吞掉,也不会被一个更宽的 profile 顶替。
 
 ## 配置
 
@@ -163,7 +168,7 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
     auditFile: /path/to/audit.ndjson        # 默认 $DSH_HOME/dsh-allow-audit.ndjson
     audit: true                             # false 关闭审计
     sessionGrantTtlMs: 600000               # 「允许一次」的兜底有效期
-    enforce: auto                           # auto | all | process | writes | off
+    enforce: auto                           # auto | full | guarded | process | writes | off
     grants:                                 # 部署级授权,字段与持久规则一致
       - path: /opt/homebrew
         recursive: true
@@ -184,9 +189,11 @@ npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的�
 
 ## 限制
 
+- 被围住的区域仍然可以解析路径:`stat`、列目录会泄漏 metadata,被扣掉的只是文件内容。
+- 把配置和令牌放在同一个目录下的工具需要一条针对该目录的读授权:`gh`、`aws`、`docker` 之类在授予 `~/.config/<tool>` 之前会报自己的错。默认拒掉 `hosts.yml`、`credentials`、`id_ed25519` 正是目的,想打开是明确的动作。
 - 命令行看不出效果的部分由沙箱判定,而不是由解析器猜:程序表里没有的效果一律交给围栏。
 - 单独的 `create` 可以新建并写入内容;改动已存在的文件需要 `write`。
-- 在这台机器上读围栏「能表达但活不下来」:macOS 自己要读的东西比策略基线列出的更多,`/bin/sh` 会直接 abort,所以 `auto` 停在 write+execute 围栏;想死磕基线的部署可以用 `enforce: all`。
+- 最强的读围栏(`enforce: full`)「能表达但活不下来」:macOS 自己要读的东西比策略基线列出的更多,`/bin/sh` 会直接 abort;`auto` 落在 guarded 围栏上。
 - 两个较弱的 Seatbelt 结论:不可读的路径仍然可被解析(metadata 始终放行);通配拒绝必须逐操作写出来。
 - 改名需要源的 `delete` 加目标的 `create`。
 - 读效果只为固定的一张程序表推导;真正的边界是围栏,不是这张表。

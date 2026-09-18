@@ -91,8 +91,8 @@ export function resolveConfig(config, home) {
     throw new TypeError('dsh-allow: config grants must be a list of {path, access, recursive} entries')
   }
   const enforce = config?.enforce ?? 'auto'
-  if (!['auto', 'all', 'process', 'writes', 'off'].includes(enforce)) {
-    throw new TypeError(`dsh-allow: config enforce must be "auto", "all", "process", "writes" or "off", got ${JSON.stringify(enforce)}`)
+  if (!['auto', 'full', 'guarded', 'process', 'writes', 'off'].includes(enforce)) {
+    throw new TypeError(`dsh-allow: config enforce must be "auto", "full", "guarded", "process", "writes" or "off", got ${JSON.stringify(enforce)}`)
   }
   const rulesFile = text(config?.rulesFile, 'rulesFile', join(home, RULES_FILE_NAME))
   const auditFile = text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME))
@@ -103,8 +103,8 @@ export function resolveConfig(config, home) {
     sessionGrantTtlMs,
     grants: grants.map(entry => configGrantRule(entry, home)),
     // How much of the filesystem policy is compiled into the process sandbox.
-    // `auto` keeps the write fence (and with it delete separation) and adds the
-    // read and execute fences only when a probe proves they apply.
+    // `auto` takes the strongest fence a probe proves this host can hold:
+    // writes and execution always, user-data reads when macOS survives it.
     enforce,
     // Nothing the agent runs may change the rules that judge it. The paths are
     // canonical so they match the paths a decision compares, whatever spelling
@@ -265,25 +265,44 @@ export function countHit(file, id) {
 /**
  * Create the "allow once" store: capability grants that live in this process
  * only, are bound to the one call the user approved, are handed to the sandbox
- * for that call, and are dropped as soon as the call settles. Nothing here is
- * ever written to the rules file.
+ * for that call, and are dropped as soon as the call settles.
+ *
+ * A confinement knows its session but not its call, so the store also answers
+ * the two questions that keep a grant from leaking sideways: which call is
+ * holding a grant in this session, and which command that call is running. The
+ * profile builder matches the command, and the gate makes a second call in the
+ * same session wait for the holder to settle.
  * @param options - lifetime and clock.
- * @returns grant/read/consume operations.
+ * @returns grant/read/hold/consume operations.
  */
 export function createGrantStore({ ttlMs = SESSION_GRANT_TTL_MS, now = Date.now } = {}) {
   const entries = new Map()
+  const waiters = new Map()
   const prune = () => {
-    for (const [key, entry] of entries) if (now() - entry.at > ttlMs) entries.delete(key)
+    for (const [key, entry] of entries) {
+      if (now() - entry.at > ttlMs) {
+        entries.delete(key)
+        release(key)
+      }
+    }
+  }
+  /** Wake everyone waiting for one call's grant to be spent. */
+  function release(key) {
+    const waiting = waiters.get(key)
+    if (waiting === undefined) return
+    waiters.delete(key)
+    for (const resolve of waiting) resolve()
   }
   return {
     /**
      * Grant capabilities for one approved call.
      * @param sessionId - owning session id.
      * @param callId - the call the approval belongs to.
+     * @param command - the command line the user approved.
      * @param rules - the rules to remember, in `makeRule` fields.
      * @returns the granted rules.
      */
-    grant(sessionId, callId, rules) {
+    grant(sessionId, callId, command, rules) {
       if (typeof sessionId !== 'string' || typeof callId !== 'string') return []
       prune()
       const stored = rules.map((fields, index) => makeRule({
@@ -293,7 +312,7 @@ export function createGrantStore({ ttlMs = SESSION_GRANT_TTL_MS, now = Date.now 
       }))
       const key = `${sessionId}\u0000${callId}`
       const current = entries.get(key)?.rules ?? []
-      entries.set(key, { rules: [...current, ...stored], at: now() })
+      entries.set(key, { rules: [...current, ...stored], command, at: now() })
       return stored
     },
     /**
@@ -308,18 +327,66 @@ export function createGrantStore({ ttlMs = SESSION_GRANT_TTL_MS, now = Date.now 
       return entries.get(`${sessionId}\u0000${callId}`)?.rules ?? []
     },
     /**
-     * Every live grant in one session: what the process sandbox must carry,
-     * because a confinement knows its session but not its call.
+     * The grants that belong to one command line in one session: what a
+     * confinement may carry, because the command it is about to run is the one
+     * the user approved for that call.
      * @param sessionId - owning session id.
+     * @param command - the command the confinement is about to run.
      * @returns the rules.
      */
-    rulesForSession(sessionId) {
-      if (typeof sessionId !== 'string') return []
+    forCommand(sessionId, command) {
+      if (typeof sessionId !== 'string' || typeof command !== 'string') return []
       prune()
       const prefix = `${sessionId}\u0000`
       const rules = []
-      for (const [key, entry] of entries) if (key.startsWith(prefix)) rules.push(...entry.rules)
+      for (const [key, entry] of entries) {
+        if (key.startsWith(prefix) && entry.command === command) rules.push(...entry.rules)
+      }
       return rules
+    },
+    /**
+     * The call holding a one-shot grant in this session, when it is not the one
+     * asking: the caller must wait for it, or its profile would carry it too.
+     * @param sessionId - owning session id.
+     * @param callId - the call asking.
+     * @returns the holding call id, or null.
+     */
+    holder(sessionId, callId) {
+      if (typeof sessionId !== 'string') return null
+      prune()
+      const prefix = `${sessionId}\u0000`
+      for (const key of entries.keys()) {
+        if (!key.startsWith(prefix)) continue
+        const holderCall = key.slice(prefix.length)
+        if (holderCall !== callId) return holderCall
+      }
+      return null
+    },
+    /**
+     * Wait until one call's grant is spent or expires.
+     * @param sessionId - owning session id.
+     * @param callId - the call being waited for.
+     * @returns a promise that settles when the grant is gone.
+     */
+    released(sessionId, callId) {
+      if (typeof sessionId !== 'string' || typeof callId !== 'string') return Promise.resolve()
+      prune()
+      const key = `${sessionId}\u0000${callId}`
+      const entry = entries.get(key)
+      if (entry === undefined) return Promise.resolve()
+      return new Promise((resolve) => {
+        const waiting = waiters.get(key) ?? new Set()
+        waiting.add(resolve)
+        waiters.set(key, waiting)
+        // A waiter must not outlive the grant it is waiting for: when the TTL
+        // runs out the grant is gone anyway, so the wait ends there.
+        const remaining = Math.max(0, ttlMs - (now() - entry.at))
+        const timer = setTimeout(() => {
+          entries.delete(key)
+          release(key)
+        }, remaining)
+        timer.unref?.()
+      })
     },
     /**
      * Drop the grants of one call once it has run.
@@ -332,6 +399,7 @@ export function createGrantStore({ ttlMs = SESSION_GRANT_TTL_MS, now = Date.now 
       const key = `${sessionId}\u0000${callId}`
       const dropped = entries.get(key)?.rules.length ?? 0
       entries.delete(key)
+      release(key)
       return dropped
     },
   }

@@ -63,11 +63,19 @@ function filtersFor(rule) {
  * processes, which inherit the profile. Clauses are order-sensitive in SBPL —
  * the last match wins — so refusals that must survive every grant are written
  * last.
- * @param options - the rules, whether to fence reads and executions, and files
- *   no grant may make writable (the permission store).
+ *
+ * Reads are fenced in one of two ways. `includeRead` withholds every file's
+ * contents and re-allows them rule by rule, which macOS itself does not
+ * survive; `readDenyRoots` is the usable form: the platform keeps reading what
+ * it needs, the user-data areas named there stop being readable, and the rules
+ * re-open the workspace, the temp areas and everything the user approved.
+ * @param options - the rules, the read fence, the execute fence, the user-data
+ *   areas to withhold, and files no grant may make writable.
  * @returns the profile text for `sandbox-exec -p`.
  */
-export function seatbeltProfile({ rules, includeRead = false, includeExecute = true, deniedPaths = [] }) {
+export function seatbeltProfile({
+  rules, includeRead = false, includeExecute = true, deniedPaths = [], readDenyRoots = [],
+}) {
   const clauses = ['(version 1)', '(allow default)', '(deny file-write*)']
   for (const device of ALWAYS_WRITABLE_DEVICES) {
     clauses.push(`(allow file-write* (literal ${sbplString(device)}))`)
@@ -76,6 +84,12 @@ export function seatbeltProfile({ rules, includeRead = false, includeExecute = t
     // Path lookup itself needs metadata; file CONTENTS are what the fence
     // withholds, so a process can still resolve a path it may not open.
     clauses.push('(deny file-read-data)', '(allow file-read-metadata)')
+  }
+  for (const root of readDenyRoots) {
+    if (typeof root !== 'string' || root === '') continue
+    // Before the rule allows, so a grant for a path inside one of these areas
+    // re-opens exactly that path and nothing else.
+    clauses.push(`(deny file-read-data (subpath ${sbplString(root)}))`)
   }
   for (const rule of rules) {
     const allowed = new Set()

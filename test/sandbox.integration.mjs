@@ -54,7 +54,9 @@ const root = mkdtempSync(join(tmpdir(), 'dsh-allow-sandbox-'))
 // workspace rules under test.
 const WORKSPACE = join(PLUGIN, 'test', '.sandbox-workspace')
 const outside = join(PLUGIN, 'test', '.sandbox-outside')
-const HOME = '/Users/tester'
+// The runtime cases run real macOS programs, so the home the baseline names has
+// to be the real one.
+const HOME = process.env.HOME ?? '/Users/tester'
 const NODE = process.execPath
 for (const directory of [WORKSPACE, outside]) rmSync(directory, { recursive: true, force: true })
 mkdirSync(join(WORKSPACE, 'sub'), { recursive: true })
@@ -174,7 +176,7 @@ console.log('F: the read fence is expressible, and macOS trips over it')
 const readFenced = compile([
   fspolicy.makeRule({ path: outside, recursive: true, access: { read: true } }),
   ...fspolicy.baselineRules({ workspaceRoot: WORKSPACE, harnessHome: join(root, '.dsh'), home: HOME, mode: 'workspace-write' }),
-], { capabilities: 'all' })
+], { capabilities: 'full' })
 // Measured: a profile that withholds reads the platform baseline does not name
 // makes /bin/sh abort before it runs anything, which is why `enforce: auto`
 // stops at `process` on this host and reports the read fence as unfenced.
@@ -184,11 +186,69 @@ check('F2: the enforcer probe rejects it for the same reason',
   enforce.probeProfile(readFenced, { workspaceRoot: WORKSPACE }) === false)
 const wideRead = compile([
   fspolicy.makeRule({ path: '/', recursive: true, access: { read: true, execute: true } }),
-], { capabilities: 'all' })
+], { capabilities: 'full' })
 check('F3: with reads granted the same fence starts a shell',
   under(wideRead, ['/bin/sh', '-c', 'exit 0']).status === 0, why())
 check('F4: and the probe accepts that one',
   enforce.probeProfile(wideRead, { workspaceRoot: WORKSPACE }) === true)
+
+console.log('R: read is a capability too (the guarded fence)')
+const guarded = compile(baseline([]), { capabilities: 'guarded' })
+const hostSecret = join(outside, 'outside.txt')
+result = under(guarded, ['/bin/cat', join(WORKSPACE, 'keep.txt')])
+check('R1: A — the workspace stays readable by cat', result.status === 0 && result.stdout.includes('seed'), why())
+result = under(guarded, ['/usr/bin/python3', '-c', `print(open(${JSON.stringify(join(WORKSPACE, 'keep.txt'))}).read().strip())`])
+check('R2: A — and by python', result.status === 0 && result.stdout.includes('seed'), why())
+result = under(guarded, ['/bin/cat', hostSecret])
+check('R3: B — a file outside the grants is refused by cat', result.status !== 0, why())
+result = under(guarded, ['/usr/bin/python3', '-c', `print(open(${JSON.stringify(hostSecret)}).read())`])
+check('R4: B — and by python, whatever the command line says', result.status !== 0, why())
+result = under(guarded, [NODE, '-e', `process.stdout.write(require('node:fs').readFileSync(${JSON.stringify(hostSecret)}, 'utf8'))`])
+check('R5: C — and by node', result.status !== 0, why())
+result = under(guarded, ['/bin/bash', '-c', `cat ${hostSecret}`])
+check('R6: C — and by bash', result.status !== 0, why())
+result = under(guarded, ['/bin/sh', '-c', `/bin/sh -c 'cat ${hostSecret}'`])
+check('R7: E — a child shell inherits the read refusal', result.status !== 0, why())
+result = under(guarded, ['/usr/bin/python3', '-c', `import subprocess; subprocess.run(['/bin/cat', ${JSON.stringify(hostSecret)}])`])
+check('R8: E — and so does a python -> cat grandchild', result.status !== 0, why())
+const readGranted = compile(baseline([
+  fspolicy.makeRule({ path: outside, recursive: true, source: 'user', access: { read: true } }),
+]), { capabilities: 'guarded' })
+result = under(readGranted, ['/usr/bin/python3', '-c', `print(open(${JSON.stringify(hostSecret)}).read().strip())`])
+check('R9: D — a read grant re-opens exactly that folder', result.status === 0 && result.stdout.includes('seed'), why())
+check('R10: D — while a sibling folder stays closed',
+  under(readGranted, ['/bin/cat', join(root, 'secret.txt')]).status !== 0, why())
+check('R11: the permission store stays refused under the guarded fence',
+  under(compile(baseline([fspolicy.makeRule({ path: WORKSPACE, recursive: true, access: { write: true, delete: true } })]),
+    { capabilities: 'guarded', protectedFiles: [join(WORKSPACE, 'dsh-allow.json')] }),
+  ['/bin/sh', '-c', `echo '{}' > ${join(WORKSPACE, 'dsh-allow.json')}`]).status !== 0)
+
+console.log('F: the read fence leaves the runtime alone')
+const ghPath = String(spawnSync('/usr/bin/which', ['gh'], { encoding: 'utf8' }).stdout).trim()
+const runtimePrograms = [
+  fspolicy.makeRule({ path: NODE, recursive: false, source: 'user', access: { read: true, execute: true } }),
+  ...(ghPath === '' ? [] : [
+    fspolicy.makeRule({ path: ghPath, recursive: false, source: 'user', access: { read: true, execute: true } }),
+    fspolicy.makeRule({ path: `${HOME}/.config/gh`, recursive: true, source: 'user', access: { read: true } }),
+  ]),
+]
+const runtimeRules = baseline(runtimePrograms)
+const runtimeProfile = compile(runtimeRules, { capabilities: 'guarded' })
+result = under(runtimeProfile, ['/bin/sh', '-c', 'echo ok'])
+check('F1: /bin/sh runs', result.status === 0 && result.stdout.includes('ok'), why())
+result = under(runtimeProfile, ['/usr/bin/python3', '-c', 'print("ok")'])
+check('F2: python runs', result.status === 0 && result.stdout.includes('ok'), why())
+result = under(runtimeProfile, [NODE, '-e', 'console.log("ok")'])
+check('F3: node runs', result.status === 0 && result.stdout.includes('ok'), why())
+result = under(runtimeProfile, ['/usr/bin/git', '--version'])
+check('F4: git runs', result.status === 0 && result.stdout.includes('git version'), why())
+if (ghPath !== '') {
+  result = under(runtimeProfile, [ghPath, '--version'])
+  check('F5: gh runs once its binary is granted', result.status === 0 && result.stdout.includes('gh version'), why())
+}
+else {
+  console.log('  skip gh --version (not installed)')
+}
 
 console.log('H: children and grandchildren inherit the fence')
 result = under(writeProfile, ['/bin/sh', '-c', `/bin/sh -c '/bin/rm ${join(WORKSPACE, 'keep.txt')}'`])

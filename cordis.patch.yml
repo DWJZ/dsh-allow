@@ -7,7 +7,7 @@
 #       auditFile: /path/to/audit.ndjson      # 默认 $DSH_HOME/dsh-allow-audit.ndjson
 #       audit: true                           # 关掉审计写 false
 #       sessionGrantTtlMs: 600000             # 「允许一次」的兜底有效期(毫秒)
-#       enforce: auto                         # auto | all | process | writes | off:FS 策略下沉到内核的程度
+#       enforce: auto                         # auto | full | guarded | process | writes | off:FS 策略下沉到内核的程度
 #       grants:                               # 部署级授权,字段与持久规则一致
 #         - path: /opt/homebrew
 #           recursive: true

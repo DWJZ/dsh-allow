@@ -34,7 +34,7 @@
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { OPERATIONS, baselineRules, canonicalPath } from './fspolicy.js'
+import { OPERATIONS, baselineRules } from './fspolicy.js'
 import { seatbeltProfile } from './macos.js'
 import { readRules } from './store.js'
 
@@ -48,27 +48,50 @@ const SEATBELT_DENIALS = Object.freeze(['operation not permitted'])
 const SEATBELT_RUNNER_RULES = Object.freeze([{ fatalSignatures: ['sandbox-exec: '] }])
 
 /**
- * The fence levels a compiled profile can carry, strongest first. `all` adds the
- * read fence, which macOS itself trips over (`/bin/sh` aborts under a profile
- * that withholds reads the platform baseline does not name), so a host settles
- * on `process` unless it probes otherwise.
+ * The user-data areas whose file CONTENTS the usable read fence withholds. The
+ * platform keeps reading everything it needs (nothing here is part of a macOS
+ * runtime path, except a user-installed toolchain, which the baseline re-opens),
+ * and a rule for a path inside one of them re-opens exactly that path.
+ */
+export const SENSITIVE_READ_ROOTS = Object.freeze(['/Users', '/Volumes'])
+
+/**
+ * The fence levels a compiled profile can carry, strongest first.
+ *
+ * - `full` withholds every read and re-allows rule by rule. macOS aborts under
+ *   it, so it is probe-gated and rarely installable.
+ * - `guarded` withholds the user-data areas and re-allows rule by rule: the
+ *   read fence that a normal macOS runtime survives.
+ * - `process` fences execution and writes only.
+ * - `writes` fences writes only.
  */
 const CAPABILITY_SETS = Object.freeze({
-  all: Object.freeze({ read: true, execute: true }),
-  process: Object.freeze({ read: false, execute: true }),
-  writes: Object.freeze({ read: false, execute: false }),
+  full: Object.freeze({ read: 'all', execute: true }),
+  guarded: Object.freeze({ read: 'sensitive', execute: true }),
+  process: Object.freeze({ read: 'none', execute: true }),
+  writes: Object.freeze({ read: 'none', execute: false }),
 })
 
 /** The fence levels, strongest first. */
-const CAPABILITY_ORDER = Object.freeze(['all', 'process', 'writes'])
+const CAPABILITY_ORDER = Object.freeze(['full', 'guarded', 'process', 'writes'])
+
+/** The command a confinement is about to run, when it is a shell invocation. */
+export function commandOfArgv(argv) {
+  if (!Array.isArray(argv) || argv.length < 3) return null
+  const program = String(argv[0] ?? '').split('/').pop()
+  if (program !== 'bash' && program !== 'sh' && program !== 'zsh') return null
+  const flagIndex = argv.findIndex((token, index) => index > 0 && /^-[A-Za-z]*c[A-Za-z]*$/u.test(String(token)))
+  if (flagIndex === -1) return null
+  return typeof argv[flagIndex + 1] === 'string' ? argv[flagIndex + 1] : null
+}
 
 /**
  * The profile one policy compiles to.
  * @param request - the mode, the workspace root, the rules, and the fence level.
  * @returns the SBPL profile text.
  */
-export function compileProfile({ mode, workspaceRoot, rules, protectedFiles = [], capabilities = 'all' }) {
-  const fence = CAPABILITY_SETS[capabilities] ?? CAPABILITY_SETS.all
+export function compileProfile({ mode, workspaceRoot, rules, protectedFiles = [], capabilities = 'full' }) {
+  const fence = CAPABILITY_SETS[capabilities] ?? CAPABILITY_SETS.full
   const readOnly = mode === 'read-only'
   const fenced = rules.map(rule => {
     if (!readOnly) return rule
@@ -81,8 +104,9 @@ export function compileProfile({ mode, workspaceRoot, rules, protectedFiles = []
   })
   return seatbeltProfile({
     rules: fenced,
-    includeRead: fence.read,
+    includeRead: fence.read === 'all',
     includeExecute: fence.execute,
+    readDenyRoots: fence.read === 'sensitive' ? SENSITIVE_READ_ROOTS : [],
     // The permission store is refused after every grant, so a rule that covers
     // its directory still cannot make it writable.
     deniedPaths: protectedFiles,
@@ -164,15 +188,19 @@ export function createEnforcer({ config, grants, logger, platform = process.plat
           capabilities,
           reason: `${['write', 'create', 'delete'].join(', ')} are fenced`
             + (fence.execute ? '; execute is fenced' : '; execute is not')
-            + (fence.read ? '; read is fenced' : '; read is not'),
+            + (fence.read === 'all'
+              ? '; every read is fenced'
+              : (fence.read === 'sensitive'
+                ? `; reads under ${SENSITIVE_READ_ROOTS.join(' and ')} are fenced`
+                : '; read is not')),
         }
         break
       }
     }
-    if (config.enforce === 'all' && verdict.capabilities !== 'all') {
+    if (config.enforce === 'full' && verdict.capabilities !== 'full') {
       verdict = {
         capabilities: 'off',
-        reason: `the kernel refused the read fence (${verdict.reason}), and enforce: all accepts no weaker fence`,
+        reason: `the kernel refused the full read fence (${verdict.reason}), and enforce: full accepts no weaker fence`,
       }
     }
     verdicts.set(key, verdict)
@@ -181,9 +209,10 @@ export function createEnforcer({ config, grants, logger, platform = process.plat
 
   /**
    * The effective rules for one confinement: the platform baseline for its mode
-   * and root, the stored rules, and this session's live "allow once" grants.
+   * and root, the stored rules, and the one-shot grant that belongs to the
+   * command this confinement is about to run.
    */
-  const rulesFor = policy => [
+  const rulesFor = (policy, command) => [
     ...readRules(config.rulesFile),
     ...config.grants,
     ...baselineRules({
@@ -192,26 +221,31 @@ export function createEnforcer({ config, grants, logger, platform = process.plat
       home: config.home,
       mode: policy.mode,
     }),
-    ...grants.rulesForSession(policy.sessionId),
+    ...grants.forCommand(policy.sessionId, command),
   ]
 
   /**
    * The confined argv for one call, or null when this deployment cannot refine
    * the policy for it.
    */
-  const refine = (policy) => {
+  const refine = (argv, policy) => {
     if (policy === null || typeof policy !== 'object') return null
     if (policy.mode === 'danger-full-access') return null
     if (typeof policy.workspaceRoot !== 'string' || policy.workspaceRoot === '') return null
-    const rules = rulesFor(policy)
+    const rules = rulesFor(policy, commandOfArgv(argv))
     const fence = fenceFor(policy, rules)
-    const set = CAPABILITY_SETS[fence.capabilities] ?? { read: false, execute: false }
-    report.state = fence.capabilities === 'off' ? 'off' : (fence.capabilities === 'all' ? 'full' : 'partial')
+    const set = CAPABILITY_SETS[fence.capabilities] ?? { read: 'none', execute: false }
+    report.state = fence.capabilities === 'off'
+      ? 'off'
+      : (fence.capabilities === 'full' ? 'full' : 'partial')
+    report.level = fence.capabilities
     report.reason = fence.reason
     report.capabilities = Object.fromEntries(OPERATIONS.map(operation => [
       operation,
       fence.capabilities !== 'off'
-        && (operation !== 'read' && operation !== 'execute' ? true : (operation === 'read' ? set.read : set.execute)),
+        && (operation !== 'read' && operation !== 'execute'
+          ? true
+          : (operation === 'read' ? set.read !== 'none' : set.execute)),
     ]))
     if (fence.capabilities === 'off') return null
     return compileProfile({
@@ -243,7 +277,7 @@ export function createEnforcer({ config, grants, logger, platform = process.plat
       found.confine = (argv, policy) => {
         let profile = null
         try {
-          profile = refine(policy)
+          profile = refine(argv, policy)
         }
         catch (error) {
           // A policy this module cannot compile must not become a wider fence.
@@ -252,7 +286,6 @@ export function createEnforcer({ config, grants, logger, platform = process.plat
           logger.warn(`dsh-allow: ${report.reason}; refusing to widen the fence`)
         }
         if (profile === null) return original.call(provider, argv, policy)
-        const workspaceRoot = canonicalPath(policy.workspaceRoot, { cwd: '/', home: config.home })
         return {
           argv: [SANDBOX_EXEC, '-p', profile, '--', ...argv],
           enforcement: report.state === 'full' ? 'full' : 'partial',
@@ -271,12 +304,13 @@ export function createEnforcer({ config, grants, logger, platform = process.plat
       original = null
     },
     /**
-     * The profile one policy compiles to, for `/allow status` and tests.
+     * The profile one confinement compiles to, for `/allow status` and tests.
+     * @param argv - the command the caller is about to spawn.
      * @param policy - the resolved sandbox policy.
      * @returns the profile text, or null when nothing is enforced for it.
      */
-    profileFor(policy) {
-      return refine(policy)
+    profileFor(argv, policy) {
+      return refine(argv, policy)
     },
     /**
      * What the kernel is currently enforcing.

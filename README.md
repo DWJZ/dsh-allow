@@ -124,7 +124,7 @@ Sandbox:   workspace-write
 
 `always allow` writes the narrowest rules for exactly what the card names — one per path in the line, recursive only when that path is a directory that already exists — and never widens a grant to the folder around it. Opening a folder on purpose is a deliberate act: `/allow add delete . folder`.
 
-`allow once` is genuinely once: it is bound to the call the user approved, it is handed to the sandbox for that call only, and `tools/post-execute` drops it the moment the call settles, with a ten-minute expiry as a backstop. It is never written to the rules file, and the next call asks again.
+`allow once` is genuinely once, and it is kept from leaking sideways by two mechanisms. The grant is bound to the call the user approved, so the decision layer only ever sees it for that call; the profile builder recognises it again by the command line that call is running, because a confinement is told its session but not its call. And while a grant is live, every other call in the same session waits for the holder to settle before it is judged — so two overlapping calls can never share one grant. `tools/post-execute` drops the grant the moment that call settles, with a ten-minute expiry as a backstop; it is never written to the rules file, and the next call asks again.
 
 A `sandbox_permissions` escalation is a wider process fence, not a filesystem capability, so it is **never** approved automatically — not even for a command whose capabilities are all granted. One approval lets a command run outside its mode; that decision belongs to the user.
 
@@ -142,17 +142,22 @@ A `sandbox_permissions` escalation is a wider process fence, not a filesystem ca
 
 `delete` is genuinely separable from `write`: a profile that allows `file-write-data` and `file-write-create` under a subtree while withholding `file-write-unlink` lets a process rewrite and create files there while `rm`, `rmdir`, `rename`, `python -c 'os.remove(…)'` and `node -e 'fs.rmSync(…)'` all fail with EPERM — in the process, in its children and in its grandchildren. `create` alone is enough to make a new file *and* fill it; it is `write` that governs changing a file that already exists. Seatbelt filters match the path the kernel resolved, so rule paths are canonicalized before they are rendered, and a rule keeps the spelling it was granted under next to the path that spelling resolves to, so a grant for `/opt/homebrew/bin/gh` also covers the Cellar binary it points at — and vice versa.
 
-Two Seatbelt details shape the profile. A wildcard denial loses to a specific allowance (`(deny file-write* …)` does not stop `(allow file-write-data …)`), so the permission store is refused by naming every write operation. And a profile that withholds reads macOS needs makes `/bin/sh` abort before it runs anything, which is why the read fence is probed rather than assumed.
+Two Seatbelt details shape the profile. A wildcard denial loses to a specific allowance (`(deny file-write* …)` does not stop `(allow file-write-data …)`), so the permission store is refused by naming every write operation. And a profile that withholds *every* read makes `/bin/sh` abort before it runs anything.
+
+Reads are therefore fenced the way a macOS runtime survives: `(deny file-read-data (subpath "/Users"))` and the same for `/Volumes`, written before the rules, with the workspace, the temp areas, the harness home, user-installed toolchains, a few home configuration files and every read grant re-opening exactly what they name. A program reads everything the platform needs; a file in the home that no rule names — `~/.ssh/id_ed25519`, `~/.aws/credentials`, `~/.config/gh/hosts.yml` — is refused by the kernel whatever command tries it, `python3 -c`, `node -e` and `bash -c` included.
 
 How much of the policy reaches the kernel is **probed** at the first call for each mode and workspace, with the real profile and real commands; the verdict is cached and reported by `/allow status`:
 
-| state | means |
+| level | means |
 | --- | --- |
-| `full` | write, create, delete, read and execute are fenced |
-| `partial` | write, create and delete are fenced; execute and read are not (the kernel refused the stronger profile) |
-| `off` | nothing of this policy is fenced, so the decision layer refuses to let opaque code run on the assumption that it is |
+| `full` | every read is withheld and re-allowed rule by rule; macOS aborts under it |
+| `guarded` | write, create, delete, execute, and reads under the user-data areas |
+| `process` | write, create, delete and execute |
+| `writes` | write, create and delete |
 
-`enforce: 'auto'` tries `full`, then the write+execute fence, then writes alone, and never falls back to something wider than the harness already had. `enforce: all` accepts nothing less than `full` and reports `off` if the kernel refuses it. A compilation failure is reported rather than swallowed, and it does not replace the profile with a wider one.
+`/allow status` reports the level as `full`, `partial` or `off` beside the per-capability flags.
+
+`enforce: 'auto'` walks that list strongest first and keeps the first level the probe accepts — on a normal macOS that is `guarded`. `enforce: full` accepts nothing less than `full` and reports `off` if the kernel refuses it. A compilation failure is reported rather than swallowed, and it does not replace the profile with a wider one.
 
 ## Configuration
 
@@ -163,7 +168,7 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
     auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
     audit: true                             # false turns the audit log off
     sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
-    enforce: auto                           # auto | all | process | writes | off
+    enforce: auto                           # auto | full | guarded | process | writes | off
     grants:                                 # deployment grants, same shape as a stored rule
       - path: /opt/homebrew
         recursive: true
@@ -184,9 +189,11 @@ npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start 
 
 ## Limits
 
+- Path resolution still works inside the fenced areas: `stat` and directory listing leak metadata, only file contents are withheld.
+- A tool that keeps its configuration and its token together under the home needs one read grant for that directory: `gh`, `aws`, `docker` and friends report their own error until `~/.config/<tool>` is granted. Denying `hosts.yml`, `credentials` and `id_ed25519` by default is the point; granting them is a deliberate act.
 - Effects the command line does not show are judged by the sandbox, not by the parser: an effect the program table does not know is left to the fence rather than guessed.
 - `create` alone lets a process create and fill a new file; changing a file that already exists needs `write`.
-- On this host the read fence is expressible but not survivable: macOS itself reads more than the policy baseline names, so `/bin/sh` aborts under it and `auto` settles on the write+execute fence. `enforce: all` is for deployments that want to chase that baseline down.
+- The strongest read fence (`enforce: full`) is expressible but not survivable on this host: macOS reads more than the policy baseline names, so `/bin/sh` aborts under it. The guarded fence is what `auto` settles on.
 - The weaker seatbelt findings: an unreadable path still resolves (metadata stays allowed), and a wildcard denial needs its operations named.
 - Renaming needs `delete` for the source plus `create` for the target.
 - Read effects are derived for a fixed table of programs; the fence, not the table, is the boundary.

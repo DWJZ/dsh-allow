@@ -201,18 +201,28 @@ check('the stored rule holds for every session', decision.kind === 'allow', JSON
 
 console.log('a one-shot grant is spent by the call it was given to')
 const settle = host.createSettleListener({ grants, logger })
-check('the one-shot is still live for its call', grants.rulesForSession('s1').length === 1)
+check('the one-shot is still live for its call', grants.rulesFor('s1', 'c2').length === 1)
+check('the profile sees it only for the approved command',
+  grants.forCommand('s1', 'rm -rf unopened').length === 1
+  && grants.forCommand('s1', 'rm -rf something-else').length === 0)
+check('another call in the session is told to wait', grants.holder('s1', 'cX') === 'c2'
+  && grants.holder('s1', 'c2') === null)
+let released = false
+const waiting = grants.released('s1', 'c2').then(() => { released = true })
 await settle(exec('rm -rf unopened', { callId: 'c2' }), { kind: 'accepted' }, next)
-check('settling that call releases it', grants.rulesForSession('s1').length === 0
-  && grants.rulesFor('s1', 'c2').length === 0)
-await settle(exec('rm -rf unopened', { callId: 'c9' }), { kind: 'accepted' }, next)
-check('an unrelated call releases nothing', grants.rulesForSession('s1').length === 0)
+await waiting
+check('settling that call releases the waiter', released === true)
+check('and drops the grant', grants.rulesFor('s1', 'c2').length === 0
+  && grants.forCommand('s1', 'rm -rf unopened').length === 0)
+check('a settle with nothing to drop is harmless', grants.consume('s1', 'c9') === 0)
 const onceStore = store.createGrantStore()
-onceStore.grant('s1', 'k1', [{ path: `${WORKSPACE}/gone`, recursive: false, access: { delete: true } }])
+onceStore.grant('s1', 'k1', 'rm -rf gone', [{ path: `${WORKSPACE}/gone`, recursive: false, access: { delete: true } }])
 check('a grant belongs to its call', onceStore.rulesFor('s1', 'k1').length === 1 && onceStore.rulesFor('s1', 'k2').length === 0)
-check('other sessions never see it', onceStore.rulesForSession('s2').length === 0)
-check('the session view carries it for the profile', onceStore.rulesForSession('s1').length === 1)
-check('and consuming the call drops it', onceStore.consume('s1', 'k1') === 1 && onceStore.rulesForSession('s1').length === 0)
+check('other sessions never see it', onceStore.forCommand('s2', 'rm -rf gone').length === 0)
+check('the command view carries it for the profile', onceStore.forCommand('s1', 'rm -rf gone').length === 1)
+check('and consuming the call drops it',
+  onceStore.consume('s1', 'k1') === 1 && onceStore.forCommand('s1', 'rm -rf gone').length === 0)
+check('a command with no grant stays empty', onceStore.forCommand('s1', 'rm -rf gone').length === 0)
 
 console.log('audit')
 const audit = readFileSync(auditFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
@@ -307,7 +317,7 @@ check('an unknown verb is an error', allow('nonsense').kind === 'error')
 console.log('one-shot grants expire')
 const clock = { now: 1000 }
 const expiring = store.createGrantStore({ ttlMs: 100, now: () => clock.now })
-expiring.grant('s1', 'c1', [{ path: `${WORKSPACE}/gone`, recursive: false, access: { delete: true } }])
+expiring.grant('s1', 'c1', 'rm -rf gone', [{ path: `${WORKSPACE}/gone`, recursive: false, access: { delete: true } }])
 check('a grant is readable', expiring.rulesFor('s1', 'c1').length === 1)
 clock.now += 500
 check('and expires even if the call never settles', expiring.rulesFor('s1', 'c1').length === 0)

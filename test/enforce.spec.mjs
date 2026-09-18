@@ -43,13 +43,14 @@ const rule = (path, access, recursive = true) => fspolicy.makeRule({ path, acces
 
 console.log('profile compilation')
 const workspaceRules = fspolicy.baselineRules({ workspaceRoot: WORKSPACE, harnessHome: root, home: HOME, mode: 'workspace-write' })
-let profile = enforce.compileProfile({ mode: 'workspace-write', workspaceRoot: WORKSPACE, rules: workspaceRules, capabilities: 'all' })
+let profile = enforce.compileProfile({ mode: 'workspace-write', workspaceRoot: WORKSPACE, rules: workspaceRules, capabilities: 'full' })
 check('write and create are granted in the workspace',
   profile.includes('file-write-data') && profile.includes('file-write-create'), profile)
 check('delete is withheld in the workspace', !profile.includes('(allow file-write-unlink'), profile)
 check('the write fence is always present', profile.includes('(deny file-write*)'))
-check('the read fence is present when asked for',
+check('the full read fence is present when asked for',
   profile.includes('(deny file-read-data)') && profile.includes('(allow file-read-metadata)'))
+check('and it withholds nothing less than everything', !profile.includes('(deny file-read-data (subpath'))
 check('the execute fence is present', profile.includes('(deny process-exec)'))
 check('system binaries stay executable', profile.includes('(allow process-exec (subpath "/usr/bin"))') || profile.includes('(allow process-exec (subpath "/bin"))'), profile)
 
@@ -61,10 +62,21 @@ profile = enforce.compileProfile({
   mode: 'workspace-write',
   workspaceRoot: WORKSPACE,
   rules: [...workspaceRules, rule(join(WORKSPACE, 'build'), { delete: true })],
-  capabilities: 'all',
+  capabilities: 'full',
 })
 check('a delete grant becomes an unlink allowance',
   profile.includes(`(allow file-write-unlink (subpath "${join(WORKSPACE, 'build')}"))`), profile)
+
+profile = enforce.compileProfile({ mode: 'workspace-write', workspaceRoot: WORKSPACE, rules: workspaceRules, capabilities: 'guarded' })
+check('the guarded fence withholds user data',
+  profile.includes('(deny file-read-data (subpath "/Users"))') && profile.includes('(deny file-read-data (subpath "/Volumes"))'), profile)
+check('and re-opens the workspace after it',
+  profile.indexOf('(allow file-read-data file-write-data') > profile.indexOf('(deny file-read-data (subpath'), profile)
+check('and re-opens the harness home',
+  profile.includes(`(subpath "${fspolicy.canonicalPath(root, { cwd: '/', home: HOME })}")`), profile)
+check('and a user toolchain below the home', profile.includes(`(subpath "${HOME}/.nvm")`), profile)
+check('the guarded fence still fences execution', profile.includes('(deny process-exec)'), profile)
+check('and does not fence every read', !profile.includes('(deny file-read-data) (allow file-read-metadata)'), profile)
 
 profile = enforce.compileProfile({ mode: 'read-only', workspaceRoot: WORKSPACE, rules: workspaceRules, capabilities: 'writes' })
 check('a read-only mode ignores write grants on the workspace', !profile.includes(`(allow file-write-data (subpath "${WORKSPACE}"))`), profile)
@@ -86,7 +98,7 @@ check('every write operation is named, not a wildcard',
 console.log('probing')
 const okSpawn = () => ({ status: 0 })
 /** A kernel that can fence writes but refuses a profile that fences reads. */
-const readRefusing = (_program, args) => ({ status: String(args?.[1] ?? '').includes('(deny file-read-data)') ? 1 : 0 })
+const readRefusing = (_program, args) => ({ status: String(args?.[1] ?? '').includes('(deny file-read-data) (allow file-read-metadata)') ? 1 : 0 })
 check('an applying profile passes the probe',
   enforce.probeProfile(profile, { workspaceRoot: WORKSPACE, spawn: okSpawn }) === true)
 check('a refusing profile fails the probe',
@@ -121,12 +133,23 @@ check('the status reports full enforcement', enforcer.status().state === 'full',
 
 console.log('what a session grant does to the profile')
 const sessionPolicy = { mode: 'workspace-write', workspaceRoot: WORKSPACE, sessionId: 's1' }
+const bash = command => ['bash', '-c', command]
 const unlinkFor = text => text.includes(`(allow file-write-unlink (literal "${join(WORKSPACE, 'build')}"))`)
-check('a plain call has no unlink allowance for that path', !unlinkFor(enforcer.profileFor(sessionPolicy)))
-grants.grant('s1', 'c1', [{ path: join(WORKSPACE, 'build'), recursive: false, access: { delete: true } }])
-check('the granted call carries it into the profile', unlinkFor(enforcer.profileFor(sessionPolicy)), enforcer.profileFor(sessionPolicy))
+check('a plain call has no unlink allowance for that path',
+  !unlinkFor(enforcer.profileFor(bash('rm -rf build'), sessionPolicy)))
+grants.grant('s1', 'c1', 'rm -rf build', [{ path: join(WORKSPACE, 'build'), recursive: false, access: { delete: true } }])
+check('the granted call carries it into the profile',
+  unlinkFor(enforcer.profileFor(bash('rm -rf build'), sessionPolicy)))
+check('but only for the command the user approved',
+  !unlinkFor(enforcer.profileFor(bash('rm -rf other'), sessionPolicy)))
+check('and the decision layer sees the same call',
+  grants.rulesFor('s1', 'c1').length === 1)
+check('while another call does not', grants.rulesFor('s1', 'c2').length === 0)
+check('and the holder is visible to the gate', grants.holder('s1', 'c2') === 'c1' && grants.holder('s1', 'c1') === null)
 grants.consume('s1', 'c1')
-check('and the next call does not', !unlinkFor(enforcer.profileFor(sessionPolicy)))
+check('and the next call does not', !unlinkFor(enforcer.profileFor(bash('rm -rf build'), sessionPolicy)))
+check('a command the builder cannot read carries no grant',
+  !unlinkFor(enforcer.profileFor(['/bin/sh', '-c', 'rm -rf build'], sessionPolicy)))
 
 console.log('delegating what it cannot refine')
 const other = fakeProvider()
@@ -145,17 +168,21 @@ offEnforcer.install({ get: () => offProvider })
 check('enforce: off delegates too', offProvider.confine(['bash', '-c', 'ls'], policy).argv[0] === 'original')
 check('and says why', offEnforcer.status().reason.includes('disabled'), offEnforcer.status().reason)
 
-console.log('a kernel that refuses the read fence')
+console.log('a kernel that refuses the full read fence')
 const partialProvider = fakeProvider()
 const partial = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: readRefusing })
 partial.install({ get: () => partialProvider })
 const partialConfined = partialProvider.confine(['bash', '-c', 'echo hi'], policy)
 check('the call still runs under a profile', partialConfined.argv[0] === '/usr/bin/sandbox-exec')
-check('one without the read fence', !partialConfined.argv[2].includes('(deny file-read-data)'), partialConfined.argv[2].slice(0, 120))
+check('one with the guarded read fence instead',
+  partialConfined.argv[2].includes('(deny file-read-data (subpath "/Users"))')
+  && !partialConfined.argv[2].includes('(deny file-read-data) (allow file-read-metadata)'), partialConfined.argv[2].slice(0, 160))
 check('and the write fence survives', partialConfined.argv[2].includes('(deny file-write*)'))
 check('the status says partial', partial.status().state === 'partial', JSON.stringify(partial.status()))
-check('with read and execute marked unfenced',
-  partial.status().capabilities.read === false && partial.status().capabilities.delete === true,
+check('with the guarded level named', partial.status().level === 'guarded', JSON.stringify(partial.status()))
+check('and user-data reads still fenced while execute is fenced too',
+  partial.status().capabilities.read === true && partial.status().capabilities.execute === true
+  && partial.status().capabilities.delete === true,
   JSON.stringify(partial.status().capabilities))
 check('enforcement is partial for the shell tool', partialConfined.enforcement === 'partial')
 

@@ -76,6 +76,26 @@ const SYSTEM_READ = Object.freeze([
   '/Library', '/opt/homebrew', '/dev', '/Applications',
 ])
 
+/**
+ * User-installed toolchain roots below the home directory. The read fence
+ * withholds user data, and a program a toolchain put under the home still has
+ * to be readable for the program to start; these hold programs and their
+ * package stores, not credentials.
+ */
+const HOME_TOOLCHAINS = Object.freeze([
+  '.nvm', '.local', '.cargo', '.rustup', '.bun', '.deno', '.volta', '.pyenv',
+  '.rbenv', '.sdkman', '.go', '.asdf', '.gem', 'Library/pnpm',
+])
+
+/**
+ * Home paths a tool reads to start at all and that hold configuration rather
+ * than credentials. The read fence withholds the home directory, so these are
+ * re-opened by name; everything that stores a secret (`~/.ssh`, `~/.aws`,
+ * `~/.gnupg`, `~/.netrc`, `~/.config/gh`, `~/.git-credentials`) stays closed
+ * until the user grants it.
+ */
+const HOME_CONFIGS = Object.freeze(['.gitconfig', '.config/git', '.gitignore'])
+
 /** Every capability, for the baseline rules that grant all of them. */
 const ALL_ACCESS = Object.freeze({ read: true, write: true, create: true, delete: true, execute: true })
 
@@ -305,9 +325,31 @@ export function baselineRules({ workspaceRoot, harnessHome, home, mode = 'worksp
       access: { read: true }, note: 'a system path',
     }))
   }
+  if (typeof home === 'string' && home.startsWith('/') && home !== '/') {
+    for (const toolchain of HOME_TOOLCHAINS) {
+      rules.push(makeRule({
+        path: `${home}/${toolchain}`,
+        recursive: true,
+        source: 'system',
+        baseline: true,
+        access: { read: true, execute: true },
+        note: 'a user-installed toolchain',
+      }))
+    }
+    for (const config of HOME_CONFIGS) {
+      rules.push(makeRule({
+        path: `${home}/${config}`,
+        recursive: true,
+        source: 'system',
+        baseline: true,
+        access: { read: true },
+        note: 'user configuration a tool reads to start',
+      }))
+    }
+  }
   // `$HOME` itself is deliberately absent: everything outside the workspace but
-  // the read-only system paths stays closed until the user opens it.
-  void home
+  // the read-only system paths and those toolchains stays closed until the user
+  // opens it, and the read fence withholds its contents meanwhile.
   return rules
 }
 

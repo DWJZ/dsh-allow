@@ -223,11 +223,17 @@ export function fileTargetOf(exec) {
  * protection this policy owns outright — the permission store itself — because
  * the harness's own fence already bounds where they may write; without this,
  * the agent could rewrite its own rules with a file tool.
- * @param options - the engine, the pending store, the configuration, and the logger.
+ *
+ * A confinement knows its session but not its call, so while one call holds an
+ * "allow once" grant every other call in that session waits for it to settle:
+ * that is what keeps a second call from running under the first one's grant.
+ * @param options - the engine, the pending store, the configuration, the session
+ *   grants, and the logger.
  * @returns the waterfall listener.
  */
-export function createGate({ engine, pendings, logger, config = null }) {
+export function createGate({ engine, pendings, logger, config = null, grants = null }) {
   return async (exec, next) => {
+    if (grants !== null) await waitForGrantHolder(grants, exec, logger)
     const command = commandOf(exec)
     if (command === null) {
       const target = fileTargetOf(exec)
@@ -257,6 +263,30 @@ export function createGate({ engine, pendings, logger, config = null }) {
     // The prefix is the card's marker: it tells the client this prompt belongs
     // to the policy layer, so the card can offer its grant buttons.
     return { kind: 'ask', reason: `${POLICY_REASON_PREFIX}${decision.reason}` }
+  }
+}
+
+/**
+ * Wait while another call in this session holds an "allow once" grant.
+ *
+ * A confinement is told its session, not its call, so the provider's profile
+ * can only match a grant by the command it is about to run. Two calls of the
+ * same session overlapped would therefore be one command away from sharing a
+ * grant. Serializing them costs a wait that ends when the holder settles (or
+ * when the grant expires) and removes the overlap entirely.
+ * @param grants - the session-grant store.
+ * @param exec - the call about to be judged.
+ * @param logger - the plugin logger.
+ * @returns a promise that settles when no other call holds a grant.
+ */
+export async function waitForGrantHolder(grants, exec, logger) {
+  const sessionId = exec?.agent?.session?.id
+  const callId = exec?.callId
+  for (let guard = 0; guard < 8; guard += 1) {
+    const holder = grants.holder(sessionId, callId)
+    if (holder === null) return
+    logger.info(`dsh-allow: waiting for call ${holder} to spend its one-shot grant before judging ${String(callId)}`)
+    await grants.released(sessionId, holder)
   }
 }
 
@@ -503,7 +533,7 @@ export function createOnceHandler({ pendings, grants, logger }) {
         return
       }
       const suggestions = record.suggestions ?? []
-      const granted = grants.grant(record.sessionId ?? body?.sessionId, body?.callId, suggestions)
+      const granted = grants.grant(record.sessionId ?? body?.sessionId, body?.callId, record.command, suggestions)
       pendings.forget(body?.sessionId, body?.callId)
       logger.info(`dsh-allow: granted ${String(granted.length)} capability rule(s) to call ${String(body?.callId)}`)
       sendJson(res, 200, { ok: true, granted: granted.map(describeRule) })
@@ -627,7 +657,7 @@ export function apply(ctx, pluginConfig) {
     return () => { enforcement.uninstall() }
   }, 'dsh-allow: process fence')
   const engine = createEngine({ config, home, grants, pendings, ctx, enforcement })
-  const gate = createGate({ engine, pendings, logger: ctx.logger, config })
+  const gate = createGate({ engine, pendings, logger: ctx.logger, config, grants })
   // Ahead of every other pre-execute listener: a protected path must be refused
   // before any other policy can allow it.
   ctx.on('tools/pre-execute', (exec, next) => gate(exec, next), { prepend: true })
