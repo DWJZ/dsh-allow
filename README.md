@@ -47,9 +47,10 @@ process execution
 
 1. `src/parse.js` splits the line on unquoted `&&`, `||`, `;`, `|`, `&`, and newlines, then tokenizes each segment with quoting and escapes intact. `echo "a && b"` is one command; `$(…)`, backticks, globs, subshells, groups, control keywords, here-documents, and dynamic executables all make the line **unanalysable**.
 2. `sh -c '…'`, `bash -lc '…'`, and `eval '…'` are parsed **recursively** (depth 4). A wrapper whose program is dynamic is unanalysable.
-3. `$(…)` and backticks are parsed recursively too: the substituted commands join the same line and are aggregated with it (`echo "$(rm -rf /)"` is forbidden). A substitution the parser cannot reduce makes the whole line a prompt, and a substituted **program name** is always unanalysable, so `$(printf rm) -rf /` is never allowed.
-4. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
-5. Unanalysable lines are `prompt` and can never match an `allow` rule — the fail-closed rule for shell syntax this parser does not model.
+3. Here-document bodies (`<<EOF … EOF`) are **stdin data, not shell source**, so they are removed before parsing — a Python line inside one is no longer read as a command. The reader is still judged: `python3 -` or a shell without `-c` takes its program from stdin, which is code execution and is never rememberable.
+4. `$(…)` and backticks are parsed recursively too: the substituted commands join the same line and are aggregated with it (`echo "$(rm -rf /)"` is forbidden). A substitution the parser cannot reduce makes the whole line a prompt, and a substituted **program name** is always unanalysable, so `$(printf rm) -rf /` is never allowed.
+5. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
+6. Unanalysable lines are `prompt` and can never match an `allow` rule — the fail-closed rule for shell syntax this parser does not model.
 
 ## Built-in policy
 

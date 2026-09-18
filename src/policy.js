@@ -211,8 +211,15 @@ export function classifyBuiltin(command, context) {
   }
 
   const inlineFlag = INLINE_CODE_FLAGS[program]
-  if (inlineFlag !== undefined && args.includes(inlineFlag)) {
-    return { decision: 'prompt', risk: 'code-execution', reason: `${program} ${inlineFlag} runs an inline program` }
+  if (inlineFlag !== undefined) {
+    if (args.includes(inlineFlag)) {
+      return { decision: 'prompt', risk: 'code-execution', reason: `${program} ${inlineFlag} runs an inline program` }
+    }
+    // No program file at all: the program arrives on stdin (a here-document or
+    // a pipe), which is exactly as unreadable as `-c`.
+    if (args.length === 0 || args[0] === '-') {
+      return { decision: 'prompt', risk: 'code-execution', reason: `${program} reads its program from stdin` }
+    }
   }
 
   if (SHELL_PROGRAMS.has(program) && !args.some(argument => /^-[A-Za-z]*c/u.test(argument))) {

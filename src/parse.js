@@ -32,6 +32,80 @@ const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish
 export const MAX_WRAPPER_DEPTH = 4
 
 /**
+ * Read the here-document delimiters one line declares.
+ *
+ * Scanned quote-aware rather than by matching the raw line, because the
+ * delimiter is often quoted (`<<'PY'`) and a `<<` inside a quoted string is
+ * data, not an operator.
+ * @param line - one raw command line.
+ * @returns the delimiters in declaration order.
+ */
+function heredocDelimiters(line) {
+  const found = []
+  let quote = null
+  let index = 0
+  while (index < line.length) {
+    const character = line[index]
+    if (quote !== null) {
+      if (character === '\\' && quote === '"') { index += 2; continue }
+      if (character === quote) quote = null
+      index += 1
+      continue
+    }
+    if (character === "'" || character === '"') { quote = character; index += 1; continue }
+    if (character === '\\') { index += 2; continue }
+    if (character === '<' && line[index + 1] === '<') {
+      let cursor = index + 2
+      if (line[cursor] === '-') cursor += 1
+      while (cursor < line.length && /\s/u.test(line[cursor])) cursor += 1
+      const opening = line[cursor]
+      if (opening === "'" || opening === '"') {
+        const close = line.indexOf(opening, cursor + 1)
+        if (close === -1) break
+        found.push(line.slice(cursor + 1, close))
+        index = close + 1
+        continue
+      }
+      const match = /^[A-Za-z_][A-Za-z0-9_]*/u.exec(line.slice(cursor))
+      if (match === null) { index += 2; continue }
+      found.push(match[0])
+      index = cursor + match[0].length
+      continue
+    }
+    index += 1
+  }
+  return found
+}
+
+/**
+ * Drop here-document bodies from a command line.
+ *
+ * The body is stdin data, not shell source: parsing it as shell invents
+ * commands that never run (a Python source line has no executable). The `<<`
+ * operator and its delimiter stay in the text, so the command that reads the
+ * body is still judged — `python3 -` is a program from stdin either way.
+ * @param source - the raw command line.
+ * @returns the line without bodies, plus whether any body was removed.
+ */
+export function stripHeredocBodies(source) {
+  const lines = source.split('\n')
+  const kept = []
+  const pending = []
+  let stripped = false
+  for (const line of lines) {
+    if (pending.length > 0) {
+      const candidate = line.replace(/^\t+/u, '').trimEnd()
+      if (candidate === pending[0]) pending.shift()
+      stripped = true
+      continue
+    }
+    kept.push(line)
+    for (const delimiter of heredocDelimiters(line)) pending.push(delimiter)
+  }
+  return { text: kept.join('\n'), stripped }
+}
+
+/**
  * Read one balanced `$( … )` body.
  * @param text - the segment text.
  * @param start - index just past the opening `$(`.
@@ -349,7 +423,8 @@ export function parseCommandLine(source, { home = '/', depth = 0 } = {}) {
   if (depth > MAX_WRAPPER_DEPTH) {
     return { analyzable: false, reason: 'shell wrapper nesting too deep', commands: [], operators: [] }
   }
-  const segments = splitSegments(source)
+  const { text: sourceText } = stripHeredocBodies(source)
+  const segments = splitSegments(sourceText)
   const commands = []
   const operators = []
   for (const segment of segments) {

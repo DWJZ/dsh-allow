@@ -47,6 +47,7 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
 
 1. `src/parse.js` 按未加引号的 `&&`、`||`、`;`、`|`、`&`、换行切分，再按引号与转义切词。`echo "a && b"` 是一条命令；`$(…)`、反引号、通配符、子 shell、分组、控制关键字、here-doc、动态可执行文件都会让整行变成**无法分析**。
 2. `sh -c '…'`、`bash -lc '…'`、`eval '…'` 会**递归解析**（深度 4）；wrapper 的程序名是动态的 → 无法分析。
+2a. here-document（`<<EOF … EOF`）的**正文是 stdin 数据，不是 shell 源码**：解析前先剥掉，所以正文里的 Python/文本行不会再被当成命令；但读取它的程序照样判定——`python3 -`、`bash`（无 `-c`）属于「从 stdin 读程序」，按代码执行 prompt 且不可记忆。
 2b. `$(…)` 与反引号**也递归解析**：替换体里的命令算作同一行的命令，一起按最严聚合（`echo "$(rm -rf /)"` → forbidden）；替换体解析不出来时整行降级为 `prompt`；被替换出来的**程序名**永远是动态可执行 → 无法分析（`$(printf rm) -rf /` 不会被放行）。
 3. 每个简单命令的 argv 由内置表分类、与存储规则匹配，然后整条请求取最严：`forbidden > prompt > allow`。
 4. 无法分析的行是 `prompt`，并且**永远不会**命中 `allow` 规则——这就是对 parser 不理解的 shell 语法的 fail-closed。

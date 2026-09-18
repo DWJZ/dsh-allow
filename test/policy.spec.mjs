@@ -165,6 +165,13 @@ check('one dangerous member defeats coverage', line.covered === false && line.de
 check('and a forbidden line suggests nothing', line.suggestions.length === 0)
 check('an unparsable line is never covered', evaluate('echo "$(cat l | while read x; do rm $x; done)"', lineRules).covered === false)
 
+console.log('here-documents: the body is data, the reader is still judged')
+check('a here-doc body is not parsed as commands', evaluate('cat > /tmp/x <<EOF\nrm -rf /\nEOF').decision === 'allow')
+check('the python heredoc reader prompts as code execution', evaluate("python3 - <<'PY'\nprint(1)\nPY").decision === 'prompt')
+check('and it is offered no rule', evaluate("python3 - <<'PY'\nprint(1)\nPY").suggestions.length === 0)
+check('a shell heredoc reader prompts too', evaluate('bash <<EOF\nrm -rf /\nEOF').decision === 'prompt')
+check('quoted << is not a heredoc', evaluate('echo "a << b"').decision === 'allow')
+
 console.log('command substitution is analysed, not guessed')
 check('a substitution runs its own command', evaluate('echo "$(rm -rf /)"').decision === 'forbidden')
 check('a read-only substitution stays allowed', evaluate('echo "local: $(git rev-parse HEAD)"').decision === 'allow')
