@@ -59,6 +59,10 @@ export function resolveConfig(config, home) {
     auditFile: text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME)),
     audit: config?.audit !== false,
     defaultDecision,
+    // A remembered command also answers the sandbox's escalation question:
+    // that is what "stop asking for this command" means for a path outside
+    // the workspace. Turn it off to keep every widening manual.
+    autoApproveEscalations: config?.autoApproveEscalations !== false,
   }
 }
 

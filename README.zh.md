@@ -39,7 +39,8 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
 ## 三种决策
 
 - **allow** —— 没有规则反对，交给沙箱（沙箱仍是文件写入的围栏）；命中已记住的 `allow` 规则也走这里。
-- **prompt** —— 弹审批卡片。`允许一次` 只回答本次、不写任何东西；`总是允许` 写入建议的窄规则；`拒绝` 拒绝本次调用。
+- **prompt** —— 弹审批卡片。`允许一次` 只回答本次、不写任何东西；`总是允许` 写入建议的窄规则（行内每条命令一条，例如 `cp` + `echo`）；`拒绝` 拒绝本次调用。
+- **已记住** —— 整行每条命令都被 allow 规则覆盖时，沙箱的提权询问也会被静默批准，于是「允许过的命令」以后彻底不再问。想保留每次手动确认，把 `autoApproveEscalations` 设为 `false`。
 - **forbidden** —— 直接拒绝并给理由，不询问、也不可升级：这类操作无论谁批准都是破坏性的。
 
 ## 命令怎么被分析
@@ -109,6 +110,7 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
     auditFile: /path/to/audit.ndjson
     audit: true
     defaultDecision: allow      # 或 prompt：全量把关
+    autoApproveEscalations: true # false：已记住的命令在扩大沙箱权限时仍需确认
 ```
 
 ## 测试

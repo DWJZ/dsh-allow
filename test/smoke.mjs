@@ -96,7 +96,7 @@ check('an unremarkable command continues to the sandbox', decision.kind === 'all
 decision = await gate(exec('git reset --hard'), next)
 check('a destructive command asks for approval', decision.kind === 'ask', JSON.stringify(decision))
 check('and the reason names the command', String(decision.reason).includes('git reset --hard'), decision.reason)
-check('and a pending record exists for the card', gatePendings.get('s1', 'c1')?.suggestion?.executable === 'git', JSON.stringify(gatePendings.get('s1', 'c1')))
+check('and a pending record exists for the card', gatePendings.get('s1', 'c1')?.suggestions?.[0]?.executable === 'git', JSON.stringify(gatePendings.get('s1', 'c1')))
 check('the suggested rule keeps the subcommand', gatePendings.get('s1', 'c1')?.label === 'git reset', String(gatePendings.get('s1', 'c1')?.label))
 
 decision = await gate(exec('rm -rf /'), next)
@@ -138,7 +138,8 @@ routePendings.remember('s1', 'c1', {
   risk: 'destructive',
   analyzable: true,
   label: 'rm',
-  suggestion: { decision: 'allow', executable: 'rm', argvPrefix: [] },
+  labels: ['rm'],
+  suggestions: [{ decision: 'allow', executable: 'rm', argvPrefix: [] }],
   triggers: ['rm -rf build'],
 })
 const pendingHandler = host.createPendingHandler({ pendings: routePendings })
@@ -161,7 +162,8 @@ check('the route refuses POST', response.statusCode === 405, String(response.sta
   const rememberPendings = store.createPendingStore()
   rememberPendings.remember('s1', 'c1', {
     command: 'git reset --hard', cwd: CWD, decision: 'prompt', reason: 'discards changes', risk: 'destructive',
-    analyzable: true, label: 'git reset', suggestion: { decision: 'allow', executable: 'git', argvPrefix: ['reset'] }, triggers: [],
+    analyzable: true, label: 'git reset', labels: ['git reset'],
+    suggestions: [{ decision: 'allow', executable: 'git', argvPrefix: ['reset'] }], triggers: [],
   })
   const rememberHandler = host.createRememberHandler({ pendings: rememberPendings, config: { ...config, rulesFile: rememberFile }, logger })
   let res = fakeResponse()
@@ -184,7 +186,7 @@ check('the route refuses POST', response.statusCode === 405, String(response.sta
   const forbiddenPendings = store.createPendingStore()
   forbiddenPendings.remember('s1', 'c9', {
     command: 'rm -rf /', cwd: CWD, decision: 'forbidden', reason: 'filesystem root', risk: 'catastrophic',
-    analyzable: true, label: null, suggestion: null, triggers: [],
+    analyzable: true, label: null, labels: [], suggestions: [], triggers: [],
   })
   res = fakeResponse()
   await host.createRememberHandler({ pendings: forbiddenPendings, config, logger })(fakeRequest({
@@ -193,6 +195,56 @@ check('the route refuses POST', response.statusCode === 405, String(response.sta
     body: JSON.stringify({ sessionId: 's1', callId: 'c9' }),
   }), res)
   check('a forbidden command can never be remembered', res.statusCode === 409, String(res.statusCode))
+}
+
+console.log('escalation listener')
+{
+  const escalationFile = join(root, 'escalation.json')
+  const escalationPendings = store.createPendingStore()
+  const listenerConfig = { ...config, rulesFile: escalationFile, auditFile: join(root, 'escalation.ndjson') }
+  const listener = host.createApprovalListener({ config: listenerConfig, home: HOME, pendings: escalationPendings, logger })
+  const delegate = () => Promise.resolve('delegated')
+  const call = (command, callId) => ({
+    callId,
+    agent: {
+      session: {
+        id: 's1',
+        header: { cwd: CWD },
+        seq: 1,
+        eventAt: () => ({ type: 'tool/call', data: { callId, name: 'bash', arguments: JSON.stringify({ command }) } }),
+      },
+    },
+  })
+
+  let outcome = await listener(call('cp /a /b && echo copied', 'c1'), delegate)
+  check('an uncovered escalation reaches the card', outcome === 'delegated', outcome)
+  check('and the card is offered a rule per command', escalationPendings.get('s1', 'c1')?.labels?.join(' + ') === 'cp + echo', JSON.stringify(escalationPendings.get('s1', 'c1')?.labels))
+
+  store.addRule(escalationFile, { decision: 'allow', executable: 'cp', argvPrefix: [] })
+  store.addRule(escalationFile, { decision: 'allow', executable: 'echo', argvPrefix: [] })
+  outcome = await listener(call('cp /a /b && echo copied', 'c2'), delegate)
+  check('a fully remembered escalation is approved without a card', outcome === 'allowed-once', outcome)
+
+  const manualPendings = store.createPendingStore()
+  const manualListener = host.createApprovalListener({
+    config: { ...listenerConfig, autoApproveEscalations: false },
+    home: HOME,
+    pendings: manualPendings,
+    logger,
+  })
+  outcome = await manualListener(call('cp /a /b && echo copied', 'c5'), delegate)
+  check('the escalation can be kept manual by configuration', outcome === 'delegated', outcome)
+
+  store.addRule(escalationFile, { decision: 'allow', executable: 'rm', argvPrefix: [] })
+  outcome = await listener(call('rm -rf /', 'c3'), delegate)
+  check('a catastrophic escalation is rejected outright', outcome === 'rejected', outcome)
+
+  const inlinePendings = store.createPendingStore()
+  const inlineListener = host.createApprovalListener({ config: listenerConfig, home: HOME, pendings: inlinePendings, logger })
+  store.addRule(escalationFile, { decision: 'allow', executable: 'node', argvPrefix: [] })
+  outcome = await inlineListener(call('node -e "x"', 'c4'), delegate)
+  check('an inline-code escalation is never auto-approved', outcome === 'delegated', outcome)
+  check('and it offers no rule', (inlinePendings.get('s1', 'c4')?.labels ?? []).length === 0, JSON.stringify(inlinePendings.get('s1', 'c4')?.labels))
 }
 
 console.log('/allow command')

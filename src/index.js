@@ -105,7 +105,8 @@ function remember(pendings, exec, decision, command, cwd) {
     risk: decision.risk,
     analyzable: decision.analyzable,
     label: decision.suggestion === null ? null : describeRule(decision.suggestion),
-    suggestion: decision.suggestion,
+    labels: decision.suggestions.map(describeRule),
+    suggestions: decision.suggestions,
     triggers: decision.triggers.map(trigger => trigger.command),
   })
   return true
@@ -116,13 +117,13 @@ function remember(pendings, exec, decision, command, cwd) {
  * @param options - configuration, home, the call, command, and cwd.
  * @returns the engine's decision.
  */
-export function decide({ config, home, exec, command, cwd }) {
+export function decide({ config, home, exec, command, cwd, silent = false }) {
   const rules = readRules(config.rulesFile)
   const decision = evaluateCommandLine({ command, cwd, home, rules, defaultDecision: config.defaultDecision })
   for (const rule of decision.matchedRules) {
     if (rule.decision === 'allow') countHit(config.rulesFile, rule.id)
   }
-  if (config.audit) {
+  if (config.audit && !silent) {
     appendAudit(config.auditFile, {
       tool: exec?.name ?? 'unknown',
       cwd,
@@ -172,22 +173,30 @@ export function createGate({ config, home, logger, pendings }) {
  * @param options - configuration, home, and the pending store.
  * @returns the waterfall listener.
  */
-export function createApprovalListener({ config, home, pendings }) {
+export function createApprovalListener({ config, home, pendings, logger }) {
   return async (request, next) => {
     const sessionId = request?.agent?.session?.id
     const callId = request?.callId
-    if (typeof callId === 'string' && pendings.get(sessionId, callId) === null) {
-      const args = toolCallArguments(request?.agent?.session, callId)
-      const command = typeof args?.command === 'string' && args.command.trim() !== '' ? args.command : null
-      if (command !== null) {
-        const sessionCwd = request?.agent?.session?.header?.cwd
-        const cwd = typeof args?.workdir === 'string' && args.workdir !== ''
-          ? args.workdir
-          : (typeof sessionCwd === 'string' && sessionCwd !== '' ? sessionCwd : process.cwd())
-        const decision = decide({ config, home, exec: { name: 'bash', callId }, command, cwd })
-        remember(pendings, { callId, agent: request.agent }, decision, command, cwd)
-      }
+    if (typeof callId !== 'string') return next()
+    // The gate already recorded its own prompt for this call.
+    if (pendings.get(sessionId, callId) !== null) return next()
+    const args = toolCallArguments(request?.agent?.session, callId)
+    const command = typeof args?.command === 'string' && args.command.trim() !== '' ? args.command : null
+    if (command === null) return next()
+    const sessionCwd = request?.agent?.session?.header?.cwd
+    const cwd = typeof args?.workdir === 'string' && args.workdir !== ''
+      ? args.workdir
+      : (typeof sessionCwd === 'string' && sessionCwd !== '' ? sessionCwd : process.cwd())
+    const decision = decide({ config, home, exec: { name: 'bash', callId }, command, cwd, silent: true })
+    if (decision.decision === 'forbidden') {
+      logger.warn(`dsh-allow: rejected the escalation for ${JSON.stringify(command.slice(0, 80))} — ${decision.reason}`)
+      return 'rejected'
     }
+    if (decision.covered && config.autoApproveEscalations !== false) {
+      logger.info(`dsh-allow: approved the escalation for ${JSON.stringify(command.slice(0, 80))} — every command in it is remembered`)
+      return 'allowed-once'
+    }
+    remember(pendings, { callId, agent: request.agent }, decision, command, cwd)
     return next()
   }
 }
@@ -279,8 +288,9 @@ export function createPendingHandler({ pendings }) {
     }
     sendJson(res, 200, {
       ok: true,
-      rememberable: record.suggestion !== null && record.decision !== 'forbidden',
+      rememberable: (record.suggestions ?? []).length > 0 && record.decision !== 'forbidden',
       label: record.label,
+      labels: record.labels ?? [],
       command: record.command,
       cwd: record.cwd,
       reason: record.reason,
@@ -314,16 +324,19 @@ export function createRememberHandler({ pendings, config, logger }) {
         sendJson(res, 404, { ok: false, error: 'this approval is no longer pending' })
         return
       }
-      if (record.suggestion === null || record.decision === 'forbidden') {
+      const suggestions = record.suggestions ?? []
+      if (suggestions.length === 0 || record.decision === 'forbidden') {
         sendJson(res, 409, { ok: false, error: 'this command cannot be remembered' })
         return
       }
-      const stored = addRule(config.rulesFile, record.suggestion)
-      logger.info(`dsh-allow: remembered "${describeRule(stored)}" as rule ${stored.id}`)
+      const stored = suggestions.map(suggestion => addRule(config.rulesFile, suggestion))
+      const labels = stored.map(describeRule)
+      logger.info(`dsh-allow: remembered ${labels.map(label => `"${label}"`).join(', ')}`)
       sendJson(res, 200, {
         ok: true,
-        label: describeRule(stored),
-        rule: { decision: stored.decision, executable: stored.executable, argvPrefix: stored.argvPrefix },
+        label: labels.join(' + '),
+        labels,
+        rules: stored.map(rule => ({ decision: rule.decision, executable: rule.executable, argvPrefix: rule.argvPrefix })),
       })
     }
     catch (error) {
@@ -390,7 +403,7 @@ export function apply(ctx, pluginConfig) {
   // Ahead of every other pre-execute listener: a forbidden command must be
   // denied before any other policy can allow it.
   ctx.on('tools/pre-execute', (exec, next) => gate(exec, next), { prepend: true })
-  const approvalListener = createApprovalListener({ config, home, pendings })
+  const approvalListener = createApprovalListener({ config, home, pendings, logger: ctx.logger })
   ctx.on('approval/request', (request, next) => approvalListener(request, next), { prepend: true })
   const pendingHandler = createPendingHandler({ pendings })
   const rememberHandler = createRememberHandler({ pendings, config, logger: ctx.logger })

@@ -153,6 +153,18 @@ check('node -e is not covered by a node rule', evaluate('node -e "x"', interpret
 check('node script.js is covered', evaluate('node script.js', interpreterRules).decision === 'allow')
 check('shell -c is not covered by a shell rule', evaluate("bash -c 'rm -rf /'", [allowRule('bash')]).decision === 'forbidden')
 
+console.log('whole-line coverage and suggestions')
+const lineRules = [allowRule('cp'), allowRule('echo')]
+let line = evaluate('cp /a /b && echo copied', [])
+check('an uncovered line still suggests a rule per command', line.suggestions.map(policy.describeRule).join(' + ') === 'cp + echo', JSON.stringify(line.suggestions))
+check('and reports itself uncovered', line.covered === false)
+line = evaluate('cp /a /b && echo copied', lineRules)
+check('the same line is covered once both rules exist', line.covered === true)
+line = evaluate('cp /a /b && rm -rf /', lineRules)
+check('one dangerous member defeats coverage', line.covered === false && line.decision === 'forbidden')
+check('and a forbidden line suggests nothing', line.suggestions.length === 0)
+check('an unparsable line is never covered', evaluate('echo $(x)', lineRules).covered === false)
+
 console.log('path normalization')
 check('~ resolves against home', policy.normalizePath('~/.ssh/id_rsa', CWD, HOME) === `${HOME}/.ssh/id_rsa`)
 check('.. collapses', policy.normalizePath('/tmp/..', CWD, HOME) === '/')

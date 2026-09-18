@@ -331,11 +331,16 @@ export function evaluateCommandLine(request) {
       triggers: [],
       commands: [],
       suggestion: null,
+      suggestions: [],
+      covered: false,
       analyzable: false,
     }
   }
   const triggers = []
   const matchedRules = []
+  const suggestions = []
+  let suggestionBlocked = false
+  let covered = true
   let decision = 'allow'
   let reason = 'no policy rule applies'
   const consider = (candidate, why, rule = null) => {
@@ -355,6 +360,20 @@ export function evaluateCommandLine(request) {
     // once must not make `node -e '…'` allowed forever.
     const unrememberable = builtin !== null && UNREMEMBERABLE_RISKS.has(builtin.risk)
     const allowed = !unrememberable && matched.some(rule => rule.decision === 'allow')
+    if (forbidden || unrememberable) {
+      suggestionBlocked = true
+      covered = false
+    }
+    else if (!allowed) {
+      covered = false
+    }
+    if (!forbidden && !unrememberable) {
+      const candidate = suggestRule(simple)
+      if (!suggestions.some(rule => rule.executable === candidate.executable
+        && rule.argvPrefix.join('\u0000') === candidate.argvPrefix.join('\u0000'))) {
+        suggestions.push(candidate)
+      }
+    }
     if (forbidden) {
       const source = builtin?.decision === 'forbidden' ? builtin : matched.find(rule => rule.decision === 'forbidden')
       consider('forbidden', source.reason ?? `forbidden by rule ${source.id ?? ''}`.trim(), source.id === undefined ? null : source)
@@ -368,14 +387,12 @@ export function evaluateCommandLine(request) {
     if (builtin !== null || matched.some(rule => rule.decision === 'prompt')) {
       const prompt = builtin ?? matched.find(rule => rule.decision === 'prompt')
       consider('prompt', prompt.reason ?? 'matched a prompt rule', prompt.id === undefined ? null : prompt)
-      if (suggestion === null && !unrememberable) suggestion = suggestRule(simple)
       continue
     }
     // Unremarkable: the sandbox remains the enforcement layer for this command.
     consider(defaultDecision === 'allow' ? 'allow' : defaultDecision, 'deferred to the sandbox', null)
-    if (suggestion === null) suggestion = suggestRule(simple)
   }
-  if (decision !== 'prompt') suggestion = null
+  const rememberable = !suggestionBlocked && suggestions.length > 0
   return {
     decision,
     reason,
@@ -383,7 +400,9 @@ export function evaluateCommandLine(request) {
     matchedRules,
     triggers,
     commands: parsed.commands.map(simple => simple.argv),
-    suggestion,
+    suggestion: rememberable ? (suggestions[0] ?? null) : null,
+    suggestions: rememberable ? suggestions : [],
+    covered,
     analyzable: true,
   }
 }

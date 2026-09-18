@@ -39,7 +39,8 @@ process execution
 ## Decisions
 
 - **allow** — no policy rule objects; execution continues to the sandbox, which stays the fence for filesystem writes. A stored `allow` rule also lands here.
-- **prompt** — the approval card asks. `Allow once` answers only the current call and writes nothing; `Always allow` stores the suggested rule; `Deny` refuses the call.
+- **prompt** — the approval card asks. `Allow once` answers only the current call and writes nothing; `Always allow` stores the suggested rule (one per command in the line, e.g. `cp` + `echo`); `Deny` refuses the call.
+- **remembered** — a command line whose every member matches an allow rule also answers the sandbox's escalation question silently, so a command you allowed once stops asking for good. Set `autoApproveEscalations: false` to keep every widening manual.
 - **forbidden** — denied outright with a reason. No approval is requested and no escalation is possible, because the denied operation is destructive regardless of who approves it.
 
 ## How a command is analysed
@@ -109,6 +110,7 @@ Every decision appends one NDJSON line to `$DSH_HOME/dsh-allow-audit.ndjson`: ti
     auditFile: /path/to/audit.ndjson
     audit: true
     defaultDecision: allow      # or prompt: gate every command
+    autoApproveEscalations: true # false: a remembered command still asks before widening the sandbox
 ```
 
 ## Test

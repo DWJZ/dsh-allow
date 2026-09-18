@@ -51,7 +51,8 @@ window.__ModuleLoader__.load({
 			waiting: "等待审批",
 			reject: "拒绝",
 			allowOnce: "允许一次",
-			always: "总是允许「{prefix}」开头的命令",
+			alwaysOne: "总是允许「{rule}」开头的命令",
+			alwaysMany: "总是允许 {rules} 这类命令",
 			remembering: "正在记住…",
 			rememberFailed: "没记住:{message}",
 			cannotRemember: "这条命令不会被记住:{reason}",
@@ -64,7 +65,8 @@ window.__ModuleLoader__.load({
 			waiting: "Waiting for approval",
 			reject: "Reject",
 			allowOnce: "Allow once",
-			always: "Always allow commands starting with \u201c{prefix}\u201d",
+			alwaysOne: "Always allow commands starting with \u201c{rule}\u201d",
+			alwaysMany: "Always allow commands like {rules}",
 			remembering: "Remembering…",
 			rememberFailed: "Not remembered: {message}",
 			cannotRemember: "This command cannot be remembered: {reason}",
@@ -96,8 +98,9 @@ window.__ModuleLoader__.load({
 		 * @param prefix - 宿主推导出的命令前缀。
 		 * @returns 按钮文字。
 		 */
-		function alwaysLabel(t, prefix) {
-			return t("always", { prefix: prefix });
+		function alwaysLabel(t, labels) {
+			if (labels.length === 1) return t("alwaysOne", { rule: labels[0] });
+			return t("alwaysMany", { rules: labels.join(" + ") });
 		}
 
 		/** 读取这次提权的命令与前缀;失败返回 null(卡片退化成内置的两按钮)。 */
@@ -174,14 +177,15 @@ window.__ModuleLoader__.load({
 					onClick: () => { answer("rejected"); }
 				}, t("reject"))
 			];
-			if (info !== null && info.rememberable === true && typeof info.label === "string" && info.label !== "") {
+			const labels = info === null || !Array.isArray(info.labels) ? [] : info.labels;
+			if (info !== null && info.rememberable === true && labels.length > 0) {
 				buttons.push(React.createElement(primitives.Button, {
 					key: "always",
 					variant: "outline",
 					disabled: disabled,
 					title: info.command,
 					onClick: rememberThenAllow
-				}, busy ? t("remembering") : alwaysLabel(t, info.label)));
+				}, busy ? t("remembering") : alwaysLabel(t, labels)));
 			}
 			buttons.push(React.createElement(primitives.Button, {
 				key: "once",

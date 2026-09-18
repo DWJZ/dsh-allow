@@ -62,7 +62,8 @@ check('a non-approval interaction is ignored', client.escalationOf({ kind: 'ques
 check('an absent interaction is ignored', client.escalationOf(undefined) === null)
 
 console.log('always label')
-check('the label names the prefix', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, 'gh repo view') === 'always:{"prefix":"gh repo view"}')
+check('one rule names itself', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, ['gh repo view']) === 'alwaysOne:{"rule":"gh repo view"}')
+check('several rules are listed', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, ['cp', 'echo']) === 'alwaysMany:{"rules":"cp + echo"}')
 
 console.log('apply')
 let registration = null
@@ -87,7 +88,7 @@ if (found === null) {
   check('the card renders the approval chrome', html.includes('dsha_card') && html.includes('dsha_strip'), html.slice(0, 200))
   check('the card renders 拒绝 and 允许一次', html.includes('reject') && html.includes('allowOnce'), html)
   check('the card shows the reason', html.includes('escalate sandbox to danger-full-access'), html)
-  check('without the pending lookup the third button is absent', !html.includes('always'), html)
+  check('without the pending lookup the third button is absent', !html.includes('alwaysOne') && !html.includes('alwaysMany'), html)
 }
 
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)
