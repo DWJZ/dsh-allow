@@ -4,7 +4,7 @@
  *
  * Usage: `node test/smoke.mjs`.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -47,7 +47,7 @@ const ctx = { get: name => (name === 'sandboxPolicy' ? { resolve: () => ({ mode:
 const pendings = store.createPendingStore()
 const grants = store.createGrantStore()
 const engine = host.createEngine({ config, home: HOME, grants, pendings, ctx })
-const gate = host.createGate({ engine, pendings, logger })
+const gate = host.createGate({ engine, pendings, logger, config })
 const approval = host.createApprovalListener({ engine, pendings, logger })
 
 let nextCalls = 0
@@ -187,15 +187,32 @@ check('a second path is pending', pendings.get('s1', 'c2') !== null)
 const rulesBefore = store.readRules(rulesFile).length
 answer = await call(onceHandler, post('/dsh-allow/once', { sessionId: 's1', callId: 'c2' }))
 check('the once route grants it', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
-check('as a session rule, not a stored one', grants.rulesFor('s1').length > 0
-  && grants.rulesFor('s1')[0].source === 'session'
-  && store.readRules(rulesFile).length === rulesBefore, JSON.stringify(grants.rulesFor('s1')))
+check('as a one-shot rule, not a stored one', grants.rulesFor('s1', 'c2').length > 0
+  && grants.rulesFor('s1', 'c2')[0].source === 'session'
+  && store.readRules(rulesFile).length === rulesBefore, JSON.stringify(grants.rulesFor('s1', 'c2')))
+decision = await gate(exec('rm -rf unopened', { callId: 'c2' }), next)
+check('and that call can run it', decision.kind === 'allow', JSON.stringify(decision))
 decision = await gate(exec('rm -rf unopened', { callId: 'c3' }), next)
-check('and the session can run it', decision.kind === 'allow', JSON.stringify(decision))
+check('but the next call asks again', decision.kind === 'ask', JSON.stringify(decision))
 decision = await gate(exec('rm -rf unopened', { callId: 'c4', agent: { session: otherSession } }), next)
-check('while another session still asks', decision.kind === 'ask', JSON.stringify(decision))
+check('and another session always asks', decision.kind === 'ask', JSON.stringify(decision))
 decision = await gate(exec('rm -rf build', { callId: 'c5', agent: { session: otherSession } }), next)
 check('the stored rule holds for every session', decision.kind === 'allow', JSON.stringify(decision))
+
+console.log('a one-shot grant is spent by the call it was given to')
+const settle = host.createSettleListener({ grants, logger })
+check('the one-shot is still live for its call', grants.rulesForSession('s1').length === 1)
+await settle(exec('rm -rf unopened', { callId: 'c2' }), { kind: 'accepted' }, next)
+check('settling that call releases it', grants.rulesForSession('s1').length === 0
+  && grants.rulesFor('s1', 'c2').length === 0)
+await settle(exec('rm -rf unopened', { callId: 'c9' }), { kind: 'accepted' }, next)
+check('an unrelated call releases nothing', grants.rulesForSession('s1').length === 0)
+const onceStore = store.createGrantStore()
+onceStore.grant('s1', 'k1', [{ path: `${WORKSPACE}/gone`, recursive: false, access: { delete: true } }])
+check('a grant belongs to its call', onceStore.rulesFor('s1', 'k1').length === 1 && onceStore.rulesFor('s1', 'k2').length === 0)
+check('other sessions never see it', onceStore.rulesForSession('s2').length === 0)
+check('the session view carries it for the profile', onceStore.rulesForSession('s1').length === 1)
+check('and consuming the call drops it', onceStore.consume('s1', 'k1') === 1 && onceStore.rulesForSession('s1').length === 0)
 
 console.log('audit')
 const audit = readFileSync(auditFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
@@ -231,7 +248,9 @@ const escalation = (command, callId, id = 's3') => ({
   callId,
 })
 let outcome = await approval(escalation('rm -rf build', 'e1'), next)
-check('an escalation for a granted command is approved', outcome === 'allowed-once', String(outcome))
+check('an escalation is never approved automatically, even for a granted command',
+  outcome?.kind === 'allow', JSON.stringify(outcome))
+check('and it is on the card', pendings.get('s3', 'e1') !== null)
 outcome = await approval(escalation('rm -rf /System/Library/x', 'e2'), next)
 check('an escalation for a protected path is rejected', outcome === 'rejected', String(outcome))
 outcome = await approval(escalation('rm -rf unopened', 'e3'), next)
@@ -240,11 +259,41 @@ check('and has a pending record of its own', pendings.get('s3', 'e3') !== null)
 outcome = await approval(escalation('rm -rf unopened', 'e4', 's4'), next)
 check('a session grant belongs to one session only', outcome?.kind === 'allow', JSON.stringify(outcome))
 
+console.log('a checked-in workspace rule grants nothing')
+{
+  const repo = join(root, 'repo')
+  mkdirSync(repo, { recursive: true })
+  writeFileSync(join(repo, '.dsh-allow.json'), `${JSON.stringify({
+    version: 3,
+    rules: [{ path: `${HOME}/.ssh`, recursive: true, access: { read: true, write: true, delete: true } }],
+  })}\n`)
+  const repoCtx = {
+    get: name => (name === 'sandboxPolicy' ? { resolve: () => ({ mode: 'workspace-write', workspaceRoot: repo }) } : undefined),
+  }
+  const repoGate = host.createGate({
+    engine: host.createEngine({ config, home: HOME, grants: store.createGrantStore(), pendings: store.createPendingStore(), ctx: repoCtx }),
+    pendings: store.createPendingStore(),
+    logger,
+    config,
+  })
+  const repoDecision = await repoGate(exec('cat /Users/tester/.ssh/id_rsa', { callId: 'r1' }), next)
+  check('reading a host secret still asks', repoDecision.kind === 'ask', JSON.stringify(repoDecision))
+  const repoWrite = await repoGate(exec('echo x >> /Users/tester/.ssh/authorized_keys', { callId: 'r2' }), next)
+  check('and writing one does too', repoWrite.kind === 'ask', JSON.stringify(repoWrite))
+}
+
 console.log('/allow')
-const allow = input => host.runAllowCommand({ file: rulesFile, workspaceRoot: WORKSPACE, mode: 'workspace-write' }, input)
+const allow = input => host.runAllowCommand({
+  file: rulesFile,
+  workspaceRoot: WORKSPACE,
+  mode: 'workspace-write',
+  enforcement: { state: 'partial', reason: 'write, create and delete are fenced; read and execute are not', capabilities: { read: false, write: true, create: true, delete: true, execute: false } },
+}, input)
 check('list names the stored rule', allow('').text.includes('delete') && allow('').text.includes(`${WORKSPACE}/build`), allow('').text)
-check('status explains the defaults and the OS coverage',
-  allow('status').text.includes('沙箱模式') && allow('status').text.includes('file-write-unlink'), allow('status').text)
+check('status reports what the kernel fences',
+  allow('status').text.includes('进程沙箱：partial')
+  && allow('status').text.includes('delete=内核强制')
+  && allow('status').text.includes('read=仅命令层'), allow('status').text)
 check('add writes a rule', allow('add delete,write other folder').kind === 'success'
   && store.readRules(rulesFile).some(rule => rule.path === `${WORKSPACE}/other` && rule.access.write === true))
 check('add can pin one exact file', allow('add read notes.txt file').kind === 'success'
@@ -255,13 +304,13 @@ check('remove drops one', allow('remove 1').kind === 'success')
 check('clear empties the file', allow('clear').kind === 'success' && store.readRules(rulesFile).length === 0)
 check('an unknown verb is an error', allow('nonsense').kind === 'error')
 
-console.log('session grants expire')
+console.log('one-shot grants expire')
 const clock = { now: 1000 }
 const expiring = store.createGrantStore({ ttlMs: 100, now: () => clock.now })
-expiring.grant('s1', [{ path: `${WORKSPACE}/gone`, recursive: false, access: { delete: true } }])
-check('a grant is readable', expiring.rulesFor('s1').length === 1)
+expiring.grant('s1', 'c1', [{ path: `${WORKSPACE}/gone`, recursive: false, access: { delete: true } }])
+check('a grant is readable', expiring.rulesFor('s1', 'c1').length === 1)
 clock.now += 500
-check('and expires', expiring.rulesFor('s1').length === 0)
+check('and expires even if the call never settles', expiring.rulesFor('s1', 'c1').length === 0)
 
 console.log('config')
 check('grants are accepted from configuration',
@@ -274,13 +323,21 @@ check('an invalid ttl is refused',
   (() => { try { store.resolveConfig({ sessionGrantTtlMs: 0 }, root); return false } catch { return true } })())
 check('configured paths are canonical',
   fspolicy.pathWithin(WORKSPACE, store.resolveConfig({ grants: [{ path: `${WORKSPACE}/a/../b`, access: { read: true } }] }, root).grants[0].path))
+check('the permission store is protected by default',
+  store.resolveConfig({}, root).protectedFiles.some(file => file.endsWith('/dsh-allow.json'))
+  && store.resolveConfig({}, root).protectedFiles.some(file => file.endsWith('/dsh-allow-audit.ndjson')))
+check('a configured rules file is protected where it points',
+  store.resolveConfig({ rulesFile: join(root, 'other.json') }, root).protectedFiles.includes(fspolicy.canonicalPath(join(root, 'other.json'), { cwd: '/', home: root })))
+check('an unknown enforcement level is refused',
+  (() => { try { store.resolveConfig({ enforce: 'maybe' }, root); return false } catch { return true } })())
 
 console.log('apply')
-const registered = { listeners: [], commands: [], routes: [] }
+const registered = { listeners: [], commands: [], routes: [], effects: [] }
 const pluginCtx = {
   logger,
   on: (name, listener, options) => { registered.listeners.push({ name, options }) },
   get: () => undefined,
+  effect: (create) => { registered.effects.push(create()); return () => {} },
   inject: (names, factory) => {
     if (names.includes('webServer')) {
       factory({ effect: create => create(), webServer: { register: route => { registered.routes.push(route); return () => {} } } })
@@ -290,13 +347,15 @@ const pluginCtx = {
   },
 }
 host.apply(pluginCtx, { rulesFile, auditFile })
-check('both listeners are prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
+check('every listener is prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
 check('the gate listens on tools/pre-execute', registered.listeners.some(entry => entry.name === 'tools/pre-execute'))
 check('the card listens on approval/request', registered.listeners.some(entry => entry.name === 'approval/request'))
+check('the one-shot grants settle on tools/post-execute', registered.listeners.some(entry => entry.name === 'tools/post-execute'))
 check('all three routes are registered',
   registered.routes.map(route => route.path).join(',') === '/dsh-allow/pending,/dsh-allow/remember,/dsh-allow/once',
   JSON.stringify(registered.routes.map(route => route.path)))
 check('/allow is registered', registered.commands[0]?.name === 'allow')
+check('the process fence is installed as an effect', registered.effects.length >= 1)
 check('a bad config fails loud', (() => {
   try {
     host.apply(pluginCtx, { sessionGrantTtlMs: -1 })
@@ -306,6 +365,16 @@ check('a bad config fails loud', (() => {
     return true
   }
 })())
+
+console.log('non-shell file tools')
+check('a write of the permission store is refused',
+  (await gate({ name: 'write', callId: 'w1', arguments: { path: join(root, 'dsh-allow.json'), content: '{}' }, agent: { session } }, next)).kind === 'deny')
+check('an edit of the audit log is refused',
+  (await gate({ name: 'edit', callId: 'w2', arguments: { file_path: join(root, 'dsh-allow-audit.ndjson') }, agent: { session } }, next)).kind === 'deny')
+check('an ordinary file write is left to the harness fence',
+  (await gate({ name: 'write', callId: 'w3', arguments: { path: join(WORKSPACE, 'notes.md'), content: 'x' }, agent: { session } }, next)).kind === 'allow')
+check('an unknown tool is untouched',
+  (await gate({ name: 'present', callId: 'w4', arguments: {}, agent: { session } }, next)).kind === 'allow')
 
 rmSync(root, { recursive: true, force: true })
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)

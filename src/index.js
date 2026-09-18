@@ -17,11 +17,12 @@
  * capability for this session only. Nothing here is remembered as command text.
  */
 import { homedir } from 'node:os'
-import { canonicalPath, describeRule } from './fspolicy.js'
+import { canonicalPath, describeRule, protectedRefusal } from './fspolicy.js'
 import { evaluateCommandLine } from './decide.js'
+import { createEnforcer } from './enforce.js'
 import {
   addRule, appendAudit, clearRules, countHit, createGrantStore, createPendingStore, readRules,
-  readWorkspaceRules, removeRule, resolveConfig, resolveHome,
+  removeRule, resolveConfig, resolveHome,
 } from './store.js'
 
 /** Stable Cordis plugin name. */
@@ -96,7 +97,7 @@ export function toolCallArguments(session, callId) {
  *   store, and the Cordis context (used to read `sandboxPolicy`).
  * @returns the engine.
  */
-export function createEngine({ config, home, grants, pendings, ctx = null }) {
+export function createEngine({ config, home, grants, pendings, ctx = null, enforcement = null }) {
   /**
    * The session's sandbox policy, or null when nothing publishes one. A missing
    * policy means nothing enforces the process, so the engine fails closed.
@@ -113,6 +114,9 @@ export function createEngine({ config, home, grants, pendings, ctx = null }) {
     }
   }
 
+  /** What the kernel currently fences, for the opaque-code branch. */
+  const fenceState = () => (enforcement === null ? null : enforcement.status())
+
   /**
    * Judge one command line and record the outcome.
    * @param request - the call, the command, its cwd, and whether to stay silent.
@@ -123,7 +127,6 @@ export function createEngine({ config, home, grants, pendings, ctx = null }) {
     const workspaceRoot = policy?.workspaceRoot
       ?? (typeof exec?.agent?.session?.header?.cwd === 'string' ? exec.agent.session.header.cwd : cwd)
     const rules = readRules(config.rulesFile)
-    const workspaceRules = readWorkspaceRules(workspaceRoot)
     const sessionId = exec?.agent?.session?.id
     const decision = evaluateCommandLine({
       command,
@@ -133,8 +136,9 @@ export function createEngine({ config, home, grants, pendings, ctx = null }) {
       harnessHome: config.harnessHome,
       mode: policy?.mode ?? null,
       rules: [...config.grants, ...rules],
-      workspaceRules,
-      sessionRules: grants.rulesFor(sessionId),
+      protectedFiles: config.protectedFiles,
+      enforcement: fenceState(),
+      sessionRules: grants.rulesFor(sessionId, exec?.callId),
     })
     if (!silent) {
       for (const rule of decision.usedRules) {
@@ -191,15 +195,52 @@ function remember(pendings, exec, context, command, cwd) {
   return true
 }
 
+/** Tools whose call names one file to read or change. */
+const FILE_TOOLS = Object.freeze({
+  write: 'change',
+  edit: 'write',
+  str_replace_editor: 'write',
+})
+
+/**
+ * The file one non-shell tool call would change, or null.
+ * @param exec - the pending tool execution.
+ * @returns the absolute-ish path and the operation, or null.
+ */
+export function fileTargetOf(exec) {
+  const operation = FILE_TOOLS[exec?.name]
+  if (operation === undefined) return null
+  const args = exec?.arguments
+  if (args === null || typeof args !== 'object') return null
+  const path = typeof args.path === 'string' ? args.path : (typeof args.file_path === 'string' ? args.file_path : null)
+  return path === null || path === '' ? null : { operation, path }
+}
+
 /**
  * The `tools/pre-execute` gate.
- * @param options - the engine, the pending store, and the logger.
+ *
+ * Shell calls go through the whole filesystem policy. File tools only get the
+ * protection this policy owns outright — the permission store itself — because
+ * the harness's own fence already bounds where they may write; without this,
+ * the agent could rewrite its own rules with a file tool.
+ * @param options - the engine, the pending store, the configuration, and the logger.
  * @returns the waterfall listener.
  */
-export function createGate({ engine, pendings, logger }) {
+export function createGate({ engine, pendings, logger, config = null }) {
   return async (exec, next) => {
     const command = commandOf(exec)
-    if (command === null) return next()
+    if (command === null) {
+      const target = fileTargetOf(exec)
+      if (target === null) return next()
+      const path = canonicalPath(target.path, { cwd: cwdOf(exec), home: homedir() })
+      const refusal = protectedRefusal(path, target.operation === 'change' ? 'write' : target.operation, config?.protectedFiles ?? [])
+      if (refusal === null) return next()
+      logger.warn(`dsh-allow: denied a ${String(exec?.name)} of ${path} — ${refusal}`)
+      return {
+        kind: 'deny',
+        reason: `dsh-allow refused this call: ${refusal}. The permission store is not something the agent may change; ask the user to run /allow instead.`,
+      }
+    }
     const cwd = cwdOf(exec)
     const context = engine.decide({ exec, command, cwd })
     const { decision } = context
@@ -220,9 +261,27 @@ export function createGate({ engine, pendings, logger }) {
 }
 
 /**
+ * The settle listener: "allow once" is spent by the call it was given to.
+ * @param options - the session-grant store and the logger.
+ * @returns the waterfall listener.
+ */
+export function createSettleListener({ grants, logger }) {
+  return async (exec, result, next) => {
+    const dropped = grants.consume(exec?.agent?.session?.id, exec?.callId)
+    if (dropped > 0) logger.info(`dsh-allow: released ${String(dropped)} one-shot grant(s) after call ${String(exec?.callId)}`)
+    return next()
+  }
+}
+
+/**
  * The approval listener: an escalation that skipped the gate gets a pending
- * record of its own, and one whose capabilities are already granted is answered
- * without a card.
+ * record of its own and reaches the card.
+ *
+ * A `sandbox_permissions` escalation widens the process fence itself — an
+ * approval here is what lets a command run outside the mode the session is in,
+ * which is more than the filesystem policy it may also be asking about. It is
+ * therefore never answered here: a fully granted command runs without an
+ * escalation, and every escalation is a human decision.
  * @param options - the engine, the pending store, and the logger.
  * @returns the waterfall listener.
  */
@@ -247,10 +306,7 @@ export function createApprovalListener({ engine, pendings, logger }) {
       logger.warn(`dsh-allow: rejected the escalation for ${JSON.stringify(command.slice(0, 80))} — ${decision.reason}`)
       return 'rejected'
     }
-    if (decision.decision === 'allow') {
-      logger.info(`dsh-allow: approved the escalation for ${JSON.stringify(command.slice(0, 80))} — its capabilities are granted`)
-      return 'allowed-once'
-    }
+    logger.info(`dsh-allow: sending the escalation for ${JSON.stringify(command.slice(0, 80))} to the card — a wider process fence is not the policy's to grant`)
     remember(pendings, { callId, agent: request.agent }, context, command, cwd)
     return next()
   }
@@ -447,9 +503,9 @@ export function createOnceHandler({ pendings, grants, logger }) {
         return
       }
       const suggestions = record.suggestions ?? []
-      const granted = grants.grant(record.sessionId ?? body?.sessionId, suggestions)
+      const granted = grants.grant(record.sessionId ?? body?.sessionId, body?.callId, suggestions)
       pendings.forget(body?.sessionId, body?.callId)
-      logger.info(`dsh-allow: granted ${String(granted.length)} capability rule(s) for this session`)
+      logger.info(`dsh-allow: granted ${String(granted.length)} capability rule(s) to call ${String(body?.callId)}`)
       sendJson(res, 200, { ok: true, granted: granted.map(describeRule) })
     }
     catch (error) {
@@ -461,12 +517,10 @@ export function createOnceHandler({ pendings, grants, logger }) {
 /**
  * Render the stored rules.
  * @param file - rules-file path.
- * @param workspaceRoot - the session workspace, for its own rule file.
  * @returns the command's answer text.
  */
-export function renderRules(file, workspaceRoot) {
+export function renderRules(file) {
   const rules = readRules(file)
-  const workspace = readWorkspaceRules(workspaceRoot)
   const lines = []
   if (rules.length === 0) lines.push('还没有记住任何文件权限。审批卡片上选「总是允许…」就会写入一条。')
   else {
@@ -476,33 +530,36 @@ export function renderRules(file, workspaceRoot) {
       lines.push(`${String(index + 1)}. ${describeRule(rule)}${hits > 0 ? `（已用 ${String(hits)} 次）` : ''}`)
     }
   }
-  if (workspace.length > 0) {
-    lines.push(`工作区自带 ${String(workspace.length)} 条：`)
-    for (const rule of workspace) lines.push(`· ${describeRule(rule)}`)
-  }
-  lines.push('用 /allow remove <编号> 删除，/allow clear 清空，/allow status 看当前生效的默认权限。')
+  lines.push('用 /allow remove <编号> 删除，/allow clear 清空，/allow status 看强制层现状。')
   return lines.join('\n')
 }
 
 /**
- * Render what the policy grants by default and what the OS fence covers today.
- * @param options - the workspace root and the resolved sandbox mode.
+ * Render what the policy grants by default and what the kernel actually fences.
+ * @param options - the workspace root, the resolved sandbox mode, and the
+ *   enforcer's status.
  * @returns the command's answer text.
  */
-export function renderStatus({ workspaceRoot, mode }) {
+export function renderStatus({ workspaceRoot, mode, enforcement = null }) {
+  const status = enforcement ?? { state: 'off', reason: '未安装', capabilities: {} }
+  const capabilityLine = ['read', 'write', 'create', 'delete', 'execute']
+    .map(operation => `${operation}=${status.capabilities?.[operation] === true ? '内核强制' : '仅命令层'}`)
+    .join('  ')
   return [
     `沙箱模式：${mode ?? '未知（无 sandboxPolicy，遇到看不清效果的命令会直接询问）'}`,
     `工作区：${workspaceRoot ?? '未知'}`,
+    `进程沙箱：${status.state}（${status.reason}）`,
+    `能力：${capabilityLine}`,
     '',
     '默认权限（工作区）：read/write/create/execute 允许，delete 拒绝；临时目录全允许；',
-    '工作区外只允许系统路径的 read+execute（/bin /usr/bin /System /usr/lib 等）与 Homebrew 前缀的 read。',
+    '工作区外只允许系统路径的 read+execute（/bin /usr/bin /System /usr/lib 等）与 Homebrew 前缀的 read；',
+    'harness home（~/.dsh）只读，权限库与审计日志对任何规则都不可写。',
     '',
-    '执行层现状（诚实说明）：',
-    '· 插件在命令层拦下能看清的效果（例如 rm 的 delete），看效果要看命令行。',
-    '· OS 沙箱今天只保证「工作区外不可写」；工作区内 unlink 仍被允许，',
-    '  所以 python -c / node -e 这类看不清的命令不会因为「delete 未授权」被拦下。',
-    '· 把 delete 真正下沉到内核，需要给 DSH sandbox 的 Seatbelt profile 加一行',
-    '  (deny file-write-unlink (subpath …))，映射见 src/macos.js。',
+    '说明：',
+    '· 命令层闸门按命令行推导出的效果判定；内核强制是把同一套 FsPolicy 编译成 Seatbelt profile，',
+    '  因此 python -c、node -e、子进程都受同一份策略约束。',
+    '· state=full 表示五种能力都在内核层；partial 表示 write/create/delete 在内核层，read/execute 只在命令层；',
+    '  off 表示没有可用的 Seatbelt 后端（此时看不清效果的命令会直接询问，不会静默放行）。',
   ].join('\n')
 }
 
@@ -512,11 +569,11 @@ export function renderStatus({ workspaceRoot, mode }) {
  * @param rawInput - text after the command name.
  * @returns the command result.
  */
-export function runAllowCommand({ file, workspaceRoot, mode }, rawInput) {
+export function runAllowCommand({ file, workspaceRoot, mode, enforcement = null }, rawInput) {
   const input = rawInput.trim()
-  if (input === '' || input === 'list') return { kind: 'success', text: renderRules(file, workspaceRoot) }
+  if (input === '' || input === 'list') return { kind: 'success', text: renderRules(file) }
   const [verb, ...rest] = input.split(/\s+/u)
-  if (verb === 'status') return { kind: 'success', text: renderStatus({ workspaceRoot, mode }) }
+  if (verb === 'status') return { kind: 'success', text: renderStatus({ workspaceRoot, mode, enforcement }) }
   if (verb === 'clear') return { kind: 'success', text: `已清空 ${String(clearRules(file))} 条文件权限。` }
   if (verb === 'remove') {
     const removed = removeRule(file, Number(rest[0]))
@@ -559,16 +616,25 @@ export function runAllowCommand({ file, workspaceRoot, mode }, rawInput) {
 export function apply(ctx, pluginConfig) {
   const home = homedir()
   const harnessHome = resolveHome()
-  const config = { ...resolveConfig(pluginConfig, harnessHome), harnessHome }
+  const config = { ...resolveConfig(pluginConfig, harnessHome), harnessHome, home }
   const pendings = createPendingStore()
   const grants = createGrantStore({ ttlMs: config.sessionGrantTtlMs })
-  const engine = createEngine({ config, home, grants, pendings, ctx })
-  const gate = createGate({ engine, pendings, logger: ctx.logger })
+  // The process fence is refined before anything can be judged against it, so
+  // the first decision already knows what the kernel enforces.
+  const enforcement = createEnforcer({ config, grants, logger: ctx.logger })
+  ctx.effect(() => {
+    enforcement.install(ctx)
+    return () => { enforcement.uninstall() }
+  }, 'dsh-allow: process fence')
+  const engine = createEngine({ config, home, grants, pendings, ctx, enforcement })
+  const gate = createGate({ engine, pendings, logger: ctx.logger, config })
   // Ahead of every other pre-execute listener: a protected path must be refused
   // before any other policy can allow it.
   ctx.on('tools/pre-execute', (exec, next) => gate(exec, next), { prepend: true })
   const approvalListener = createApprovalListener({ engine, pendings, logger: ctx.logger })
   ctx.on('approval/request', (request, next) => approvalListener(request, next), { prepend: true })
+  const settleListener = createSettleListener({ grants, logger: ctx.logger })
+  ctx.on('tools/post-execute', (exec, result, next) => settleListener(exec, result, next), { prepend: true })
   const pendingHandler = createPendingHandler({ pendings })
   const rememberHandler = createRememberHandler({ pendings, config, logger: ctx.logger })
   const onceHandler = createOnceHandler({ pendings, grants, logger: ctx.logger })
@@ -598,6 +664,7 @@ export function apply(ctx, pluginConfig) {
         file: config.rulesFile,
         workspaceRoot: engine.policyOf({ agent: invocation.agent })?.workspaceRoot,
         mode: engine.policyOf({ agent: invocation.agent })?.mode,
+        enforcement: enforcement.status(),
       }, invocation.rawInput),
     }), 'dsh-allow: /allow command')
   })

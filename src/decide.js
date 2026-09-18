@@ -26,13 +26,15 @@ const ENFORCING_MODES = new Set(['read-only', 'workspace-write'])
 
 /**
  * Evaluate one complete command line.
- * @param request - the raw command, its directory, the rules, and the mode.
+ * @param request - the raw command, its directory, the rules, the sandbox mode,
+ *   the files the permission store owns, and what the kernel currently fences.
  * @returns the decision, the effects behind it, and what could be remembered.
  */
 export function evaluateCommandLine(request) {
   const {
     command, cwd = '/', home = '/', workspaceRoot, harnessHome,
-    mode = 'workspace-write', rules = [], workspaceRules = [], sessionRules = [], grants = [],
+    mode = 'workspace-write', rules = [], sessionRules = [], grants = [],
+    protectedFiles = [], enforcement = null,
   } = request
   const parsed = parseCommandLine(command, { home })
   if (!parsed.analyzable && parsed.syntaxError === true) {
@@ -47,10 +49,8 @@ export function evaluateCommandLine(request) {
       analyzable: false,
     }
   }
-  const known = rules.filter(isUsableRule)
   const allRules = [
-    ...known,
-    ...workspaceRules.filter(isUsableRule),
+    ...rules.filter(isUsableRule),
     ...grants.filter(isUsableRule),
     ...baselineRules({ workspaceRoot, harnessHome, home, mode }),
     ...sessionRules.filter(isUsableRule),
@@ -62,7 +62,7 @@ export function evaluateCommandLine(request) {
   const missing = []
   const usedRules = new Map()
   for (const effect of derived.effects) {
-    const refusal = protectedRefusal(effect.path, effect.operation)
+    const refusal = protectedRefusal(effect.path, effect.operation, protectedFiles)
     if (refusal !== null) {
       return {
         decision: 'forbidden',
@@ -101,15 +101,26 @@ export function evaluateCommandLine(request) {
     else blocked.push(entry)
   }
   // Only a wholly opaque program — inline code, an unreadable shell program —
-  // is left to the sandbox, which fences the process itself.
+  // is left to the sandbox, and only when that sandbox can actually be trusted
+  // for it: either the kernel fences all five capabilities, or this line's
+  // directory already grants all five, so there is nothing left to withhold.
   const opaque = derived.unknown.filter(entry => entry.operation === null)
-  const deferred = opaque.length > 0 && ENFORCING_MODES.has(mode)
+  const grantedHere = operation => resolveOperation({
+    path: workingDirectory, realPath: workingDirectory, operation, rules: allRules,
+  }).granted
+  const openHere = ['read', 'write', 'create', 'delete', 'execute'].every(grantedHere)
+  const fenced = enforcement === null
+    ? Object.fromEntries(['read', 'write', 'create', 'delete', 'execute'].map(operation => [operation, false]))
+    : enforcement.capabilities
+  const fencedEverywhere = ['read', 'write', 'create', 'delete', 'execute'].every(operation => fenced[operation] === true)
+  const opener = openHere ? 'this directory grants every capability' : 'the sandbox fences every capability'
+  const deferred = opaque.length > 0 && ENFORCING_MODES.has(mode) && (fencedEverywhere || openHere)
   if (missing.length === 0 && blocked.length === 0 && (opaque.length === 0 || deferred)) {
     return {
       decision: 'allow',
       reason: opaque.length === 0
         ? 'every filesystem capability this line needs is granted'
-        : 'the line\'s effects cannot be read from its text; the sandbox confines the process',
+        : `the line's effects cannot be read from its text, and ${opener}`,
       effects: derived.effects,
       missing: [],
       unknown: derived.unknown,
@@ -124,7 +135,7 @@ export function evaluateCommandLine(request) {
   const suggestions = suggestGrants(
     missing.length > 0 || blocked.length > 0
       ? [...missing, ...blocked.map(entry => ({ operation: entry.operation, path: undefined }))]
-      : opaque.map(entry => ({ operation: 'read' })),
+      : ['read', 'write', 'create', 'delete', 'execute'].map(operation => ({ operation })),
     { cwd },
   )
   const what = missing.length > 0
@@ -132,7 +143,9 @@ export function evaluateCommandLine(request) {
     : derived.unknown.map(entry => `${String(entry.operation ?? 'the line')}: ${entry.reason}`).join('; ')
   const why = missing.length > 0 || blocked.length > 0
     ? `filesystem permission required: ${what}`
-    : `the effects of this line cannot be determined (${what}) and no sandbox mode is enforcing them`
+    : fencedEverywhere
+      ? `the effects of this line cannot be determined (${what}) and no sandbox mode is enforcing them`
+      : `the effects of this line cannot be determined (${what}), and the sandbox cannot fence every capability: grant them for this directory to let opaque programs run`
   return {
     decision: 'prompt',
     reason: why,

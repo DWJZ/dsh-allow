@@ -40,7 +40,7 @@ export const DEFAULT_LEVEL = 4
 /** Rule sources accepted from disk and from the UI. */
 export const RULE_SOURCES = Object.freeze(['user', 'workspace', 'system', 'session'])
 
-/** How many leading components a `never`-protected path resists. */
+/** Platform paths whose write, create and delete no rule may grant. */
 const PROTECTED = Object.freeze([
   { path: '/System', operations: ['write', 'create', 'delete'] },
   { path: '/bin', operations: ['write', 'create', 'delete'] },
@@ -93,6 +93,21 @@ export function pathWithin(ancestor, target) {
 }
 
 /**
+ * Normalize one path lexically: `~` expanded, made absolute, `.`/`..`
+ * collapsed, and symlinks left alone.
+ * @param target - path text as written.
+ * @param options - the effective working directory and home directory.
+ * @returns the absolute spelling the caller used.
+ */
+export function normalizeSpelling(target, { cwd = '/', home = '/' } = {}) {
+  let text = String(target ?? '')
+  if (text === '~') text = home
+  else if (text.startsWith('~/')) text = `${home}/${text.slice(2)}`
+  if (!text.startsWith('/')) text = `${cwd}/${text}`
+  return normalize(text)
+}
+
+/**
  * Resolve one path the way the policy compares it: `~` expanded, relative to
  * `cwd`, `.`/`..` collapsed, and every existing ancestor replaced by its real
  * path so symlinks cannot spell one location two ways.
@@ -100,12 +115,8 @@ export function pathWithin(ancestor, target) {
  * @param options - the effective working directory and home directory.
  * @returns an absolute canonical path.
  */
-export function canonicalPath(target, { cwd = '/', home = '/' } = {}) {
-  let text = String(target ?? '')
-  if (text === '~') text = home
-  else if (text.startsWith('~/')) text = `${home}/${text.slice(2)}`
-  if (!text.startsWith('/')) text = `${cwd}/${text}`
-  const lexical = normalize(text)
+export function canonicalPath(target, options = {}) {
+  const lexical = normalizeSpelling(target, options)
   let head = lexical
   const tail = []
   for (;;) {
@@ -128,10 +139,16 @@ export function canonicalPath(target, { cwd = '/', home = '/' } = {}) {
  * Whether a platform rule refuses this operation for every writer.
  * @param path - canonical absolute path.
  * @param operation - the capability being asked for.
- * @returns the refusal reason, or null when the path is not platform-protected.
+ * @param protectedFiles - files no rule may make writable (the permission store itself).
+ * @returns the refusal reason, or null when the path is not protected.
  */
-export function protectedRefusal(path, operation) {
+export function protectedRefusal(path, operation, protectedFiles = []) {
   if (operation !== 'write' && operation !== 'create' && operation !== 'delete') return null
+  for (const file of protectedFiles) {
+    if (typeof file === 'string' && file !== '' && (path === file || path.startsWith(`${file}.`))) {
+      return 'it is the permission store, which nothing the agent runs may change'
+    }
+  }
   if (PROTECTED_EXCEPTIONS.some(exception => pathWithin(exception, path))) return null
   for (const entry of PROTECTED) {
     if (!entry.operations.includes(operation)) continue
@@ -147,6 +164,10 @@ export function protectedRefusal(path, operation) {
  */
 export function makeRule(fields) {
   const path = canonicalPath(fields.path, { cwd: '/', home: '/' })
+  // The spelling the user granted, kept only when it differs from the path the
+  // kernel resolves — a grant for `/opt/homebrew/bin/gh` has to authorize that
+  // name, not just the Cellar binary it points at.
+  const spelling = normalizeSpelling(fields.spelling ?? fields.path, { cwd: '/', home: '/' })
   const access = {}
   for (const operation of OPERATIONS) {
     if (fields.access?.[operation] === true) access[operation] = true
@@ -157,6 +178,7 @@ export function makeRule(fields) {
     recursive: fields.recursive !== false,
     access,
     source: RULE_SOURCES.includes(fields.source) ? fields.source : 'user',
+    ...(spelling !== path ? { spelling } : {}),
     ...(fields.baseline === true ? { baseline: true } : {}),
     ...(fields.note === undefined ? {} : { note: fields.note }),
   }
@@ -173,13 +195,23 @@ export function levelOf(rule) {
 }
 
 /**
+ * The paths one rule speaks about: the resolved path, plus the spelling the
+ * user granted when the two differ.
+ * @param rule - the rule.
+ * @returns every path the rule covers.
+ */
+export function rulePaths(rule) {
+  return rule.spelling === undefined ? [rule.path] : [rule.path, rule.spelling]
+}
+
+/**
  * Whether one rule speaks about one canonical path.
  * @param rule - the rule.
  * @param path - canonical absolute path.
  * @returns true when the rule covers the path.
  */
 export function ruleCovers(rule, path) {
-  return rule.recursive === true ? pathWithin(rule.path, path) : rule.path === path
+  return rulePaths(rule).some(candidate => (rule.recursive === true ? pathWithin(candidate, path) : candidate === path))
 }
 
 /**
@@ -220,9 +252,11 @@ export function resolveOperation({ path, realPath = path, operation, rules }) {
 /**
  * The rules the platform contributes on its own: the workspace, the temp areas,
  * the harness home, and the system paths macOS needs. The workspace grants
- * everything except `delete`; the temp areas and the harness home grant all
- * five; system paths grant read and execute, and Homebrew's prefix grants read
- * only — every Homebrew binary is authorized one file at a time.
+ * everything except `delete`; the temp areas grant all five; the harness home is
+ * readable and nothing more, so a shell command can never rewrite the rules or
+ * the audit log that judge it; system paths grant read and execute, and
+ * Homebrew's prefix grants read only — every Homebrew binary is authorized one
+ * file at a time.
  * @param options - workspace root, harness home, and the session's sandbox mode.
  * @returns baseline rules, in no particular order.
  */
@@ -255,8 +289,8 @@ export function baselineRules({ workspaceRoot, harnessHome, home, mode = 'worksp
       recursive: true,
       source: 'system',
       baseline: true,
-      access: readOnly ? { read: true } : { read: true, write: true, create: true, delete: true },
-      note: 'the harness home',
+      access: { read: true },
+      note: 'the harness home, read-only for anything the agent starts',
     }))
   }
   for (const path of SYSTEM_READ_EXECUTE) {
@@ -284,11 +318,11 @@ export function baselineRules({ workspaceRoot, harnessHome, home, mode = 'worksp
  */
 export function describeRule(rule) {
   const operations = OPERATIONS.filter(operation => rule.access?.[operation] === true)
-  const scope = rule.recursive === true ? `${rule.path}${rule.path === '/' ? '' : '/'}**` : rule.path
+  const shown = rule.spelling ?? rule.path
+  const scope = rule.recursive === true ? `${shown}${shown === '/' ? '' : '/'}**` : shown
   const prefix = rule.source === 'session' ? 'once：' : ''
   return `${prefix}${operations.join('+')} · ${scope}`
 }
-
 /**
  * Normalize one rule read from disk, dropping what cannot be used.
  * @param rule - the stored record.
@@ -300,6 +334,7 @@ export function normalizeStoredRule(rule, source) {
   const normalized = makeRule({
     ...rule,
     path: rule.path,
+    spelling: rule.spelling,
     source,
     recursive: rule.recursive !== false,
   })

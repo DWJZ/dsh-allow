@@ -15,9 +15,6 @@ import { OPERATIONS, canonicalPath, describeRule, makeRule, normalizeStoredRule 
 /** Default file name for stored rules below the harness home. */
 const RULES_FILE_NAME = 'dsh-allow.json'
 
-/** Rule file a workspace may carry for itself. */
-export const WORKSPACE_RULES_FILE_NAME = '.dsh-allow.json'
-
 /** Default file name for the audit log below the harness home. */
 const AUDIT_FILE_NAME = 'dsh-allow-audit.ndjson'
 
@@ -93,16 +90,27 @@ export function resolveConfig(config, home) {
   if (!Array.isArray(grants)) {
     throw new TypeError('dsh-allow: config grants must be a list of {path, access, recursive} entries')
   }
+  const enforce = config?.enforce ?? 'auto'
+  if (!['auto', 'all', 'process', 'writes', 'off'].includes(enforce)) {
+    throw new TypeError(`dsh-allow: config enforce must be "auto", "all", "process", "writes" or "off", got ${JSON.stringify(enforce)}`)
+  }
+  const rulesFile = text(config?.rulesFile, 'rulesFile', join(home, RULES_FILE_NAME))
+  const auditFile = text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME))
   return {
-    rulesFile: text(config?.rulesFile, 'rulesFile', join(home, RULES_FILE_NAME)),
-    auditFile: text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME)),
+    rulesFile,
+    auditFile,
     audit: config?.audit !== false,
     sessionGrantTtlMs,
     grants: grants.map(entry => configGrantRule(entry, home)),
-    // An approval for one call also answers the sandbox's escalation question:
-    // that is what "stop asking for this path" means once the run needs a wider
-    // mode. Turn it off to keep every widening manual.
-    autoApproveEscalations: config?.autoApproveEscalations !== false,
+    // How much of the filesystem policy is compiled into the process sandbox.
+    // `auto` keeps the write fence (and with it delete separation) and adds the
+    // read and execute fences only when a probe proves they apply.
+    enforce,
+    // Nothing the agent runs may change the rules that judge it. The paths are
+    // canonical so they match the paths a decision compares, whatever spelling
+    // the configuration used.
+    protectedFiles: [rulesFile, auditFile, join(home, 'dsh-allow.json'), join(home, 'dsh-allow-audit.ndjson')]
+      .map(file => canonicalPath(file, { cwd: process.cwd(), home })),
   }
 }
 
@@ -134,18 +142,6 @@ export function readRules(file) {
   if (!Array.isArray(parsed?.rules)) return []
   if (parsed.version !== undefined && parsed.version !== RULES_VERSION) return []
   return parsed.rules.map(rule => normalizeStoredRule(rule, 'user')).filter(rule => rule !== null)
-}
-
-/**
- * Read the rules one workspace carries for itself.
- * @param workspaceRoot - the session workspace root.
- * @returns the workspace rules.
- */
-export function readWorkspaceRules(workspaceRoot) {
-  if (typeof workspaceRoot !== 'string' || workspaceRoot === '') return []
-  const parsed = readJson(resolve(workspaceRoot, WORKSPACE_RULES_FILE_NAME))
-  if (!Array.isArray(parsed?.rules)) return []
-  return parsed.rules.map(rule => normalizeStoredRule(rule, 'workspace')).filter(rule => rule !== null)
 }
 
 /**
@@ -268,9 +264,11 @@ export function countHit(file, id) {
 
 /**
  * Create the "allow once" store: capability grants that live in this process
- * only, for a bounded time, and are never written to the rules file.
+ * only, are bound to the one call the user approved, are handed to the sandbox
+ * for that call, and are dropped as soon as the call settles. Nothing here is
+ * ever written to the rules file.
  * @param options - lifetime and clock.
- * @returns grant/read/release operations.
+ * @returns grant/read/consume operations.
  */
 export function createGrantStore({ ttlMs = SESSION_GRANT_TTL_MS, now = Date.now } = {}) {
   const entries = new Map()
@@ -279,39 +277,62 @@ export function createGrantStore({ ttlMs = SESSION_GRANT_TTL_MS, now = Date.now 
   }
   return {
     /**
-     * Grant capabilities for one session until the grant expires.
+     * Grant capabilities for one approved call.
      * @param sessionId - owning session id.
+     * @param callId - the call the approval belongs to.
      * @param rules - the rules to remember, in `makeRule` fields.
      * @returns the granted rules.
      */
-    grant(sessionId, rules) {
-      if (typeof sessionId !== 'string') return []
+    grant(sessionId, callId, rules) {
+      if (typeof sessionId !== 'string' || typeof callId !== 'string') return []
       prune()
-      const current = entries.get(sessionId)?.rules ?? []
       const stored = rules.map((fields, index) => makeRule({
         ...fields,
         source: 'session',
         id: `s${String(now())}${String(index)}`,
       }))
-      entries.set(sessionId, { rules: [...current, ...stored], at: now() })
+      const key = `${sessionId}\u0000${callId}`
+      const current = entries.get(key)?.rules ?? []
+      entries.set(key, { rules: [...current, ...stored], at: now() })
       return stored
     },
     /**
-     * The session's live grants.
+     * The grants that belong to one call.
+     * @param sessionId - owning session id.
+     * @param callId - the call being judged.
+     * @returns the rules.
+     */
+    rulesFor(sessionId, callId) {
+      if (typeof sessionId !== 'string' || typeof callId !== 'string') return []
+      prune()
+      return entries.get(`${sessionId}\u0000${callId}`)?.rules ?? []
+    },
+    /**
+     * Every live grant in one session: what the process sandbox must carry,
+     * because a confinement knows its session but not its call.
      * @param sessionId - owning session id.
      * @returns the rules.
      */
-    rulesFor(sessionId) {
+    rulesForSession(sessionId) {
       if (typeof sessionId !== 'string') return []
       prune()
-      return entries.get(sessionId)?.rules ?? []
+      const prefix = `${sessionId}\u0000`
+      const rules = []
+      for (const [key, entry] of entries) if (key.startsWith(prefix)) rules.push(...entry.rules)
+      return rules
     },
     /**
-     * Drop one session's grants.
+     * Drop the grants of one call once it has run.
      * @param sessionId - owning session id.
+     * @param callId - the call that settled.
+     * @returns how many rules were dropped.
      */
-    release(sessionId) {
-      if (typeof sessionId === 'string') entries.delete(sessionId)
+    consume(sessionId, callId) {
+      if (typeof sessionId !== 'string' || typeof callId !== 'string') return 0
+      const key = `${sessionId}\u0000${callId}`
+      const dropped = entries.get(key)?.rules.length ?? 0
+      entries.delete(key)
+      return dropped
     },
   }
 }

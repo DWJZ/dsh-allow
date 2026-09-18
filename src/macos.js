@@ -5,7 +5,7 @@
  * The mapping was measured against the kernel, not assumed:
  *
  *   read    -> file-read*
- *   write   -> file-write-data, file-write-attributes, file-write-mode,
+ *   write   -> file-write-data, file-write-xattr, file-write-mode,
  *              file-write-flags, file-write-owner, file-write-times
  *   create  -> file-write-create
  *   delete  -> file-write-unlink   (unlink, rmdir, and rename-away)
@@ -28,9 +28,11 @@ import { OPERATIONS } from './fspolicy.js'
 
 /** The SBPL operations behind each capability. */
 export const SEATBELT_OPERATIONS = Object.freeze({
-  read: Object.freeze(['file-read*']),
+  // Contents, not metadata: a fenced read still has to let the kernel look up
+  // every path component, which is what `file-read-metadata` is allowed for.
+  read: Object.freeze(['file-read-data']),
   write: Object.freeze([
-    'file-write-data', 'file-write-attributes', 'file-write-mode',
+    'file-write-data', 'file-write-xattr', 'file-write-mode',
     'file-write-flags', 'file-write-owner', 'file-write-times',
   ]),
   create: Object.freeze(['file-write-create']),
@@ -46,9 +48,10 @@ function sbplString(path) {
   return `"${path.replaceAll('\\', String.raw`\\`).replaceAll('"', String.raw`\"`)}"`
 }
 
-/** The path filter for one rule: a subtree for `recursive`, one file otherwise. */
-function filterFor(rule) {
-  return rule.recursive === true ? `(subpath ${sbplString(rule.path)})` : `(literal ${sbplString(rule.path)})`
+/** The path filters for one rule: every spelling it was granted under. */
+function filtersFor(rule) {
+  const paths = rule.spelling === undefined ? [rule.path] : [rule.path, rule.spelling]
+  return paths.map(path => (rule.recursive === true ? `(subpath ${sbplString(path)})` : `(literal ${sbplString(path)})`))
 }
 
 /**
@@ -57,14 +60,22 @@ function filterFor(rule) {
  * The profile starts from the platform default and then fences each capability
  * separately, so a rule that grants `write` and `create` but not `delete`
  * produces exactly that: no unlink for anyone in the subtree, including child
- * processes, which inherit the profile.
- * @param options - the rules, and whether to fence reads and executions too.
+ * processes, which inherit the profile. Clauses are order-sensitive in SBPL —
+ * the last match wins — so refusals that must survive every grant are written
+ * last.
+ * @param options - the rules, whether to fence reads and executions, and files
+ *   no grant may make writable (the permission store).
  * @returns the profile text for `sandbox-exec -p`.
  */
-export function seatbeltProfile({ rules, includeRead = false, includeExecute = true }) {
+export function seatbeltProfile({ rules, includeRead = false, includeExecute = true, deniedPaths = [] }) {
   const clauses = ['(version 1)', '(allow default)', '(deny file-write*)']
   for (const device of ALWAYS_WRITABLE_DEVICES) {
     clauses.push(`(allow file-write* (literal ${sbplString(device)}))`)
+  }
+  if (includeRead) {
+    // Path lookup itself needs metadata; file CONTENTS are what the fence
+    // withholds, so a process can still resolve a path it may not open.
+    clauses.push('(deny file-read-data)', '(allow file-read-metadata)')
   }
   for (const rule of rules) {
     const allowed = new Set()
@@ -72,7 +83,7 @@ export function seatbeltProfile({ rules, includeRead = false, includeExecute = t
       if (rule.access?.[operation] === true) for (const name of SEATBELT_OPERATIONS[operation]) allowed.add(name)
     }
     if (allowed.size === 0) continue
-    clauses.push(`(allow ${[...allowed].join(' ')} ${filterFor(rule)})`)
+    clauses.push(`(allow ${[...allowed].join(' ')} ${filtersFor(rule).join(' ')})`)
   }
   if (includeExecute) {
     // `execute` is a capability too: with the fence in place, only the rules
@@ -80,14 +91,18 @@ export function seatbeltProfile({ rules, includeRead = false, includeExecute = t
     clauses.push('(deny process-exec)')
     for (const rule of rules) {
       if (rule.access?.execute !== true) continue
-      clauses.push(`(allow process-exec ${filterFor(rule)})`)
+      clauses.push(`(allow process-exec ${filtersFor(rule).join(' ')})`)
     }
   }
-  if (includeRead) {
-    clauses.push('(deny file-read*)')
-    for (const rule of rules) {
-      if (rule.access?.read !== true) continue
-      clauses.push(`(allow file-read* ${filterFor(rule)})`)
+  for (const path of deniedPaths) {
+    if (typeof path !== 'string' || path === '') continue
+    // Named operations, not `file-write*`: a wildcard denial loses to a
+    // specific `(allow file-write-data …)`, which is exactly what a rule for
+    // the surrounding folder contributed.
+    const operations = [...SEATBELT_OPERATIONS.write, ...SEATBELT_OPERATIONS.create, ...SEATBELT_OPERATIONS.delete]
+    for (const operation of operations) {
+      clauses.push(`(deny ${operation} (literal ${sbplString(path)}))`)
+      clauses.push(`(deny ${operation} (subpath ${sbplString(path)}))`)
     }
   }
   return clauses.join(' ')
@@ -109,7 +124,7 @@ export function seatbeltArgs(profile, argv) {
  */
 export function backendLimitations() {
   return [
-    'read: Seatbelt can deny file-read*, but macOS needs a large read baseline; a deny-everything-then-allow profile is only usable with the full system rule set.',
+    'read: the contents fence denies file-read-data and keeps file-read-metadata allowed so paths still resolve; macOS itself reads outside the rules (dyld caches, XPC, preferences), so a fenced read is probed before it is trusted.',
     'create without write: file-write-create lets a process make an empty file; filling it also needs file-write-data, so a create-only rule produces empty files only.',
     'rename counts as delete of the source plus create of the target, so it needs both grants.',
     'the filter matches the resolved path: rule paths must be canonical.',

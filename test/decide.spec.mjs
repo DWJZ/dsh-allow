@@ -28,6 +28,10 @@ const CWD = WORKSPACE
 const BASE = { cwd: CWD, home: HOME, workspaceRoot: WORKSPACE, harnessHome: `${HOME}/.dsh`, mode: 'workspace-write' }
 const decide = (command, overrides = {}) => evaluateCommandLine({ command, ...BASE, ...overrides })
 const rule = (path, access, recursive = true) => fspolicy.makeRule({ path, access, recursive })
+/** A kernel that fences every capability, as `enforce: 'auto'` reports when it can. */
+const FENCED = { capabilities: { read: true, write: true, create: true, delete: true, execute: true } }
+/** A kernel that fences only the writes, which is what `enforce: 'writes'` buys. */
+const WRITES_FENCED = { capabilities: { read: false, write: true, create: true, delete: true, execute: false } }
 
 console.log('granted within the workspace')
 check('listing the workspace is allowed', decide('ls -la').decision === 'allow')
@@ -58,8 +62,20 @@ check('a rule for one folder does not cover its sibling', decision.decision === 
 decision = decide('rm -rf build', { sessionRules: [rule(`${WORKSPACE}/build`, { delete: true })] })
 check('an allow-once grant allows it', decision.decision === 'allow')
 
-decision = decide('rm -rf build', { workspaceRules: [rule(`${WORKSPACE}/build`, { delete: true })] })
-check('a workspace-carried rule allows it', decision.decision === 'allow')
+console.log('the permission store is not the agent\'s to change')
+const STORE = `${HOME}/.dsh/dsh-allow.json`
+check('writing the rules file is refused',
+  decide(`echo x > ${STORE}`, { protectedFiles: [STORE] }).decision === 'forbidden')
+check('deleting the rules file is refused',
+  decide(`rm -f ${STORE}`, { protectedFiles: [STORE] }).decision === 'forbidden')
+check('a user rule cannot unlock it',
+  decide(`rm -f ${STORE}`, { protectedFiles: [STORE], rules: [rule('/Users/tester/.dsh', { delete: true })] }).decision === 'forbidden')
+check('a rule for the directory grants nothing there',
+  decide(`cat ${STORE}`, { protectedFiles: [STORE], rules: [rule('/Users/tester/.dsh', { read: true })] }).decision === 'allow')
+check('the audit log is protected too',
+  decide(`rm -f ${HOME}/.dsh/dsh-allow-audit.ndjson`, { protectedFiles: [`${HOME}/.dsh/dsh-allow-audit.ndjson`] }).decision === 'forbidden')
+check('and the harness home is read-only by default',
+  decide(`echo x > ${HOME}/.dsh/other.json`).decision === 'prompt')
 
 console.log('outside the workspace')
 decision = decide('echo x > /Users/tester/other/out.txt')
@@ -98,20 +114,30 @@ check('at most its executable is questioned',
   JSON.stringify(decision.missing))
 check('a network transfer without a file target needs nothing', decide('curl https://example.invalid').decision === 'allow')
 
-console.log('inline programs are deferred, not remembered')
-decision = decide("/usr/bin/python3 -c 'print(1)'")
-check('inline code runs under an enforcing sandbox', decision.decision === 'allow', JSON.stringify(decision.reason))
+console.log('inline programs run only on a fence that can back them')
+decision = decide("/usr/bin/python3 -c 'print(1)'", { enforcement: FENCED })
+check('inline code runs when the kernel fences every capability', decision.decision === 'allow', JSON.stringify(decision.reason))
 check('and is recorded as unreadable', decision.unknown.length === 1)
-decision = decide("python3 -c 'print(1)'")
-check('only the interpreter executable is questioned',
-  decision.decision === 'allow' || decision.missing.every(entry => entry.operation === 'execute'),
-  JSON.stringify(decision.missing))
-decision = decide("/usr/bin/python3 -c 'print(1)'", { mode: 'danger-full-access' })
-check('with no enforcing sandbox it asks', decision.decision === 'prompt', JSON.stringify(decision.reason))
-decision = decide("/usr/bin/python3 -c 'print(1)'", { mode: null })
+decision = decide("/usr/bin/python3 -c 'print(1)'")
+check('without an installed fence it asks', decision.decision === 'prompt', JSON.stringify(decision.reason))
+check('and the card offers every capability for this directory',
+  decision.suggestions.length === 1
+  && decision.suggestions[0]?.path === CWD
+  && decision.suggestions[0]?.access?.delete === true
+  && decision.suggestions[0]?.access?.execute === true, JSON.stringify(decision.suggestions))
+decision = decide("/usr/bin/python3 -c 'print(1)'", { enforcement: WRITES_FENCED })
+check('a partial fence is not enough on its own', decision.decision === 'prompt', JSON.stringify(decision.reason))
+decision = decide("/usr/bin/python3 -c 'print(1)'", {
+  enforcement: WRITES_FENCED,
+  rules: [rule(CWD, { read: true, write: true, create: true, delete: true, execute: true })],
+})
+check('but an open directory is: nothing is left to withhold', decision.decision === 'allow', JSON.stringify(decision.reason))
+decision = decide("/usr/bin/python3 -c 'print(1)'", { enforcement: FENCED, mode: 'danger-full-access' })
+check('with no confining mode it asks', decision.decision === 'prompt', JSON.stringify(decision.reason))
+decision = decide("/usr/bin/python3 -c 'print(1)'", { enforcement: FENCED, mode: null })
 check('an unknown mode asks too', decision.decision === 'prompt')
-decision = decide("/usr/bin/python3 -c 'print(1)'", { mode: 'read-only' })
-check('read-only still defers to the sandbox', decision.decision === 'allow')
+decision = decide("/usr/bin/python3 -c 'print(1)'", { enforcement: FENCED, mode: 'read-only' })
+check('read-only still confines the process', decision.decision === 'allow')
 
 console.log('computed paths are not a free ride')
 decision = decide('rm -rf "$DIR"')

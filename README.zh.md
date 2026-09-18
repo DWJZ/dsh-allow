@@ -1,22 +1,21 @@
 ---
-description: "dsh-allow:按路径授予 DSH shell 调用的 read / write / create / delete / execute 文件权限,卡片上给「拒绝 / 允许一次 / 总是允许」。"
+description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / create / delete / execute 文件权限,并在进程沙箱里真正强制;卡片上给「拒绝 / 允许一次 / 总是允许」。"
 ---
 
 # dsh-allow
 
 [English](README.md) | 中文
 
-给 agent 每次 shell 调用加一层**文件系统权限**。判断依据是这条命令需要哪些文件能力,而不是命令名听起来多危险:`rm build` 会问,是因为 `delete(/…/build)` 没被授予;`chmod 600 build` 会问,是因为 `write(/…/build)` 没被授予;`echo x > new.txt` 直接通过,是因为 workspace 里 `create` 是允许的。授权一个路径不会顺带打开它的邻居,授权一个可执行文件也不会打开它所在的整个前缀。
+给 DSH 加一层**文件系统权限**。判断依据是这条命令需要哪些文件能力,而不是命令名听起来多危险;同一份策略还会被编译成进程真正运行其下的 profile —— 所以它启动的子进程、以及命令行里根本没露出来的代码,同样受这份策略约束。
 
 ```
-cat README.md               →  允许    (workspace 内 read)
-echo x > out.md             →  允许    (workspace 内 create)
-rm -rf build                →  询问    (workspace 默认不授予 delete)
-mkdir build && rm -rf build →  询问    (整行取最严的一条)
-python3 -c '…'              →  允许    (见「内联程序」:交给系统层沙箱)
-gh pr list                  →  询问    (这个二进制没被授予 execute)
-echo x > /Users/me/other/o  →  询问    (workspace 外 create)
-sudo rm -rf /System/Library →  拒绝    (平台保留路径)
+cat README.md                  →  允许    (workspace 内 read)
+echo x > out.md                →  允许    (workspace 内 create)
+rm -rf build                   →  询问    (workspace 默认不授予 delete)
+python3 -c 'os.remove(…)'      →  delete 未授权时由内核拒绝
+gh pr list                     →  询问    (这个二进制没被授予 execute)
+echo x > /Users/me/other/o     →  询问    (workspace 外 create)
+echo x > ~/.dsh/dsh-allow.json →  拒绝    (权限库永远不可写)
 ```
 
 ## 挂在哪一层
@@ -28,13 +27,14 @@ bash / pwsh 工具调用
       ↓
 tools/pre-execute  ← 本插件:解析 → 推导文件效果 → 逐条解析 (路径, 能力)
       ↓ 允许                     ↓ 询问                        ↓ 拒绝
-  DSH 沙箱(不改动)         审批卡片:拒绝 / 总是允许 /        直接拒绝,不能提权
-                          允许一次
+  ctx.sandbox.confine        审批卡片:拒绝 / 总是允许 /      不能提权
+      ↓                      允许一次
+  用同一套规则编译出来的 Seatbelt profile
       ↓
-进程执行
+整棵进程树(子进程、孙进程、内联代码)
 ```
 
-`tools/pre-execute` 是文档化的策略接缝,也是 shell 命令唯一的路径,没有旁路。监听器用 `prepend: true` 注册,所以别人无法覆盖「拒绝」。
+`tools/pre-execute` 是文档化的策略接缝,也是 shell 命令唯一的路径。插件**不替换** sandbox provider:它包住已注册 provider 的 `confine`,把由当前有效策略编译出的 profile 交给它,自己处理不了的平台原样委托回去。`tools/post-execute` 负责把「允许一次」用掉,另有一道针对写文件工具的小闸门拦下权限库。
 
 ## 能力与规则
 
@@ -63,41 +63,50 @@ tools/pre-execute  ← 本插件:解析 → 推导文件效果 → 逐条解析 
 }
 ```
 
-`recursive: true` 覆盖整棵子树;`recursive: false` 只覆盖这一个路径 —— 卡片上的「总是允许这个文件」写的就是后者(单个二进制、单个文件)。
+`recursive: true` 覆盖整棵子树;`recursive: false` 只覆盖这一个路径 —— 卡片上的「总是允许」对单个文件、单个二进制写的就是后者。
+
+## 权限库不是 agent 能改的
+
+规则文件与审计日志属于**硬保护路径**:`write`/`create`/`delete` 对任何人(包括用户规则)都拒绝,编译出的 profile 还会在所有授权之后再次拒绝。覆盖 `$DSH_HOME/dsh-allow.json` 与 `$DSH_HOME/dsh-allow-audit.ndjson`,配置指到哪就保护到哪。
+
+同一道保护也加在写文件的工具上(`write`、`edit`、`str_replace_editor`),所以 agent 也不能用文件工具改写自己的规则;其它文件工具调用仍由 harness 自己的围栏负责。
+
+harness home(`~/.dsh`)只读,shell 命令改不了「审判它的那套状态」。
+
+clone 进 workspace 的仓库也无法给自己扩权:dsh-allow **不会**读取 workspace 里的 `.dsh-allow.json`。仓库内容永远不该授予宿主机权限。
 
 ## 优先级
 
 从高到低,某个能力第一次被某一级明确表态就按它执行;同一级内部,路径更具体的优先:
 
-1. **平台保留路径** —— `/System`、`/bin`、`/sbin`、`/usr`(除 `/usr/local`)、`/AppleInternal`、`/private/var/db`、`/dev` 的 `write`/`create`/`delete` 对任何人(包括用户规则)都拒绝;`/dev/null`、标准流与 `/usr/local` 例外。
-2. **显式规则** —— 规则文件(`source: user`)与本会话的「允许一次」(`source: session`)。
-3. **工作区规则** —— 会话 workspace 里的 `.dsh-allow.json`。
-4. **平台基线** —— workspace、临时目录、harness home,以及 macOS 自身需要的系统路径。
-5. **全局默认** —— 未授予。
+1. **平台保留路径** —— `/System`、`/bin`、`/sbin`、`/usr`(除 `/usr/local`)、`/AppleInternal`、`/private/var/db`、`/dev`,以及权限库本体,其 `write`/`create`/`delete` 对任何人(包括用户规则)都拒绝。
+2. **显式规则** —— 规则文件(`source: user`)与本次获批调用的一次性授权(`source: session`)。
+3. **平台基线** —— workspace、临时目录、harness home,以及 macOS 自身需要的系统路径。
+4. **全局默认** —— 未授予。
 
-路径按规范化后的绝对路径逐段比较:`~`、相对路径、`.`、`..`、以及符号链接祖先都会先解析,所以 `/tmp/x` 与 `/private/tmp/x` 是同一条路径,也无法用 `../` 绕过规则。每次判定会同时拿「写法路径」和「真实路径」去匹配,因此 `/opt/homebrew/bin/gh` 的授权和它指向的 Cellar 二进制的授权各自有效,又都不会打开 `/opt/homebrew` 其余部分。
+路径按规范化后的绝对路径逐段比较:`~`、相对路径、`.`、`..`、以及符号链接祖先都会先解析,所以 `/tmp/x` 与 `/private/tmp/x` 是同一条路径,也无法用 `../` 绕过规则。每次判定会同时拿「写法路径」和「真实路径」去匹配,因此 `/opt/homebrew/bin/gh` 的授权和它指向的 Cellar 二进制的授权各自有效,又都不会打开 `/opt/homebrew` 其余部分。workspace 根自身也只是普通路径;一条规则绝不会覆盖只是前缀相同的兄弟目录(`/w/build` 不覆盖 `/w/build-2`)。
 
 ## 默认权限与平台基线
 
 workspace 内:`read`、`write`、`create`、`execute` 允许,`delete` 默认拒绝。
 
-插件自己的临时目录与 harness home 五种全允许。系统路径给 macOS 必需的部分:`/bin`、`/sbin`、`/usr/bin`、`/usr/sbin`、`/usr/lib`、`/usr/libexec`、`/System`、`/Library/Apple`、`/Library/Developer` 给 `read` + `execute`;`/etc`、`/var`、`/usr`、`/usr/share`、`/Library`、`/Applications`、`/dev`、`/opt/homebrew` 只给 `read`。
+临时目录五种全允许。系统路径给 macOS 必需的部分:`/bin`、`/sbin`、`/usr/bin`、`/usr/sbin`、`/usr/lib`、`/usr/libexec`、`/System`、`/Library/Apple`、`/Library/Developer` 给 `read` + `execute`;`/etc`、`/var`、`/usr`、`/usr/share`、`/Library`、`/Applications`、`/dev`、`/opt/homebrew` 只给 `read`。
 
-其余位置(包括 workspace 之外的 `$HOME`)在你打开之前都是关着的。`read-only` 会话会把基线收窄得和沙箱模式一致:workspace 只保留 `read` + `execute`。
+其余位置(包括 workspace 之外的 `$HOME`)在你打开之前都是关着的。`read-only` 会话会把基线按沙箱模式收窄:workspace 只保留 `read` + `execute`,而且在只读会话里没有任何规则能把写权限加回来。
 
 ## Homebrew 与符号链接可执行文件
 
-Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/homebrew/**` 不可执行,因此每个 Homebrew 二进制都要单独授权一次。对 `execute /opt/homebrew/bin/gh` 点「总是允许」只会写这一条路径,不会顺带覆盖第二个工具;因为判定会同时比对写法路径与它解析到的目标,同一个名字下次再经由符号链接启动时这条授权依然有效。
+Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/homebrew/**` 不可执行,因此每个 Homebrew 二进制都要单独授权一次。对 `execute /opt/homebrew/bin/gh` 点「总是允许」只会写这一条路径,不会顺带覆盖第二个工具。
 
 ## 命令的文件效果怎么读出来
 
-命令行用 `tree-sitter` + `tree-sitter-bash` 解析(结构:管道、列表、控制流、替换、重定向、here-document),然后按程序对参数做了什么,把每条简单命令变成 `(路径, 能力)`:`rm` 删除操作数、`mkdir` 创建、`mv` 删源建目标、`cp` 读源建目标、`grep` 读路径参数但绝不把 pattern 当路径、`sed -i` 读写同一个文件、`dd if=` 读而 `of=` 建、`curl -o` 建。重定向也算效果:`>` 写或建、`<` 读,空设备与标准流忽略。`sudo`、`doas`、`env`、`nice`、`nohup`、`timeout`、`command`、`exec` 会被跟到真正启动的程序,所以 `sudo rm -rf build` 仍然是一次对 `build` 的 delete。
+命令行用 `tree-sitter` + `tree-sitter-bash` 解析(结构:管道、列表、控制流、替换、重定向、here-document、函数体),然后按程序对参数做了什么,把每条简单命令变成 `(路径, 能力)`:`rm` 删除操作数、`mkdir` 创建、`mv` 删源建目标、`cp` 读源建目标、`grep` 读路径参数但绝不把 pattern 当路径、`sed -i` 读写同一个文件、`dd if=` 读而 `of=` 建、`curl -o` 建。重定向也算效果:`>` 写或建、`<` 读,空设备与标准流忽略。`sudo`、`doas`、`env`、`nice`、`nohup`、`timeout`、`command`、`exec` 会被跟到真正启动的程序,所以 `sudo rm -rf build` 仍然是一次对 `build` 的 delete。
 
 除此之外不从程序名推断任何东西;不在表里的程序只推导 `execute` —— 命令行看不出文件效果的程序(`git status`)完全不需要路径授权。
 
-## 内联程序:不再按整行原文审批
+## 看不清效果的程序,只在沙箱撑得住时才直接跑
 
-`python3 -c '…'`、`node -e '…'`、`eval`,以及解析器无法还原的 shell 程序,既不会按文本判定,也不会被固定成原文规则:两条源码不同、能力相同的 `python3 -c` 行为一致,不会因为源码变了再问一次。运行由沙箱约束进程;只有在**没有**任何沙箱模式在约束时(模式未知,或 `danger-full-access`)这种行才会询问 —— 这是 fail closed 的那一支。
+`python3 -c '…'`、`node -e '…'`、`eval`,以及解析器无法还原的 shell 程序,既不会按文本判定,也不会被固定成原文规则。只有当进程沙箱真能按策略管住它们时才直接执行:要么内核把五种能力都围住了,要么工作目录本身已经授予了全部五种 —— 也就是没有任何东西可以被藏起来。其余情况(没有 `sandbox-exec`、profile 应用不上、当前模式不隔离进程)一律先问,卡片上的那颗按钮就是为这个目录授予五种能力。
 
 「操作可见但路径是算出来的」是另一回事:`rm -rf "$DIR"` 明确是一次 delete,但路径无法核对,所以它会问,而不是搭上一条已有授权。一旦该操作在工作目录上被授予,它就不再询问,而沙箱会把运行期路径限制在你打开的范围里。
 
@@ -113,7 +122,11 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 沙箱: workspace-write
 ```
 
-「总是允许」只写卡片上念出来的那几条最窄规则 —— 命令行里每个路径一条,只有路径本身是已存在的目录时才带 `/**`,绝不顺手把路径所在的文件夹打开;想主动打开文件夹就明确写 `/allow add delete . folder`。「允许一次」只在内存里给本会话授权,默认十分钟后过期,绝不写规则文件。
+「总是允许」只写卡片上念出来的那几条最窄规则 —— 命令行里每个路径一条,只有路径本身是已存在的目录时才带 `/**`,绝不顺手把路径所在的文件夹打开;想主动打开文件夹就明确写 `/allow add delete . folder`。
+
+「允许一次」是真的只允许一次:它绑定到你批准的那一次调用,只交给那一次调用的沙箱,`tools/post-execute` 在该调用结束的瞬间就把它丢掉(另有十分钟过期作为兜底)。它绝不写规则文件,下一次调用仍然会问。
+
+`sandbox_permissions` 提权是「更宽的进程围栏」,不是文件能力,所以**永不自动批准** —— 即使这条命令需要的能力全都已授权。一次批准就等于让命令跑到模式之外,这个决定属于用户。
 
 ## macOS 后端
 
@@ -121,41 +134,25 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 
 | 能力 | SBPL 操作 |
 | --- | --- |
-| `read` | `file-read*` |
-| `write` | `file-write-data`、`file-write-attributes`、`file-write-mode`、`file-write-flags`、`file-write-owner`、`file-write-times` |
+| `read` | `file-read-data`(同时保留 `file-read-metadata`,否则路径都解析不了) |
+| `write` | `file-write-data`、`file-write-xattr`、`file-write-mode`、`file-write-flags`、`file-write-owner`、`file-write-times` |
 | `create` | `file-write-create` |
 | `delete` | `file-write-unlink` |
 | `execute` | `process-exec` |
 
-macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `file-write-data` 与 `file-write-create`、同时不授予 `file-write-unlink`,进程就能改写和新建文件,而 `rm`、`rmdir`、`rename` 全部 EPERM —— 子进程同样继承这个 profile。Seatbelt 的过滤器匹配内核解析后的路径,所以渲染前必须先规范化。
+macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `file-write-data` 与 `file-write-create`、同时不授予 `file-write-unlink`,进程就能改写和新建文件,而 `rm`、`rmdir`、`rename`、`python -c 'os.remove(…)'`、`node -e 'fs.rmSync(…)'` 全部 EPERM —— 本进程、子进程、孙进程都一样。单独的 `create` 就足以新建并把内容写进去;管「改动已存在的文件」的是 `write`。Seatbelt 的过滤器匹配内核解析后的路径,所以渲染前必须先规范化;一条规则会同时记住「用户写的那个名字」和它解析到的路径,所以 `/opt/homebrew/bin/gh` 的授权也覆盖它指向的 Cellar 二进制 —— 反之亦然。
 
-`test/sandbox.integration.mjs` 拿真内核验证了以上全部:workspace 读/写/建允许、删除被拒、授予 delete 后又能删、workspace 外写入被拒、execute 围栏拒绝未授权二进制、符号链接二进制按真实路径匹配、`python3 -c 'os.remove(…)'` 与子 shell 都被拒、内核拒绝的 profile 一个字节也不执行。
+有两个 Seatbelt 细节决定了 profile 的写法:通配的拒绝会被具体的允许压过去(`(deny file-write* …)` 拦不住 `(allow file-write-data …)`),所以权限库是逐操作写出拒绝的;而一个扣掉 macOS 运行所必需读取的 profile 会让 `/bin/sh` 在跑任何东西之前直接 abort,所以读围栏是探测出来的,不是假设的。
 
-## 到底在哪里被强制
+策略有多少真正下沉到内核,会在每个「模式 + workspace」的首次调用上**实测**:用真实 profile 跑真实命令,结果缓存下来并由 `/allow status` 报告:
 
-| 能力 | 命令级闸门(本插件) | 今天的 OS 沙箱 |
-| --- | --- | --- |
-| `write`、`create` | 有 | 有 —— workspace 根之外一律被 DSH 的 Seatbelt profile 拒绝 |
-| `delete` | 有,限于命令行能看出的效果 | **还没有** —— DSH profile 在 workspace 下授予 `file-write*`,其中包含 unlink |
-| `read` | 有 | 没有 —— 任何模式下读都放行 |
-| `execute` | 有 | 没有 —— profile 不管 `process-exec` |
+| 状态 | 含义 |
+| --- | --- |
+| `full` | write/create/delete/read/execute 全部在内核层 |
+| `partial` | write/create/delete 在内核层;execute/read 不在(内核拒绝了更强的 profile) |
+| `off` | 这份策略完全没有下沉;这时决策层不会假设「有沙箱」而放行看不清效果的命令 |
 
-诚实的结果:看不清效果的程序(`python3 -c 'os.remove(…)'`)不会被策略拦下;命令行没写出来的 workspace 外读取也不会被沙箱拦下。把 delete 下沉到内核只差 `@deepseek-ai/dsh-sandbox-local` profile 里的一行 —— 对「规则未授予 delete」的根加 `(deny file-write-unlink (subpath …))`,由能力集喂给它;`/allow status` 会在终端打印上面这张表。
-
-## `/allow`
-
-```
-/allow                          列出已记住的规则
-/allow status                   默认权限与强制层现状
-/allow add delete,write build folder
-/allow add execute /opt/homebrew/bin/gh file
-/allow remove 2
-/allow clear
-```
-
-## 审计日志
-
-每次非静默判定都会往 `$DSH_HOME/dsh-allow-audit.ndjson` 追加一行 JSON:命令、工作目录、决策、沙箱模式,以及支撑它的 `(能力, 路径)` 列表。凭据形状的文本在落盘前会被打码。
+`enforce: 'auto'` 依次试 `full`、write+execute 围栏、只围 write,绝不会退到比 harness 原有更宽的围栏;`enforce: all` 只接受 `full`,内核做不到就报告 `off`。编译失败会被报告而不是被吞掉,也不会被一个更宽的 profile 顶替。
 
 ## 配置
 
@@ -165,8 +162,8 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
     rulesFile: /path/to/rules.json          # 默认 $DSH_HOME/dsh-allow.json
     auditFile: /path/to/audit.ndjson        # 默认 $DSH_HOME/dsh-allow-audit.ndjson
     audit: true                             # false 关闭审计
-    sessionGrantTtlMs: 600000               # 「允许一次」的有效期
-    autoApproveEscalations: true            # 已授权的命令自己回答提权询问
+    sessionGrantTtlMs: 600000               # 「允许一次」的兜底有效期
+    enforce: auto                           # auto | all | process | writes | off
     grants:                                 # 部署级授权,字段与持久规则一致
       - path: /opt/homebrew
         recursive: true
@@ -179,19 +176,22 @@ dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,�
 
 ```sh
 npm test              # 单元 + 宿主接线 + 卡片渲染 + 真实沙箱
-npm run test:unit     # 策略、效果推导、决策
+npm run test:unit     # 策略、效果推导、强制层、决策
 npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的宿主)
 ```
 
-当 `sandbox-exec` 无法应用 profile 时(包括测试本身跑在另一层 Seatbelt 沙箱里),集成套件会打印明显的 SKIP;要在真内核上验证,请从普通终端运行它。
+`test/sandbox.integration.mjs` 跑的是真内核,覆盖:权限库对任何写入者都拒绝;`rm` / `rmdir` / `rename` / `python -c 'os.remove'` / `node -e 'fs.rmSync'` 全部被拒而写和建正常;再授予 delete 后又能删;单独关闭 write 与 create;读围栏让 `cat` 和 `open().read()` 失败;execute 围栏拒绝未授权二进制;`python → sh` 与 `node → sh` 的孙进程继承全部限制;内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。当 `sandbox-exec` 无法应用 profile 时(包括测试本身跑在另一层 Seatbelt 沙箱里),它会打印明显的 SKIP —— 要在真内核上验证,请从普通终端运行。
 
 ## 限制
 
-- 卡片按命令行判定;命令行看不出效果的程序由沙箱约束,而不是由本策略约束。
-- `read` 与 `execute` 目前是命令级的(见强制层表格);把它们下沉到内核所需的 macOS 映射已经在 `src/macos.js` 里实现并测试。
-- macOS 上只有 `create` 无法写出非空文件:填内容还需要 `file-write-data`,所以创建类授权通常同时带 `write`。
+- 命令行看不出效果的部分由沙箱判定,而不是由解析器猜:程序表里没有的效果一律交给围栏。
+- 单独的 `create` 可以新建并写入内容;改动已存在的文件需要 `write`。
+- 在这台机器上读围栏「能表达但活不下来」:macOS 自己要读的东西比策略基线列出的更多,`/bin/sh` 会直接 abort,所以 `auto` 停在 write+execute 围栏;想死磕基线的部署可以用 `enforce: all`。
+- 两个较弱的 Seatbelt 结论:不可读的路径仍然可被解析(metadata 始终放行);通配拒绝必须逐操作写出来。
 - 改名需要源的 `delete` 加目标的 `create`。
-- 读效果只为固定的一张程序表推导;表里没有的效果交给沙箱,而不是猜。
+- 读效果只为固定的一张程序表推导;真正的边界是围栏,不是这张表。
+- 一次性授权存活期间,同会话里并发运行的另一次调用可能用上它:沙箱按会话拿授权,判定按调用拿授权。
+- profile runner 固定为 `/usr/bin/sandbox-exec`;Seatbelt 不在这个位置的宿主会退回到 harness 自己的 profile 并报告 `off`。
 
 ## 许可证
 
