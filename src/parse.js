@@ -178,6 +178,18 @@ export function splitSegments(source) {
       index += 1
       continue
     }
+    // `2>&1`, `&>file`, and `>&2` are redirections, not sequencing: their `&`
+    // belongs to the redirection and must not split the line.
+    if (character === '&' && (text.endsWith('>') || text.endsWith('<'))) {
+      text += character
+      index += 1
+      continue
+    }
+    if (character === '&' && source[index + 1] === '>') {
+      text += character
+      index += 1
+      continue
+    }
     const operator = OPERATORS.find(candidate => source.startsWith(candidate, index))
     if (operator !== undefined) {
       flush(operator)
@@ -323,6 +335,8 @@ function parseSegment(segment, home) {
   const env = []
   const argv = []
   const redirections = []
+  // A trailing `&` was consumed as the segment's operator; anything else that
+  // merely ends in `&` is part of a redirection (`2>&1`).
   let background = segment.trimEnd().endsWith('&')
   let index = 0
   for (; index < words.length; index += 1) {
@@ -434,7 +448,7 @@ export function parseCommandLine(source, { home = '/', depth = 0 } = {}) {
     if (!parsed.ok) {
       return { analyzable: false, reason: parsed.reason, commands: [], operators }
     }
-    const command = parsed.command
+    const command = { ...parsed.command, ...(segment.operator === '&' ? { background: true } : {}) }
     const evaluated = evalSource(command)
     if (evaluated === false) {
       return { analyzable: false, reason: 'eval of a runtime string', commands: [], operators }

@@ -75,6 +75,8 @@ python - · node -                                 （从 stdin 读程序）
 eval · source · exec                              （单独出现）
 ```
 
+另外，**靠参数选择要运行什么**的程序也按同一标准（规则必须带具体操作，不能只写程序名）：`git`（`-c alias.x='!cmd'`、`--exec-path`）、`npm`/`pnpm`/`yarn`/`bun`、`make`、`docker`/`podman`/`kubectl`、`ssh`、`sudo`/`su`/`doas`、`env`/`xargs`/`nohup`/`timeout`/`nice`。所以 `git` 单独一条会被拒绝，`git status` 可以；`sudo` 单独一条会被拒绝，`sudo apt update` 可以。
+
 判定规则：**规则必须把「将要运行的程序」钉死**——要么是内联开关后的那段代码文本，要么是脚本路径。`python -c 'print(123)'` 与 `python -c 'print(456)'` 是两条不同的能力，前者不会覆盖后者。`forbidden` 永远优先：即使存在精确 allow 规则，`rm -rf /` 仍然拒绝（`bash -lc 'rm -rf /'` 也一样）。
 
 卡片上的文案也跟着区分：内联代码给的是「**总是允许这条完全相同的命令**」，解析成功的外层则显示内层命令（`总是允许「cargo test」`）。

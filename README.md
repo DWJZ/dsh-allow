@@ -75,6 +75,8 @@ python - · node -                                 (program from stdin)
 eval · source · exec                              (alone)
 ```
 
+Programs that run code *selected by their arguments* follow the same standard (a rule must name the operation, not just the program): `git` (`-c alias.x='!cmd'`, `--exec-path`), `npm`/`pnpm`/`yarn`/`bun`, `make`, `docker`/`podman`/`kubectl`, `ssh`, `sudo`/`su`/`doas`, `env`/`xargs`/`nohup`/`timeout`/`nice`. So a bare `git` rule is refused while `git status` is fine, and a bare `sudo` rule is refused while `sudo apt update` is fine.
+
 The test is whether the rule pins the program that will run — the code string after an inline flag, or a script path. `python -c 'print(123)'` and `python -c 'print(456)'` are different capabilities. `forbidden` always wins: an exact allow rule never covers `rm -rf /`, not even inside `bash -lc 'rm -rf /'`.
 
 The card says which one it is: inline code gets **Always allow this exact command**, while a parsed wrapper names the inner command (`Always allow "cargo test"`).

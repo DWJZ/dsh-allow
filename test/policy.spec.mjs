@@ -183,6 +183,13 @@ check('and it is offered no rule', evaluate("python3 - <<'PY'\nprint(1)\nPY").su
 check('a shell heredoc reader prompts too', evaluate('bash <<EOF\nrm -rf /\nEOF').decision === 'prompt')
 check('quoted << is not a heredoc', evaluate('echo "a << b"').decision === 'allow')
 
+console.log('redirections are not sequencing')
+let redirect = evaluate('dd if=/dev/zero of=/dev/null bs=1 count=1 2>&1 | head -5')
+check('2>&1 does not become a command named 1', redirect.commands.every(argv => argv[0] !== '1'), JSON.stringify(redirect.commands))
+check('and the pipeline keeps both its members', redirect.commands.length === 2, JSON.stringify(redirect.commands))
+check('a trailing & still means background', evaluate('nohup server &').decision === 'prompt')
+check('while 2>&1 alone does not', evaluate('ls > /tmp/x 2>&1').commands.length === 1, JSON.stringify(evaluate('ls > /tmp/x 2>&1').commands))
+
 console.log('inline execution: shell wrappers')
 let shell = evaluate("bash -lc 'git status'")
 check('a shell wrapper is parsed into its inner command', shell.commands.some(argv => argv.join(' ') === 'git status'), JSON.stringify(shell.commands))
@@ -206,6 +213,7 @@ const invalid = [
   ['python', []], ['python', ['-c']], ['python3', ['-c']], ['python', ['-']],
   ['node', ['-e']], ['perl', ['-e']], ['ruby', ['-e']], ['lua', ['-e']], ['deno', ['eval']],
   ['eval', []], ['source', []],
+  ['git', []], ['npm', []], ['sudo', []], ['env', []], ['xargs', []], ['docker', []],
 ]
 for (const [executable, argvPrefix] of invalid) {
   const verdict = policy.validatePersistentRule({ decision: 'allow', executable, argvPrefix })
@@ -214,6 +222,7 @@ for (const [executable, argvPrefix] of invalid) {
 const valid = [
   ['bash', ['-lc', 'cargo test']], ['python', ['-c', 'print(123)']], ['node', ['-e', 'console.log(1)']],
   ['python', ['tools/check.py']], ['bash', ['script.sh']], ['python', ['-u', 'tools/check.py']],
+  ['git', ['status']], ['npm', ['test']], ['sudo', ['apt', 'update']], ['docker', ['run', 'alpine']],
 ]
 for (const [executable, argvPrefix] of valid) {
   const verdict = policy.validatePersistentRule({ decision: 'allow', executable, argvPrefix })
@@ -241,6 +250,9 @@ check('a shell script rule does not cover -c', evaluateStrict("bash -lc 'anythin
 
 console.log('hard safety still wins')
 check('an exact allow rule cannot cover a catastrophic command', evaluate('rm -rf /', [allowRule('rm', ['-rf', '/'])]).decision === 'forbidden')
+check('a bare git rule cannot cover a git shell alias', evaluateStrict("git -c alias.p=!rm -rf / p", [allowRule('git')]).decision === 'prompt')
+check('while a pinned git rule covers its own operation', evaluateStrict('git status', [allowRule('git', ['status'])]).decision === 'allow')
+check('a bare sudo rule cannot cover an arbitrary command', evaluateStrict('sudo rm -rf /', [allowRule('sudo')]).decision === 'prompt')
 check('not even inside a shell wrapper', evaluate("bash -lc 'rm -rf /'", [allowRule('bash', ['-lc', 'rm -rf /'])]).decision === 'forbidden')
 
 console.log('command substitution is analysed, not guessed')

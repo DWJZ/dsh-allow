@@ -30,6 +30,14 @@ const CODE_PROGRAMS = {
   perl: { inline: ['-e'] }, ruby: { inline: ['-e'] }, lua: { inline: ['-e'] },
   php: { inline: ['-r'] }, osascript: { inline: ['-e'] }, deno: { inline: ['eval'] },
   eval: { inline: [] }, exec: { inline: [] }, source: { inline: [] }, '.': { inline: [] },
+  // Programs that run code selected by their arguments: a rule for one of them
+  // must pin the operation, never the program alone. `git -c alias.p='!cmd' p`
+  // and `sudo rm -rf /` are capabilities, not program names.
+  git: { inline: [] }, npm: { inline: [] }, pnpm: { inline: [] }, yarn: { inline: [] },
+  bun: { inline: [] }, make: { inline: [] }, docker: { inline: [] }, podman: { inline: [] },
+  kubectl: { inline: [] }, ssh: { inline: [] }, sudo: { inline: [] }, su: { inline: [] },
+  doas: { inline: [] }, env: { inline: [] }, xargs: { inline: [] }, nohup: { inline: [] },
+  timeout: { inline: [] }, nice: { inline: [] }, command: { inline: [] },
 }
 
 /** Shell flags that make the next argument a program (`-c`, `-lc`, `-ic`, …). */
