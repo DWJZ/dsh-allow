@@ -227,6 +227,8 @@ let redirect = evaluate('dd if=/dev/zero of=/dev/null bs=1 count=1 2>&1 | head -
 check('2>&1 does not become a command named 1', redirect.commands.every(argv => argv[0] !== '1'), JSON.stringify(redirect.commands))
 check('and the pipeline keeps both its members', redirect.commands.length === 2, JSON.stringify(redirect.commands))
 check('a trailing & still means background', evaluate('nohup server &').decision === 'prompt')
+check('writing the null device is not a file change', evaluate('curl -s http://x 2>/dev/null > /dev/null').decision === 'allow')
+check('while a real system target still prompts', evaluate('echo x > /etc/hosts').decision === 'prompt')
 check('while 2>&1 alone does not', evaluate('ls > /tmp/x 2>&1').commands.length === 1, JSON.stringify(evaluate('ls > /tmp/x 2>&1').commands))
 
 console.log('inline execution: shell wrappers')

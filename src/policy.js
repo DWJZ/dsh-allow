@@ -239,6 +239,8 @@ export function classifyBuiltin(command, context) {
   // Redirection targets: writing system or credential files is a filesystem change.
   for (const redirection of command.redirections) {
     if (!['>', '>>', '&>', '&>>'].includes(redirection.op)) continue
+    // The null device is where output goes to be discarded, not a file change.
+    if (/^\/dev\/(?:null|stdout|stderr)$/u.test(redirection.target)) continue
     if (redirection.dynamic) {
       return { decision: 'prompt', risk: 'filesystem-write', reason: 'a redirection target is built at runtime' }
     }
