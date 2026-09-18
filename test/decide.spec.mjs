@@ -41,10 +41,10 @@ let decision = decide('rm -rf build')
 check('deleting in the workspace asks', decision.decision === 'prompt', JSON.stringify(decision.reason))
 check('and names the missing capability', decision.missing[0]?.operation === 'delete'
   && decision.missing[0]?.path === `${WORKSPACE}/build`, JSON.stringify(decision.missing))
-check('and offers a narrow grant', decision.suggestions[0]?.path === `${WORKSPACE}/build`
-  && decision.suggestions[0]?.scope === 'file', JSON.stringify(decision.suggestions))
-check('and a folder grant', decision.suggestions[1]?.path === WORKSPACE
-  && decision.suggestions[1]?.scope === 'folder', JSON.stringify(decision.suggestions))
+check('and offers exactly one grant, the narrowest one',
+  decision.suggestions.length === 1
+  && decision.suggestions[0]?.path === `${WORKSPACE}/build`
+  && decision.suggestions[0]?.recursive === false, JSON.stringify(decision.suggestions))
 
 decision = decide('rm -rf build', { rules: [rule(`${WORKSPACE}/build`, { delete: true })] })
 check('a stored delete rule allows it', decision.decision === 'allow', JSON.stringify(decision.reason))

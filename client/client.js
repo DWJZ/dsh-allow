@@ -56,8 +56,8 @@ window.__ModuleLoader__.load({
 			waiting: "需要文件权限",
 			reject: "拒绝",
 			allowOnce: "允许一次",
-			alwaysFile: "总是允许这个文件：{rule}",
-			alwaysFolder: "总是允许这个文件夹：{rule}",
+			alwaysOne: "总是允许：{rule}",
+			alwaysMany: "总是允许 {rules}",
 			remembering: "正在记住…",
 			rememberFailed: "没记住:{message}",
 			cannotRemember: "这次没法记住，只能用「允许一次」:{reason}",
@@ -74,8 +74,8 @@ window.__ModuleLoader__.load({
 			waiting: "Filesystem permission required",
 			reject: "Deny",
 			allowOnce: "Allow once",
-			alwaysFile: "Always allow this file: {rule}",
-			alwaysFolder: "Always allow this folder: {rule}",
+			alwaysOne: "Always allow: {rule}",
+			alwaysMany: "Always allow {rules}",
 			remembering: "Remembering…",
 			rememberFailed: "Not remembered: {message}",
 			cannotRemember: "This cannot be remembered; only \u201callow once\u201d is available: {reason}",
@@ -115,6 +115,19 @@ window.__ModuleLoader__.load({
 		 */
 		function shorten(text, max) {
 			return text.length <= max ? text : text.slice(0, max - 1) + "\u2026";
+		}
+
+		/**
+		 * 「总是允许」按钮上的文案:把这次会写入的规则念出来(最多 3 条,再多给数量)。
+		 * @param t - 本命名空间的翻译函数。
+		 * @param suggestions - 宿主给出的最窄规则。
+		 * @returns 按钮文字。
+		 */
+		function alwaysText(t, suggestions) {
+			const labels = suggestions.map((suggestion) => suggestion.label);
+			if (labels.length === 1) return t("alwaysOne", { rule: labels[0] });
+			const head = labels.length <= 3 ? labels.join(" + ") : labels.slice(0, 3).join(" + ") + " +" + String(labels.length - 3) + "\u2026";
+			return t("alwaysMany", { rules: head });
 		}
 
 		/** 读取这次审批缺什么、能记住什么;失败返回 null(卡片退化成两按钮)。 */
@@ -202,20 +215,17 @@ window.__ModuleLoader__.load({
 				}, t("reject"))
 			];
 			const suggestions = info === null || !Array.isArray(info.suggestions) ? [] : info.suggestions;
-			if (info !== null && info.rememberable === true) {
-				for (const suggestion of suggestions) {
-					const scope = suggestion.scope === "folder" ? "folder" : "file";
-					const text = t(scope === "folder" ? "alwaysFolder" : "alwaysFile", { rule: suggestion.label });
-					buttons.push(React.createElement(primitives.Button, {
-						key: "always-" + scope,
-						variant: "outline",
-						disabled: disabled,
-						title: suggestion.label,
-						onClick: () => { post("/dsh-allow/remember", { scope: scope }, "remember-" + scope); }
-					}, busy === "remember-" + scope
-						? t("remembering")
-						: React.createElement("span", { className: "dsha_ellipsis" }, shorten(text, 48))));
-				}
+			if (info !== null && info.rememberable === true && suggestions.length > 0) {
+				// 只有一个「总是允许」按钮:写入的就是卡片上念出来的那几条最窄规则。
+				buttons.push(React.createElement(primitives.Button, {
+					key: "always",
+					variant: "outline",
+					disabled: disabled,
+					title: suggestions.map((suggestion) => suggestion.label).join(" + "),
+					onClick: () => { post("/dsh-allow/remember", {}, "remember"); }
+				}, busy === "remember"
+					? t("remembering")
+					: React.createElement("span", { className: "dsha_ellipsis" }, shorten(alwaysText(t, suggestions), 48))));
 			}
 			buttons.push(React.createElement(primitives.Button, {
 				key: "once",
@@ -284,6 +294,7 @@ window.__ModuleLoader__.load({
 		// 供离线冒烟测试使用。
 		exports.escalationOf = escalationOf;
 		exports.shorten = shorten;
+		exports.alwaysText = alwaysText;
 		exports.AllowPanel = AllowPanel;
 		//#endregion
 

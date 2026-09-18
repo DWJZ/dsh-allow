@@ -44,8 +44,7 @@ const pendingInfo = {
   missing: [{ operation: 'delete', path: '/Users/tester/project/build', label: 'delete /Users/tester/project/build' }],
   unknown: [],
   suggestions: [
-    { scope: 'file', label: 'delete · /Users/tester/project/build', path: '/Users/tester/project/build', recursive: false, access: { delete: true } },
-    { scope: 'folder', label: 'delete · /Users/tester/project/**', path: '/Users/tester/project', recursive: true, access: { delete: true } },
+    { label: 'delete · /Users/tester/project/build', path: '/Users/tester/project/build', recursive: false, access: { delete: true } },
   ],
 }
 
@@ -93,6 +92,11 @@ check('an absent interaction is ignored', client.escalationOf(undefined) === nul
 console.log('display helpers')
 check('an over-long display string is ellipsised', client.shorten('x'.repeat(80), 20).length === 20 && client.shorten('x'.repeat(80), 20).endsWith('\u2026'))
 check('a short string is untouched', client.shorten('short', 20) === 'short')
+const labels = (list) => client.alwaysText((key, params) => `${key}(${JSON.stringify(params)})`, list)
+check('one rule names itself', labels([{ label: 'delete · /w/build' }]) === 'alwaysOne({"rule":"delete · /w/build"})', labels([{ label: 'delete · /w/build' }]))
+check('two rules are listed', labels([{ label: 'a' }, { label: 'b' }]) === 'alwaysMany({"rules":"a + b"})', labels([{ label: 'a' }, { label: 'b' }]))
+const many = labels(Array.from({ length: 5 }, (_value, index) => ({ label: `r${String(index)}` })))
+check('a long list is capped with a count', many.includes('+2'), many)
 
 console.log('apply')
 let registration = null
@@ -121,8 +125,8 @@ if (found === null) {
   check('the card names the missing path', html.includes('/Users/tester/project/build'), html)
   check('the card names the command', html.includes('rm -rf build'), html)
   check('the card shows the sandbox mode', html.includes('workspace-write'), html)
-  check('a file grant has its own button', html.includes('alwaysFile'), html)
-  check('a folder grant has its own button', html.includes('alwaysFolder'), html)
+  check('exactly one always-allow button is offered', html.split('alwaysOne').length - 1 === 1, html)
+  check('and no folder button exists', !html.includes('alwaysFolder') && !html.includes('alwaysFile'), html)
 }
 
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)

@@ -148,9 +148,26 @@ check('a rule label names the operations and the scope',
 check('an exact rule label omits the glob',
   fs.describeRule(user('/w/build/out.o', { write: true }, false)) === 'write · /w/build/out.o')
 const suggestions = fs.suggestGrants([{ operation: 'delete', path: join(root, 'build') }], { cwd: root })
-check('a narrow grant and its folder are offered', suggestions.length === 2, JSON.stringify(suggestions))
-check('the narrow grant names the path itself', suggestions[0].path === join(root, 'build') && suggestions[0].scope === 'file')
-check('the folder grant is recursive', suggestions[1].recursive === true && suggestions[1].scope === 'folder')
+check('a path that is not there yet gets one exact grant', suggestions.length === 1
+  && suggestions[0].path === join(root, 'build') && suggestions[0].recursive === false
+  && suggestions[0].access.delete === true, JSON.stringify(suggestions))
+check('and nothing for the folder around it',
+  !suggestions.some(suggestion => suggestion.path === root), JSON.stringify(suggestions))
+const directoryGrant = fs.suggestGrants([{ operation: 'delete', path: realDir }], { cwd: root })
+check('an existing directory is granted recursively',
+  directoryGrant.length === 1 && directoryGrant[0].recursive === true, JSON.stringify(directoryGrant))
+const mergedGrant = fs.suggestGrants([
+  { operation: 'write', path: join(root, 'a.txt') },
+  { operation: 'create', path: join(root, 'a.txt') },
+], { cwd: root })
+check('two capabilities on one path become one rule',
+  mergedGrant.length === 1 && mergedGrant[0].access.write === true && mergedGrant[0].access.create === true,
+  JSON.stringify(mergedGrant))
+const twoPaths = fs.suggestGrants([
+  { operation: 'read', path: join(root, 'a.txt') },
+  { operation: 'create', path: join(root, 'b.txt') },
+], { cwd: root })
+check('two paths get one suggestion each', twoPaths.length === 2, JSON.stringify(twoPaths))
 const unknownSuggestions = fs.suggestGrants([{ operation: 'read' }], { cwd: root })
 check('an unknown path falls back to the working directory',
   unknownSuggestions.length === 1 && unknownSuggestions[0].path === root && unknownSuggestions[0].recursive === true)

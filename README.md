@@ -87,7 +87,7 @@ Everything else — including `$HOME` outside the workspace — is closed until 
 
 ## Homebrew and symlinked executables
 
-Homebrew is deliberately not a granted prefix: `/opt/homebrew` is readable, but `/opt/homebrew/**` is not executable, so every Homebrew binary is authorized one file at a time. `always allow` on `execute /opt/homebrew/bin/gh` stores grants for both the name the user saw and the Cellar binary it resolves to, and neither grant covers a second tool.
+Homebrew is deliberately not a granted prefix: `/opt/homebrew` is readable, but `/opt/homebrew/**` is not executable, so every Homebrew binary is authorized one file at a time. `always allow` on `execute /opt/homebrew/bin/gh` stores that one path, and the stored rule does not cover a second tool. Because a path is resolved against both its spelling and its target, the grant holds when the same name resolves through its symlink again, which is how the binary is normally reached.
 
 ## How effects are read from a command
 
@@ -103,7 +103,7 @@ A computed path for a visible operation is different: `rm -rf "$DIR"` states a d
 
 ## The card
 
-`deny`, `always allow this file`, `always allow this folder` (when the two differ) and `allow once`, plus the real missing capability:
+`deny`, one `always allow` button, and `allow once`, plus the real missing capability:
 
 ```
 Filesystem permission required
@@ -113,7 +113,7 @@ Command:   rm -rf build
 Sandbox:   workspace-write
 ```
 
-`always allow` writes a persistent rule; `allow once` grants the capability to this session only, in memory, for ten minutes, and never touches the rules file.
+`always allow` writes the narrowest rules for exactly what the card names — one per path in the line, recursive only when the path is a directory that already exists — and never widens a grant to the folder around it. Opening a folder on purpose is a deliberate act: `/allow add delete . folder`. `allow once` grants the capability to this session only, in memory, for ten minutes, and never touches the rules file.
 
 ## The macOS backend
 

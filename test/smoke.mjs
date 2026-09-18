@@ -132,8 +132,9 @@ check('the prompt carries the card marker', String(decision.reason).startsWith(h
 check('and names the missing capability', String(decision.reason).includes('delete'), decision.reason)
 const record = pendings.get('s1', 'c1')
 check('a pending record exists for the card', record !== null && record.missing[0]?.operation === 'delete', JSON.stringify(record?.missing))
-check('with a narrow and a folder suggestion', record.suggestions.length === 2
-  && record.suggestions[0].scope === 'file' && record.suggestions[1].scope === 'folder', JSON.stringify(record.suggestions))
+check('with exactly one, narrow suggestion', record.suggestions.length === 1
+  && record.suggestions[0].path === `${WORKSPACE}/build`
+  && record.suggestions[0].recursive === false, JSON.stringify(record.suggestions))
 
 const before = nextCalls
 decision = await gate(exec('ls', { name: 'read' }), next)
@@ -156,21 +157,23 @@ answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending', met
 check('a wrong method is refused', answer.status === 405)
 
 console.log('always allow')
-answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c1', scope: 'file' }))
-check('remembering the file scope succeeds', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
-check('and writes exactly that rule', store.readRules(rulesFile).length === 1
+answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c1' }))
+check('remembering succeeds', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
+check('and writes exactly one rule, the one the button named', store.readRules(rulesFile).length === 1
   && store.readRules(rulesFile)[0].path === `${WORKSPACE}/build`
+  && store.readRules(rulesFile)[0].recursive === false
   && store.readRules(rulesFile)[0].access.delete === true, JSON.stringify(store.readRules(rulesFile)))
 decision = await gate(exec('rm -rf build'), next)
 check('the same command no longer asks', decision.kind === 'allow', JSON.stringify(decision))
 decision = await gate(exec('rm -rf build/nested', { callId: 'c6' }), next)
-check('an exact-file rule leaves the subtree asking', decision.kind === 'ask', JSON.stringify(decision))
-answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c6', scope: 'folder' }))
-check('the folder scope is stored recursively', answer.status === 200
-  && store.readRules(rulesFile).some(rule => rule.path === `${WORKSPACE}/build` && rule.recursive === true),
-  JSON.stringify(store.readRules(rulesFile)))
-decision = await gate(exec('rm -rf build/nested/deeper', { callId: 'c7' }), next)
-check('and then covers the subtree', decision.kind === 'allow', JSON.stringify(decision))
+check('a path beside it still asks: the folder was not opened', decision.kind === 'ask', JSON.stringify(decision))
+answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c6' }))
+check('and its own grant stays narrow too', answer.status === 200
+  && store.readRules(rulesFile).length === 2
+  && store.readRules(rulesFile)[1].path === `${WORKSPACE}/build/nested`
+  && store.readRules(rulesFile)[1].recursive === false, JSON.stringify(store.readRules(rulesFile)))
+decision = await gate(exec('rm -rf build/nested', { callId: 'c7' }), next)
+check('which then covers that path', decision.kind === 'allow', JSON.stringify(decision))
 answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c1' }))
 check('remembering a stale approval is a 404', answer.status === 404)
 answer = await call(rememberHandler, fakeRequest({

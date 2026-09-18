@@ -336,7 +336,6 @@ function pendingPayload(record) {
     })),
     unknown: record.unknown ?? [],
     suggestions: (record.suggestions ?? []).map(suggestion => ({
-      scope: suggestion.scope,
       label: suggestion.label,
       path: suggestion.path,
       recursive: suggestion.recursive === true,
@@ -400,10 +399,9 @@ export function createRememberHandler({ pendings, config, logger }) {
         sendJson(res, 409, { ok: false, error: 'this command cannot be remembered' })
         return
       }
-      const scope = body?.scope === 'folder' ? 'folder' : 'file'
-      const chosen = suggestions.filter(suggestion => suggestion.scope === scope)
-      const picked = chosen.length > 0 ? chosen : suggestions.slice(0, 1)
-      const stored = picked.map(suggestion => addRule(config.rulesFile, {
+      // One button, and exactly the narrowest rules it named: no folder is
+      // opened behind the user's back.
+      const stored = suggestions.map(suggestion => addRule(config.rulesFile, {
         path: suggestion.path,
         recursive: suggestion.recursive,
         access: suggestion.access,

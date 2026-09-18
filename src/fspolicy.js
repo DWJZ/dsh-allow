@@ -327,48 +327,36 @@ export function isDirectory(path) {
 }
 
 /**
- * The grants worth offering for one missing capability: the narrowest one that
- * covers what the user just saw, and the folder around it.
+ * The grants worth offering for the capabilities one line is missing: one per
+ * path, each the narrowest rule that covers what the user just saw — the exact
+ * path, recursive when it names a directory so its contents come with it, or
+ * the working directory when the operation names no path at all. Nothing is
+ * widened to the folder around a path: a grant for `build` is a grant for
+ * `build`, and the card shows exactly what will be stored.
  * @param missing - the missing `{operation, path}` entries.
  * @param options - the effective working directory.
- * @returns one suggestion per scope, narrowest first.
+ * @returns one suggestion per distinct path, in the order the line asks for them.
  */
 export function suggestGrants(missing, { cwd }) {
   const narrow = new Map()
-  const folder = new Map()
+  const remember = (path, recursive, operation) => {
+    const key = `${path}\u0000${String(recursive)}`
+    const current = narrow.get(key) ?? { path, recursive, access: {} }
+    current.access[operation] = true
+    narrow.set(key, current)
+  }
   for (const entry of missing) {
     if (typeof entry.path !== 'string') {
-      // The operation is known but the path is not (a variable, a here-document
-      // program): the narrowest scope the user can name is the working directory.
-      const key = `${cwd}\u0000true`
-      const current = narrow.get(key) ?? { path: cwd, recursive: true, access: {} }
-      current.access[entry.operation] = true
-      narrow.set(key, current)
+      // The operation is known but the path is not (a variable, an archive, a
+      // here-document program): the narrowest scope the user can name is the
+      // working directory itself.
+      remember(cwd, true, entry.operation)
       continue
     }
-    const recurse = isDirectory(entry.path)
-    const key = `${entry.path}\u0000${String(recurse)}`
-    const exact = narrow.get(key) ?? { path: entry.path, recursive: recurse, access: {} }
-    exact.access[entry.operation] = true
-    narrow.set(key, exact)
-    const parent = dirname(entry.path)
-    if (parent !== entry.path) {
-      const folderKey = `${parent}\u0000true`
-      const current = folder.get(folderKey) ?? { path: parent, recursive: true, access: {} }
-      current.access[entry.operation] = true
-      folder.set(folderKey, current)
-    }
+    remember(entry.path, isDirectory(entry.path), entry.operation)
   }
-  const suggestions = []
-  for (const entry of narrow.values()) {
-    suggestions.push({ scope: 'file', ...entry, label: describeRule({ ...entry, source: 'user' }) })
-  }
-  const exact = new Set(suggestions.map(suggestion => `${suggestion.path}\u0000${String(suggestion.recursive)}`))
-  for (const entry of folder.values()) {
-    const key = `${entry.path}\u0000true`
-    if (exact.has(key)) continue
-    suggestions.push({ scope: 'folder', ...entry, label: describeRule({ ...entry, source: 'user' }) })
-  }
-  void cwd
-  return suggestions.slice(0, 2)
+  return [...narrow.values()].map(entry => ({
+    ...entry,
+    label: describeRule({ ...entry, source: 'user' }),
+  }))
 }
