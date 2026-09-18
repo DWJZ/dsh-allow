@@ -32,10 +32,6 @@ const MAX_SCAN_EVENTS = 2000
 /** Longest command prefix a rule may store. */
 const MAX_PREFIX_WORDS = 4
 
-/** Answer labels the plugin owns (built per question so "always" can name the rule). */
-const ALLOW_ONCE = '允许一次'
-const REJECT = '拒绝'
-
 /**
  * Resolve the harness home: `$DSH_HOME` when set, otherwise `~/.dsh`.
  * @param env - environment to read.
@@ -178,42 +174,6 @@ export function escalationOf(args) {
 }
 
 /**
- * Build the three-answer question for one escalation.
- * @param escalation - the requested mode, command, and justification.
- * @param prefix - the command prefix a "always allow" answer would store.
- * @returns the question item and the label that means "remember this".
- */
-export function buildQuestion(escalation, prefix) {
-  const always = `总是允许「${prefix}」开头的命令`
-  return {
-    always,
-    question: {
-      id: 'dsh-allow',
-      header: '权限请求',
-      question: `这条命令请求把沙箱权限提升到 ${escalation.mode}，是否允许？`,
-      detail: `${escalation.command}${escalation.justification === '' ? '' : `\n\n原因：${escalation.justification}`}`,
-      options: [
-        { label: ALLOW_ONCE, description: '只放行这一次，下次仍然询问。' },
-        { label: always, description: `记住这条规则，以后以「${prefix}」开头、请求相同模式的命令直接放行。` },
-        { label: REJECT, description: '拒绝，本次调用不会执行。' },
-      ],
-    },
-  }
-}
-
-/**
- * Pick the single selection of one answer, by question id.
- * @param answer - the answer returned by the question service.
- * @param id - question id to read.
- * @returns the selected label, or an empty string.
- */
-export function selectionOf(answer, id) {
-  const item = answer?.answers?.find((entry) => entry?.id === id)
-  const selected = item?.selected
-  return Array.isArray(selected) && typeof selected[0] === 'string' ? selected[0] : ''
-}
-
-/**
  * Add one rule, replacing an identical rule and keeping ids stable.
  * @param file - absolute rules-file path.
  * @param rule - tool, mode, and prefix to remember.
@@ -247,10 +207,15 @@ function countHit(file, id) {
 
 /**
  * Create the approval listener.
- * @param options - rules file, logger, and the question service lookup.
+ *
+ * A remembered rule settles the ask here, before any UI sees it. Everything
+ * else is handed to the next answerer — the browser approval card — after
+ * recording what the card's "always allow" button would need to store, so the
+ * button can ask this process what the command was.
+ * @param options - rules file, logger, and the pending-escalation store.
  * @returns the waterfall listener.
  */
-export function createApprovalListener({ file, logger, questionsFor }) {
+export function createApprovalListener({ file, logger, pendings }) {
   return async (request, next) => {
     const parsed = escalationOf(toolCallArguments(request?.agent?.session, request?.callId))
     if (parsed === null) return next()
@@ -268,30 +233,72 @@ export function createApprovalListener({ file, logger, questionsFor }) {
       countHit(file, hit.id)
       return 'allowed-once'
     }
-    const questions = questionsFor()
-    if (questions === undefined) return next()
-    const { always, question } = buildQuestion(parsed, prefix)
-    let answer
-    try {
-      answer = await questions.ask({
-        agent: request.agent,
-        questions: [question],
-        ...request.signal === undefined ? {} : { signal: request.signal },
-      })
+    pendings.remember(request, query, parsed.command)
+    return next()
+  }
+}
+
+/** Separator between a session id and a call id in one pending key. */
+const PENDING_SEPARATOR = '\u0000'
+
+/**
+ * The key one approval request's pending entry is stored under.
+ * @param session - the requesting session, when known.
+ * @param callId - the tool call under decision.
+ * @returns the key, or null when either half is unavailable.
+ */
+export function pendingKey(session, callId) {
+  const id = typeof session === 'string' ? session : session?.id
+  if (typeof id !== 'string' || typeof callId !== 'string') return null
+  return `${id}${PENDING_SEPARATOR}${callId}`
+}
+
+/**
+ * Create the store of escalations whose prompt is currently on screen.
+ *
+ * It exists so the card's "always allow" button can ask this process what the
+ * command was: the browser only knows the tool name and call id, and the rule
+ * needs the command prefix.
+ * @param options - entry lifetime, entry cap, and clock.
+ * @returns the pending store.
+ */
+export function createPendingStore({ ttlMs = 15 * 60 * 1000, limit = 100, now = Date.now } = {}) {
+  const entries = new Map()
+  const prune = () => {
+    for (const [key, entry] of entries) {
+      if (now() - entry.at > ttlMs) entries.delete(key)
     }
-    catch (error) {
-      // An aborted ask is a cancellation; anything else (no answerer, a
-      // delegated caller) falls through to the interactive answerer.
-      return error?.code === 'ASK_ABORTED' ? 'cancelled' : next()
-    }
-    const selected = selectionOf(answer, question.id)
-    if (selected === always) {
-      const stored = addRule(file, query)
-      logger.info(`dsh-allow: remembered "${query.tool}" ${prefix} (${query.mode}) as rule ${stored.id}`)
-      return 'allowed-once'
-    }
-    if (selected === ALLOW_ONCE) return 'allowed-once'
-    return 'rejected'
+  }
+  return {
+    /**
+     * Record one escalation that was just handed to the interactive answerer.
+     * @param request - the approval request being delegated.
+     * @param query - tool, mode, and prefix the rule would use.
+     * @param command - the full command shown to the user.
+     */
+    remember(request, query, command) {
+      const key = pendingKey(request?.agent?.session, request?.callId)
+      if (key === null) return
+      prune()
+      entries.set(key, { ...query, command, at: now() })
+      while (entries.size > limit) {
+        const oldest = entries.keys().next().value
+        if (oldest === undefined) break
+        entries.delete(oldest)
+      }
+    },
+    /**
+     * Read one pending escalation.
+     * @param session - the requesting session, or its id.
+     * @param callId - the tool call under decision.
+     * @returns the recorded entry, or null.
+     */
+    get(session, callId) {
+      const key = pendingKey(session, callId)
+      if (key === null) return null
+      prune()
+      return entries.get(key) ?? null
+    },
   }
 }
 
@@ -372,20 +379,158 @@ export function resolveConfig(config, home) {
 }
 
 /**
- * Wire the approval listener and the `/allow` command.
+ * Answer one route with JSON.
+ * @param res - the response to own.
+ * @param statusCode - HTTP status to send.
+ * @param payload - value serialized as the body.
+ */
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload)
+  res.writeHead(statusCode, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
+  })
+  res.end(body)
+}
+
+/** Whether a request arrived from this host on loopback. */
+function isLoopback(req) {
+  const address = req.socket.remoteAddress
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+}
+
+/**
+ * Whether a state-changing request came from this Web host itself.
+ *
+ * Storing a rule is a durable grant, so the peer address and a matching
+ * Origin/Host pair are the whole authorization: a forwarding header means the
+ * loopback peer is a proxy rather than the page.
+ * @param req - incoming request.
+ * @returns true only for a direct same-origin loopback request.
+ */
+function sameOriginLoopback(req) {
+  if (!isLoopback(req)) return false
+  if (req.headers.forwarded !== undefined
+    || req.headers['x-forwarded-for'] !== undefined
+    || req.headers['x-real-ip'] !== undefined) return false
+  const host = req.headers.host
+  const origin = req.headers.origin
+  if (typeof host !== 'string' || typeof origin !== 'string') return false
+  try {
+    const parsed = new URL(origin)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host === host
+  }
+  catch {
+    // URL() rejects a malformed Origin; an unparseable authority authorizes nothing.
+    return false
+  }
+}
+
+/**
+ * Read one JSON request body.
+ * @param req - incoming request.
+ * @param limit - largest accepted body in bytes.
+ * @returns the parsed body, or an empty object for an empty body.
+ */
+async function readJsonBody(req, limit = 64 * 1024) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > limit) throw new Error('request body too large')
+    chunks.push(chunk)
+  }
+  if (chunks.length === 0) return {}
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+}
+
+/**
+ * The card's read route: what one pending escalation would remember.
+ * @param options - the pending-escalation store.
+ * @returns a Web-host route handler.
+ */
+export function createPendingHandler({ pendings }) {
+  return (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { allow: 'GET, HEAD' })
+      res.end()
+      return
+    }
+    if (!isLoopback(req)) {
+      sendJson(res, 403, { ok: false, error: 'loopback only' })
+      return
+    }
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    const entry = pendings.get(url.searchParams.get('sessionId'), url.searchParams.get('callId'))
+    if (entry === null) {
+      sendJson(res, 404, { ok: false })
+      return
+    }
+    sendJson(res, 200, { ok: true, tool: entry.tool, mode: entry.mode, prefix: entry.prefix, command: entry.command })
+  }
+}
+
+/**
+ * The card's "always allow" route: store the rule, then let the card grant the
+ * call. A second identical click finds the rule already present.
+ * @param options - pending-escalation store, rules file, and logger.
+ * @returns a Web-host route handler.
+ */
+export function createRememberHandler({ pendings, file, logger }) {
+  return async (req, res) => {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { allow: 'POST' })
+      res.end()
+      return
+    }
+    if (!sameOriginLoopback(req)) {
+      sendJson(res, 403, { ok: false, error: 'same-origin loopback only' })
+      return
+    }
+    try {
+      const body = await readJsonBody(req)
+      const entry = pendings.get(body?.sessionId, body?.callId)
+      if (entry === null) {
+        sendJson(res, 404, { ok: false, error: 'this approval is no longer pending' })
+        return
+      }
+      const stored = addRule(file, { tool: entry.tool, mode: entry.mode, prefix: entry.prefix })
+      logger.info(`dsh-allow: remembered "${stored.tool}" ${stored.prefix} (${stored.mode}) as rule ${stored.id}`)
+      sendJson(res, 200, { ok: true, tool: stored.tool, mode: stored.mode, prefix: stored.prefix })
+    }
+    catch (error) {
+      sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+}
+
+/**
+ * Wire the approval listener, the card's two routes, and the `/allow` command.
  * @param ctx - Cordis context of this plugin's fiber.
  * @param config - validated plugin configuration from cordis.yml.
  */
 export function apply(ctx, config) {
   const { file } = resolveConfig(config, resolveHome())
-  const listener = createApprovalListener({
-    file,
-    logger: ctx.logger,
-    questionsFor: () => ctx.get('userQuestions'),
-  })
+  const pendings = createPendingStore()
+  const listener = createApprovalListener({ file, logger: ctx.logger, pendings })
   // Ahead of the interactive answerer: a remembered rule must settle the ask
   // before the browser is troubled with it.
   ctx.on('approval/request', (request, next) => listener(request, next), { prepend: true })
+  const pendingHandler = createPendingHandler({ pendings })
+  const rememberHandler = createRememberHandler({ pendings, file, logger: ctx.logger })
+  ctx.inject(['webServer'], (webCtx) => {
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: '/dsh-allow/pending',
+      handler: pendingHandler,
+    }), 'dsh-allow: pending route')
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: '/dsh-allow/remember',
+      handler: rememberHandler,
+    }), 'dsh-allow: remember route')
+  })
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.effect(() => commandCtx.commands.register({
       name: 'allow',

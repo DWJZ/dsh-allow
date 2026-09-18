@@ -1,4 +1,4 @@
-# dsh-allow bundle 层:一个宿主插件行(只有宿主半,弹窗走 user-questions 通道)。
+# dsh-allow bundle 层:一个宿主插件行(浏览器半由 package.json 的 dsh.client 声明注入)。
 # 安装: dsh plugin --profile web add link:<本目录>
 # 可选配置:
 #   - id: dsh-allow

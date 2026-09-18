@@ -1,27 +1,25 @@
 ---
-description: "dsh-allow: remembers sandbox-escalation approvals so the same command prefix stops asking."
+description: "dsh-allow: the approval card gains an always-allow button, and remembered command prefixes stop asking."
 ---
 
 # dsh-allow
 
 English | [中文](README.zh.md)
 
-Ask once, allow from then on. The permission dialog gains a third answer — **总是允许「…」开头的命令** — and the rules it writes live in your harness home, managed with `/allow`.
+The permission card grows a third button — **总是允许「pnpm dsh plugin」开头的命令** — and the rules it writes live in your harness home, managed with `/allow`. Click it and the command continues; the same command prefix never asks again.
 
 ## What it does
 
-DSH keeps a file sandbox: a command that writes outside the session workspace is denied, and the model may retry it with `sandbox_permissions`, which raises an approval prompt. That prompt is fine the first time and tedious the tenth, because the same handful of operations keep coming back (`pnpm dsh plugin …`, `brew install …`, `git push …`).
+DSH keeps a file sandbox: a command that writes outside the session workspace is denied, and the model may retry it with `sandbox_permissions`, which raises an approval card. That card is fine the first time and tedious the tenth, because the same handful of operations keep coming back (`pnpm dsh plugin …`, `brew install …`, `gh repo view …`).
 
-This plugin listens on the `approval/request` waterfall *ahead of* the built-in answerer:
-
-- **A remembered rule** allows the call silently — no dialog at all.
-- **No rule** asks with three answers:
-  - `允许一次` — allow this call only.
-  - `总是允许「pnpm dsh plugin」开头的命令` — store a rule, then allow.
+- **A remembered rule** settles the escalation in the host before any UI sees it — no card, no click.
+- **No rule** shows the approval card with three buttons:
   - `拒绝` — deny the call.
-- **Every other approval request** (hooks, file edits, anything that is not a sandbox escalation) is delegated to the built-in answerer unchanged.
+  - `总是允许「gh repo view」开头的命令` — store that rule, then allow this call.
+  - `允许一次` — allow this call only.
+- **Every other approval request** (hooks, `write`/`edit` path escalations, anything that is not a sandbox escalation) keeps the built-in card untouched.
 
-A rule is scoped by **tool + requested sandbox mode + the command's leading words**, so allowing `pnpm dsh plugin` never allows `rm`, and a rule recorded for `danger-full-access` does not silently cover a wider request. The prefix is derived by dropping a leading `cd … &&`, dropping `VAR=value` assignments, and keeping words until the first flag, path, or shell operator — and the dialog shows the exact prefix before you agree to it.
+A rule is scoped by **tool + requested sandbox mode + the command's leading words**, so allowing `pnpm dsh plugin` never allows `rm`, and a rule recorded for `danger-full-access` does not cover a different request. The prefix drops a leading `cd … &&`, drops `VAR=value`, reduces the program to its basename (`/opt/homebrew/bin/gh` → `gh`), and then keeps words until the first flag, path, or shell operator. The button names the exact prefix before you agree to it.
 
 ## Install
 
@@ -55,20 +53,30 @@ dsh plugin --profile web add link:/path/to/dsh-allow
 }
 ```
 
-Unreadable or hand-edited files degrade to "no rules" rather than blocking approvals; a rule that no longer exists simply means the dialog asks again.
+Unreadable or hand-edited files degrade to "no rules" rather than blocking approvals; deleting a rule just means the card asks again.
+
+## How the card is built
+
+The built-in approval card's action row is fixed (`拒绝` / `允许一次`), and its only slot is the command detail — a plugin cannot add a button to that component. This plugin therefore registers its own `conversation.composer` chain entry at a lower priority than the built-in one, and renders a card with the same markup and the same CSS declarations, plus the extra button. It matches only sandbox escalations, so every other approval still renders through the built-in card.
+
+The two host routes behind it:
+
+- `GET /dsh-allow/pending?sessionId=…&callId=…` — what this approval would remember (prefix + command), so the button can name it. Loopback only.
+- `POST /dsh-allow/remember` — store the rule. Same-origin loopback only.
 
 ## Test
 
 ```sh
-node test/smoke.mjs
+npm test        # host suite + browser suite
 ```
 
-Covers prefix derivation, the escalation shape, rule storage and matching, all three dialog answers, silent allowance on a stored rule, hit counting, delegation for non-escalation and unanswerable requests, and the `/allow` grammar.
+The host suite covers prefix derivation, the escalation shape, rule storage and matching, the pending store's identity and expiry rules, both routes (including their refusals), and the `/allow` grammar. The browser suite loads the client bundle, checks the chain registration and its escalation predicate, and server-renders the card. Set `DSH_CHECKOUT=<dsh checkout>` for the render assertion.
 
 ## Limits
 
-- Only **bash/pwsh command** escalations are remembered; the `write`/`edit` tools' path escalations still use the built-in prompt.
-- The plugin reads the escalation out of the logged tool call (its `sandbox_permissions` and `command` arguments), so it needs the call id the approval request carries — a request without one is delegated.
+- Only **bash/pwsh command** escalations get the third button; `write`/`edit` path escalations keep the built-in card.
+- The card is this plugin's own render, not the built-in component, so a future change to the harness's card markup is not inherited automatically.
+- It reads the escalation out of the logged tool call, so an approval request without a call id is left to the built-in card.
 
 ## License
 
