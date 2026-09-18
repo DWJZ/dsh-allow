@@ -36,7 +36,8 @@ window.__ModuleLoader__.load({
 				".dsha_body{display:flex;flex-direction:column;gap:6px;box-sizing:border-box;max-height:var(--dsh-composer-text-max-height);overflow-y:auto;padding:12px 16px 0}",
 				".dsha_headline{color:var(--dsw-alias-label-primary);font-size:15px;font-weight:500;line-height:24px}",
 				".dsha_command{color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);font-size:13px;line-height:20px;word-break:break-all}",
-				".dsha_actions{display:flex;justify-content:flex-end;gap:8px;padding:14px 16px}",
+				".dsha_actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding:14px 16px;flex-wrap:nowrap}",
+				".dsha_ellipsis{display:inline-block;max-width:42ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}",
 				".dsha_notice{padding:0 16px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-state-error-primary)}",
 				".dsha_hint{padding:0 16px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
 				".dsha_meta{display:flex;flex-wrap:wrap;gap:4px 16px;padding:6px 16px 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}"
@@ -102,6 +103,27 @@ window.__ModuleLoader__.load({
 		 * @param prefix - 宿主推导出的命令前缀。
 		 * @returns 按钮文字。
 		 */
+		/**
+		 * Shorten one display string, keeping the head and marking the cut.
+		 * @param text - full text.
+		 * @param max - longest accepted length.
+		 * @returns the text, truncated with an ellipsis when needed.
+		 */
+		function shorten(text, max) {
+			return text.length <= max ? text : text.slice(0, max - 1) + "\u2026";
+		}
+
+		/**
+		 * Name the rules one button would store, capped so a long list stays one line.
+		 * @param t - namespace translator.
+		 * @param labels - rule descriptions.
+		 * @returns the button label.
+		 */
+		function alwaysLabelText(t, labels) {
+			if (labels.length <= 3) return alwaysLabel(t, labels);
+			return t("alwaysMany", { rules: labels.slice(0, 3).join(" + ") + " +" + String(labels.length - 3) + "\u2026" });
+		}
+
 		function alwaysLabel(t, labels) {
 			if (labels.length === 1) return t("alwaysOne", { rule: labels[0] });
 			return t("alwaysMany", { rules: labels.join(" + ") });
@@ -189,7 +211,9 @@ window.__ModuleLoader__.load({
 					disabled: disabled,
 					title: info.command,
 					onClick: rememberThenAllow
-				}, busy ? t("remembering") : alwaysLabel(t, labels)));
+				}, busy
+					? t("remembering")
+					: React.createElement("span", { className: "dsha_ellipsis" }, shorten(alwaysLabelText(t, labels), 56))));
 			}
 			buttons.push(React.createElement(primitives.Button, {
 				key: "once",
@@ -244,6 +268,8 @@ window.__ModuleLoader__.load({
 		// 供离线冒烟测试使用。
 		exports.escalationOf = escalationOf;
 		exports.alwaysLabel = alwaysLabel;
+		exports.alwaysLabelText = alwaysLabelText;
+		exports.shorten = shorten;
 		exports.AllowPanel = AllowPanel;
 		//#endregion
 

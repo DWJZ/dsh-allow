@@ -66,6 +66,12 @@ check('an absent interaction is ignored', client.escalationOf(undefined) === nul
 console.log('always label')
 check('one rule names itself', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, ['gh repo view']) === 'alwaysOne:{"rule":"gh repo view"}')
 check('several rules are listed', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, ['cp', 'echo']) === 'alwaysMany:{"rules":"cp + echo"}')
+const manyLabels = ['cd', 'npm', 'test', 'grep', 'head', 'git add', 'git log', 'git push', 'tail', 'cat', 'echo']
+const manyText = client.alwaysLabelText((key, params) => `${key}:${JSON.stringify(params)}`, manyLabels)
+check('a long rule list is capped with a count', manyText.includes('+8'), manyText)
+check('a short list is unchanged', client.alwaysLabelText((key, params) => key + JSON.stringify(params), ['cp']) === 'alwaysOne{"rule":"cp"}')
+check('an over-long display string is ellipsised', client.shorten('x'.repeat(80), 20).length === 20 && client.shorten('x'.repeat(80), 20).endsWith('\u2026'))
+check('a short string is untouched', client.shorten('short', 20) === 'short')
 
 console.log('apply')
 let registration = null
