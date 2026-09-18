@@ -1,7 +1,7 @@
 /**
  * dsh-allow browser smoke test — loads the client bundle outside a browser and
  * checks the chain registration it installs, plus a server-side render of the
- * card.
+ * card with a pending record already loaded.
  *
  * Usage: `node test/client.smoke.mjs`.
  * The render assertion needs React, resolved from a DSH checkout; set
@@ -32,8 +32,35 @@ new Function(readFileSync(join(PLUGIN, 'client/client.js'), 'utf8'))()
 
 check('the bundle registers one module', captured !== null && captured.id === 'dsh-allow', String(captured?.id))
 
+/** The pending record a card renders; the host half sends exactly these fields. */
+const pendingInfo = {
+  ok: true,
+  rememberable: true,
+  command: 'rm -rf build',
+  cwd: '/Users/tester/project',
+  reason: 'filesystem permission required: delete(/Users/tester/project/build)',
+  mode: 'workspace-write',
+  decision: 'prompt',
+  missing: [{ operation: 'delete', path: '/Users/tester/project/build', label: 'delete /Users/tester/project/build' }],
+  unknown: [],
+  suggestions: [
+    { scope: 'file', label: 'delete · /Users/tester/project/build', path: '/Users/tester/project/build', recursive: false, access: { delete: true } },
+    { scope: 'folder', label: 'delete · /Users/tester/project/**', path: '/Users/tester/project', recursive: true, access: { delete: true } },
+  ],
+}
+
+let hooks = 0
 const stubRequire = (specifier) => {
-  if (specifier === 'react') return found === null ? { createElement: () => null, useState: () => [], useEffect: () => {} } : found.react
+  if (specifier === 'react') {
+    if (found === null) return { createElement: () => null, useState: () => [null, () => {}], useEffect: () => {} }
+    return {
+      ...found.react,
+      // The first hook of the panel is the fetched record; rendering it
+      // directly is what a browser shows once `/dsh-allow/pending` answered.
+      useState: (initial) => { hooks += 1; return [hooks === 1 ? pendingInfo : initial, () => {}] },
+      useEffect: () => {},
+    }
+  }
   if (specifier === '@deepseek-ai/dsh-client-ui-primitives') {
     return {
       Button: ({ children, ...rest }) => (found === null ? null : found.react.createElement('button', rest, children)),
@@ -46,7 +73,7 @@ const client = captured.factory(stubRequire)
 check('the factory exports apply', typeof client.apply === 'function')
 check('the factory exports inject', Array.isArray(client.inject) && client.inject.includes('slots'))
 
-console.log('escalation predicate')
+console.log('approval predicate')
 const pending = {
   kind: 'approval',
   key: 'approval:1',
@@ -58,19 +85,12 @@ const pending = {
 }
 check('a sandbox escalation is taken over', client.escalationOf(pending) === pending)
 check('another approval is left to the built-in card', client.escalationOf({ ...pending, reason: 'hook requires approval' }) === null)
-const policyPrompt = { ...pending, reason: 'dsh-allow: rm deletes files (rm -rf build)' }
+const policyPrompt = { ...pending, reason: 'dsh-allow: filesystem permission required: delete(/w/build)' }
 check('a policy prompt is claimed by this card', client.escalationOf(policyPrompt) === policyPrompt)
 check('a non-approval interaction is ignored', client.escalationOf({ kind: 'question' }) === null)
 check('an absent interaction is ignored', client.escalationOf(undefined) === null)
 
-console.log('always label')
-check('a pinned line says so', client.alwaysLabelText((key) => key, ['cd', 'npm test'], true) === 'alwaysExact')
-check('one rule names itself', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, ['gh repo view']) === 'alwaysOne:{"rule":"gh repo view"}')
-check('several rules are listed', client.alwaysLabel((key, params) => `${key}:${JSON.stringify(params)}`, ['cp', 'echo']) === 'alwaysMany:{"rules":"cp + echo"}')
-const manyLabels = ['cd', 'npm', 'test', 'grep', 'head', 'git add', 'git log', 'git push', 'tail', 'cat', 'echo']
-const manyText = client.alwaysLabelText((key, params) => `${key}:${JSON.stringify(params)}`, manyLabels)
-check('a long rule list is capped with a count', manyText.includes('+8'), manyText)
-check('a short list is unchanged', client.alwaysLabelText((key, params) => key + JSON.stringify(params), ['cp']) === 'alwaysOne{"rule":"cp"}')
+console.log('display helpers')
 check('an over-long display string is ellipsised', client.shorten('x'.repeat(80), 20).length === 20 && client.shorten('x'.repeat(80), 20).endsWith('\u2026'))
 check('a short string is untouched', client.shorten('short', 20) === 'short')
 
@@ -97,7 +117,12 @@ if (found === null) {
   check('the card renders the approval chrome', html.includes('dsha_card') && html.includes('dsha_strip'), html.slice(0, 200))
   check('the card renders 拒绝 and 允许一次', html.includes('reject') && html.includes('allowOnce'), html)
   check('the card shows the reason', html.includes('escalate sandbox to danger-full-access'), html)
-  check('without the pending lookup the third button is absent', !html.includes('alwaysOne') && !html.includes('alwaysMany'), html)
+  check('the card names the missing operation', html.includes('>delete<'), html)
+  check('the card names the missing path', html.includes('/Users/tester/project/build'), html)
+  check('the card names the command', html.includes('rm -rf build'), html)
+  check('the card shows the sandbox mode', html.includes('workspace-write'), html)
+  check('a file grant has its own button', html.includes('alwaysFile'), html)
+  check('a folder grant has its own button', html.includes('alwaysFolder'), html)
 }
 
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)

@@ -1,7 +1,7 @@
 {
   "name": "dsh-allow",
   "version": "0.1.0",
-  "description": "DeepSeek Harness 权限记忆插件：把某类命令加进允许列表，之后同类命令不再询问。 / Remember sandbox-escalation approvals so the same commands stop asking.",
+  "description": "DeepSeek Harness 文件系统权限插件：按 read/write/create/delete/execute 授权路径，而不是按命令名。 / Filesystem permissions for DSH shell calls, granted per path and capability instead of per command name.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -14,11 +14,15 @@
     "harness",
     "dsh-plugin",
     "approval",
-    "permissions"
+    "permissions",
+    "filesystem",
+    "seatbelt"
   ],
   "main": "src/index.js",
   "scripts": {
-    "test": "node test/policy.spec.mjs && node test/smoke.mjs && node test/client.smoke.mjs"
+    "test": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/decide.spec.mjs && node test/smoke.mjs && node test/client.smoke.mjs && node test/sandbox.integration.mjs",
+    "test:unit": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/decide.spec.mjs",
+    "test:sandbox": "node test/sandbox.integration.mjs"
   },
   "exports": {
     ".": "./src/index.js",

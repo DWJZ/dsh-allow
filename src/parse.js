@@ -206,16 +206,24 @@ export function parseCommandLine(source, { home = '/', depth = 0 } = {}) {
     }
     if (node.type === 'test_command' || node.type === 'arithmetic') return
     if (node.type === 'function_definition') {
-      commands.push({
-        argv: [node.text],
-        dynamicArgv: [true],
-        env: [],
-        redirections: [],
-        background,
-        source: node.text,
-        opaque: true,
-        opaqueReason: 'function definition',
-      })
+      // A function body is not run by the definition, but the only caller is a
+      // name this parser cannot follow: reading the body's commands is what
+      // makes `f() { rm -rf build; }; f` the delete it performs.
+      const body = node.childForFieldName?.('body')
+      const before = commands.length
+      walk(body ?? node, background)
+      if (commands.length === before) {
+        commands.push({
+          argv: [node.text],
+          dynamicArgv: [true],
+          env: [],
+          redirections: [],
+          background,
+          source: node.text,
+          opaque: true,
+          opaqueReason: 'empty function definition',
+        })
+      }
       return
     }
     if (!STATEMENT_CONTAINERS.has(node.type)) {

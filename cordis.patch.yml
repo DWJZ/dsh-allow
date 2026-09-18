@@ -6,7 +6,12 @@
 #       rulesFile: /path/to/rules.json        # 默认 $DSH_HOME/dsh-allow.json
 #       auditFile: /path/to/audit.ndjson      # 默认 $DSH_HOME/dsh-allow-audit.ndjson
 #       audit: true                           # 关掉审计写 false
-#       defaultDecision: allow                # 或 prompt: 全量把关
+#       sessionGrantTtlMs: 600000             # 「允许一次」的有效期(毫秒)
+#       autoApproveEscalations: true          # 已授权的命令自己回答沙箱提权询问
+#       grants:                               # 部署级授权,字段与持久规则一致
+#         - path: /opt/homebrew
+#           recursive: true
+#           access: { read: true, execute: true }
 - insert:
     - id: dsh-allow
       name: dsh-allow

@@ -1,11 +1,10 @@
 /**
- * Host wiring suite: the pre-execute gate, the card routes, the rule store, the
- * audit log, and `/allow`. No host, no network.
+ * Host wiring suite: the pre-execute gate, the approval listener, the card
+ * routes, the rule store, the audit log, and `/allow`. No host, no network.
  *
  * Usage: `node test/smoke.mjs`.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -13,13 +12,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const PLUGIN = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const host = await import(pathToFileURL(join(PLUGIN, 'src/index.js')).href)
 const store = await import(pathToFileURL(join(PLUGIN, 'src/store.js')).href)
+const fspolicy = await import(pathToFileURL(join(PLUGIN, 'src/fspolicy.js')).href)
 
-const root = mkdtempSync(join(tmpdir(), 'dsh-allow-'))
+const root = mkdtempSync(join(tmpdir(), 'dsh-allow-smoke-'))
 const rulesFile = join(root, 'rules.json')
 const auditFile = join(root, 'audit.ndjson')
-const config = { rulesFile, auditFile, audit: true, defaultDecision: 'allow' }
 const HOME = '/Users/tester'
-const CWD = '/Users/tester/project'
+const WORKSPACE = `${HOME}/project`
+const CWD = WORKSPACE
+const config = {
+  ...store.resolveConfig({ rulesFile, auditFile, audit: true }, root),
+  harnessHome: root,
+}
 
 let failures = 0
 const check = (name, condition, detail = '') => {
@@ -30,15 +34,24 @@ const check = (name, condition, detail = '') => {
   }
 }
 
-const require = createRequire(import.meta.url)
 const logger = { info: () => {}, warn: () => {}, error: () => {} }
-const session = { id: 's1', header: { cwd: CWD } }
-const exec = (command, { name = 'bash', callId = 'c1', workdir } = {}) => ({
+const session = { id: 's1', seq: 0, header: { cwd: CWD }, eventAt: () => undefined }
+const otherSession = { id: 's2', seq: 0, header: { cwd: CWD }, eventAt: () => undefined }
+const exec = (command, { name = 'bash', callId = 'c1', workdir, agent = { session } } = {}) => ({
   name,
   callId,
   arguments: { command, ...(workdir === undefined ? {} : { workdir }) },
-  agent: { session },
+  agent,
 })
+const ctx = { get: name => (name === 'sandboxPolicy' ? { resolve: () => ({ mode: 'workspace-write', workspaceRoot: WORKSPACE }) } : undefined) }
+const pendings = store.createPendingStore()
+const grants = store.createGrantStore()
+const engine = host.createEngine({ config, home: HOME, grants, pendings, ctx })
+const gate = host.createGate({ engine, pendings, logger })
+const approval = host.createApprovalListener({ engine, pendings, logger })
+
+let nextCalls = 0
+const next = () => { nextCalls += 1; return Promise.resolve({ kind: 'allow' }) }
 
 /** A Web route request. */
 function fakeRequest({ method = 'GET', url = '/', headers = {}, body, remoteAddress = '127.0.0.1' } = {}) {
@@ -63,244 +76,205 @@ function fakeResponse() {
   }
 }
 
+/** Drive one route handler and return its parsed answer. */
+async function call(handler, request) {
+  const response = fakeResponse()
+  await handler(request, response)
+  return { status: response.statusCode, json: response.body === '' ? null : JSON.parse(response.body) }
+}
+
+const post = (path, body) => fakeRequest({
+  method: 'POST',
+  url: path,
+  headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
+  body: JSON.stringify(body),
+})
+const pendingHandler = host.createPendingHandler({ pendings })
+const rememberHandler = host.createRememberHandler({ pendings, config, logger })
+const onceHandler = host.createOnceHandler({ pendings, grants, logger })
+
 console.log('rule store')
 rmSync(rulesFile, { force: true })
 check('a missing file reads as no rules', store.readRules(rulesFile).length === 0)
-const rule = store.addRule(rulesFile, { decision: 'allow', executable: 'git', argvPrefix: ['status'] })
-check('a rule is stored with an id and a prefix', rule.id !== undefined && rule.argvPrefix[0] === 'status', JSON.stringify(rule))
-store.addRule(rulesFile, { decision: 'allow', executable: 'git', argvPrefix: ['status'] })
+const stored = store.addRule(rulesFile, { path: `${WORKSPACE}/build`, recursive: true, access: { delete: true } })
+check('a rule is stored with a canonical path', stored.path === `${WORKSPACE}/build`, JSON.stringify(stored))
+store.addRule(rulesFile, { path: `${WORKSPACE}/build`, recursive: true, access: { delete: true } })
 check('an identical rule is not duplicated', store.readRules(rulesFile).length === 1)
-check('removing by position works', store.removeRule(rulesFile, 1)?.executable === 'git' && store.readRules(rulesFile).length === 0)
+check('removing by position works', store.removeRule(rulesFile, 1)?.access.delete === true && store.readRules(rulesFile).length === 0)
 check('an out-of-range removal is refused', store.removeRule(rulesFile, 5) === null)
-store.addRule(rulesFile, { decision: 'allow', executable: 'touch', argvPrefix: [] })
+const refuses = (fields) => {
+  try {
+    store.addRule(rulesFile, fields)
+    return false
+  }
+  catch {
+    return true
+  }
+}
+check('a rule that grants nothing is refused', refuses({ path: '/w', access: {} }))
+check('a write-everything rule is refused', refuses({ path: '/', recursive: true, access: { write: true } }))
+store.addRule(rulesFile, { path: `${WORKSPACE}/build`, access: { write: true } })
 check('clear empties the file', store.clearRules(rulesFile) === 1 && store.readRules(rulesFile).length === 0)
-
-console.log('pending store')
-const clock = { now: 1000 }
-const pendings = store.createPendingStore({ ttlMs: 100, now: () => clock.now })
-pendings.remember('s1', 'c1', { command: 'rm x', suggestion: { decision: 'allow', executable: 'rm', argvPrefix: [] } })
-check('a pending record is readable', pendings.get('s1', 'c1')?.command === 'rm x')
-check('another call id is not', pendings.get('s1', 'c2') === null)
-clock.now += 500
-check('an expired record is pruned', pendings.get('s1', 'c1') === null)
+writeFileSync(rulesFile, `${JSON.stringify({ version: 2, rules: [{ id: 'old', decision: 'allow', executable: 'rm', argvPrefix: [] }] })}\n`)
+check('an older rule model reads as no rules', store.readRules(rulesFile).length === 0)
+store.addRule(rulesFile, { path: `${WORKSPACE}/build`, access: { delete: true } })
+check('its file is kept as a backup', existsSync(`${rulesFile}.v2.bak`), `${rulesFile}.v2.bak`)
+check('and the new rules are readable', store.readRules(rulesFile).length === 1)
+rmSync(rulesFile, { force: true })
 
 console.log('pre-execute gate')
-rmSync(rulesFile, { force: true })
-rmSync(auditFile, { force: true })
-const gatePendings = store.createPendingStore()
-const gate = host.createGate({ config, home: HOME, logger, pendings: gatePendings })
-let nextCalls = 0
-const next = () => { nextCalls += 1; return Promise.resolve({ kind: 'allow' }) }
-
 let decision = await gate(exec('ls -la'), next)
-check('an unremarkable command continues to the sandbox', decision.kind === 'allow' && nextCalls === 1, JSON.stringify(decision))
+check('a granted command continues to the sandbox', decision.kind === 'allow' && nextCalls === 1, JSON.stringify(decision))
 
-decision = await gate(exec('git reset --hard'), next)
-check('a destructive command asks for approval', decision.kind === 'ask', JSON.stringify(decision))
-check('and the prompt carries the card marker', String(decision.reason).startsWith(host.POLICY_REASON_PREFIX), decision.reason)
-check('and the reason names the command', String(decision.reason).includes('git reset --hard'), decision.reason)
-check('and a pending record exists for the card', gatePendings.get('s1', 'c1')?.suggestions?.[0]?.executable === 'git', JSON.stringify(gatePendings.get('s1', 'c1')))
-check('the suggested rule keeps the subcommand', gatePendings.get('s1', 'c1')?.label === 'git reset', String(gatePendings.get('s1', 'c1')?.label))
-
-decision = await gate(exec('rm -rf /'), next)
-check('a catastrophic command asks instead of denying', decision.kind === 'ask', JSON.stringify(decision))
-check('and the card is offered a concrete rule', String(decision.reason).includes('rm -rf /'), decision.reason)
+decision = await gate(exec('rm -rf build'), next)
+check('an ungranted delete asks', decision.kind === 'ask', JSON.stringify(decision))
+check('the prompt carries the card marker', String(decision.reason).startsWith(host.POLICY_REASON_PREFIX), decision.reason)
+check('and names the missing capability', String(decision.reason).includes('delete'), decision.reason)
+const record = pendings.get('s1', 'c1')
+check('a pending record exists for the card', record !== null && record.missing[0]?.operation === 'delete', JSON.stringify(record?.missing))
+check('with a narrow and a folder suggestion', record.suggestions.length === 2
+  && record.suggestions[0].scope === 'file' && record.suggestions[1].scope === 'folder', JSON.stringify(record.suggestions))
 
 const before = nextCalls
 decision = await gate(exec('ls', { name: 'read' }), next)
 check('a non-shell tool is untouched', decision.kind === 'allow' && nextCalls === before + 1, JSON.stringify(decision))
 
-store.addRule(rulesFile, { decision: 'allow', executable: 'git', argvPrefix: ['status'] })
-decision = await gate(exec('git status'), next)
-check('a stored rule allows the covered command', decision.kind === 'allow', JSON.stringify(decision))
-check('and counts the hit', store.readRules(rulesFile)[0]?.hits === 1, JSON.stringify(store.readRules(rulesFile)[0]))
-
-decision = await gate(exec('touch x && rm -rf /'), next)
-check('a chained catastrophic command still asks', decision.kind === 'ask', JSON.stringify(decision))
-
-console.log('audit log')
-const lines = readFileSync(auditFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-check('every decision is logged', lines.length >= 5, String(lines.length))
-check('the log records the decision and the parsed commands', lines.some(line => line.decision === 'prompt' && Array.isArray(line.commands)), JSON.stringify(lines.at(-1)))
-const secretGate = host.createGate({
-  config: { ...config, auditFile: join(root, 'secret.ndjson') },
-  home: HOME,
-  logger,
-  pendings: store.createPendingStore(),
-})
-await secretGate(exec('curl -H "Authorization: Bearer abc123" https://x'), next)
-const secretLine = readFileSync(join(root, 'secret.ndjson'), 'utf8')
-check('credential-shaped text is redacted', secretLine.includes('[redacted]') && !secretLine.includes('abc123'), secretLine.slice(0, 200))
+decision = await gate(exec('rm -rf /System/Library/x', { callId: 'cf' }), next)
+check('a platform-protected path is denied outright', decision.kind === 'deny', JSON.stringify(decision))
 
 console.log('card routes')
-const routePendings = store.createPendingStore()
-routePendings.remember('s1', 'c1', {
-  command: 'rm -rf build',
-  cwd: CWD,
-  decision: 'prompt',
-  reason: 'rm deletes files',
-  risk: 'destructive',
-  analyzable: true,
-  label: 'rm',
-  labels: ['rm'],
-  suggestions: [{ decision: 'allow', executable: 'rm', argvPrefix: [] }],
-  triggers: ['rm -rf build'],
-})
-const pendingHandler = host.createPendingHandler({ pendings: routePendings })
-let response = fakeResponse()
-pendingHandler(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1' }), response)
-const payload = JSON.parse(response.body)
-check('the card learns the label, risk, and cwd', payload.label === 'rm' && payload.risk === 'destructive' && payload.cwd === CWD, response.body)
-response = fakeResponse()
-pendingHandler(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=none' }), response)
-check('an unknown approval is a 404', response.statusCode === 404, String(response.statusCode))
-response = fakeResponse()
-pendingHandler(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1', remoteAddress: '10.0.0.5' }), response)
-check('the route is loopback only', response.statusCode === 403, String(response.statusCode))
-response = fakeResponse()
-pendingHandler(fakeRequest({ url: '/dsh-allow/pending', method: 'POST' }), response)
-check('the route refuses POST', response.statusCode === 405, String(response.statusCode))
+let answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1' }))
+check('the pending route describes the decision', answer.status === 200 && answer.json.rememberable === true, JSON.stringify(answer.json))
+check('and lists the operation and the path', answer.json.missing[0].operation === 'delete'
+  && answer.json.missing[0].path === `${WORKSPACE}/build`, JSON.stringify(answer.json.missing))
+check('and the sandbox mode', answer.json.mode === 'workspace-write', JSON.stringify(answer.json.mode))
+answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=nope' }))
+check('an unknown pending is a 404', answer.status === 404)
+answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1', remoteAddress: '10.0.0.9' }))
+check('a non-loopback read is refused', answer.status === 403)
+answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending', method: 'POST' }))
+check('a wrong method is refused', answer.status === 405)
 
-{
-  const rememberFile = join(root, 'remember.json')
-  const rememberPendings = store.createPendingStore()
-  rememberPendings.remember('s1', 'c1', {
-    command: 'git reset --hard', cwd: CWD, decision: 'prompt', reason: 'discards changes', risk: 'destructive',
-    analyzable: true, label: 'git reset', labels: ['git reset'],
-    suggestions: [{ decision: 'allow', executable: 'git', argvPrefix: ['reset'] }], triggers: [],
-  })
-  const rememberHandler = host.createRememberHandler({ pendings: rememberPendings, config: { ...config, rulesFile: rememberFile }, logger })
-  let res = fakeResponse()
-  await rememberHandler(fakeRequest({
-    method: 'POST',
-    url: '/dsh-allow/remember',
-    headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId: 's1', callId: 'c1' }),
-  }), res)
-  check('always-allow stores the suggested rule', res.statusCode === 200 && JSON.parse(res.body).label === 'git reset', res.body)
-  check('and the rule landed in the file', store.readRules(rememberFile)[0]?.argvPrefix?.[0] === 'reset', JSON.stringify(store.readRules(rememberFile)))
-  res = fakeResponse()
-  await rememberHandler(fakeRequest({
-    method: 'POST', url: '/dsh-allow/remember',
-    headers: { origin: 'http://evil.test', 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId: 's1', callId: 'c1' }),
-  }), res)
-  check('a cross-origin remember is refused', res.statusCode === 403, String(res.statusCode))
+console.log('always allow')
+answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c1', scope: 'file' }))
+check('remembering the file scope succeeds', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
+check('and writes exactly that rule', store.readRules(rulesFile).length === 1
+  && store.readRules(rulesFile)[0].path === `${WORKSPACE}/build`
+  && store.readRules(rulesFile)[0].access.delete === true, JSON.stringify(store.readRules(rulesFile)))
+decision = await gate(exec('rm -rf build'), next)
+check('the same command no longer asks', decision.kind === 'allow', JSON.stringify(decision))
+decision = await gate(exec('rm -rf build/nested', { callId: 'c6' }), next)
+check('an exact-file rule leaves the subtree asking', decision.kind === 'ask', JSON.stringify(decision))
+answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c6', scope: 'folder' }))
+check('the folder scope is stored recursively', answer.status === 200
+  && store.readRules(rulesFile).some(rule => rule.path === `${WORKSPACE}/build` && rule.recursive === true),
+  JSON.stringify(store.readRules(rulesFile)))
+decision = await gate(exec('rm -rf build/nested/deeper', { callId: 'c7' }), next)
+check('and then covers the subtree', decision.kind === 'allow', JSON.stringify(decision))
+answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c1' }))
+check('remembering a stale approval is a 404', answer.status === 404)
+answer = await call(rememberHandler, fakeRequest({
+  method: 'POST', url: '/dsh-allow/remember', headers: { origin: 'http://evil.invalid' }, body: '{}',
+}))
+check('a cross-origin write is refused', answer.status === 403)
 
-  const forbiddenPendings = store.createPendingStore()
-  forbiddenPendings.remember('s1', 'c9', {
-    command: 'rm -rf /', cwd: CWD, decision: 'forbidden', reason: 'filesystem root', risk: 'catastrophic',
-    analyzable: true, label: null, labels: [], suggestions: [], triggers: [],
-  })
-  res = fakeResponse()
-  await host.createRememberHandler({ pendings: forbiddenPendings, config, logger })(fakeRequest({
-    method: 'POST', url: '/dsh-allow/remember',
-    headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId: 's1', callId: 'c9' }),
-  }), res)
-  check('a forbidden command can never be remembered', res.statusCode === 409, String(res.statusCode))
-}
+console.log('allow once')
+await gate(exec('rm -rf unopened', { callId: 'c2' }), next)
+check('a second path is pending', pendings.get('s1', 'c2') !== null)
+const rulesBefore = store.readRules(rulesFile).length
+answer = await call(onceHandler, post('/dsh-allow/once', { sessionId: 's1', callId: 'c2' }))
+check('the once route grants it', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
+check('as a session rule, not a stored one', grants.rulesFor('s1').length > 0
+  && grants.rulesFor('s1')[0].source === 'session'
+  && store.readRules(rulesFile).length === rulesBefore, JSON.stringify(grants.rulesFor('s1')))
+decision = await gate(exec('rm -rf unopened', { callId: 'c3' }), next)
+check('and the session can run it', decision.kind === 'allow', JSON.stringify(decision))
+decision = await gate(exec('rm -rf unopened', { callId: 'c4', agent: { session: otherSession } }), next)
+check('while another session still asks', decision.kind === 'ask', JSON.stringify(decision))
+decision = await gate(exec('rm -rf build', { callId: 'c5', agent: { session: otherSession } }), next)
+check('the stored rule holds for every session', decision.kind === 'allow', JSON.stringify(decision))
 
-console.log('escalation listener')
-{
-  const escalationFile = join(root, 'escalation.json')
-  const escalationPendings = store.createPendingStore()
-  const listenerConfig = { ...config, rulesFile: escalationFile, auditFile: join(root, 'escalation.ndjson') }
-  const listener = host.createApprovalListener({ config: listenerConfig, home: HOME, pendings: escalationPendings, logger })
-  const delegate = () => Promise.resolve('delegated')
-  const call = (command, callId) => ({
-    callId,
-    agent: {
-      session: {
-        id: 's1',
-        header: { cwd: CWD },
-        seq: 1,
-        eventAt: () => ({ type: 'tool/call', data: { callId, name: 'bash', arguments: JSON.stringify({ command }) } }),
-      },
-    },
-  })
-
-  let outcome = await listener(call('cp /a /b && echo copied', 'c1'), delegate)
-  check('an uncovered escalation reaches the card', outcome === 'delegated', outcome)
-  check('and the card is offered a rule per command', escalationPendings.get('s1', 'c1')?.labels?.join(' + ') === 'cp + echo', JSON.stringify(escalationPendings.get('s1', 'c1')?.labels))
-
-  store.addRule(escalationFile, { decision: 'allow', executable: 'cp', argvPrefix: [] })
-  store.addRule(escalationFile, { decision: 'allow', executable: 'echo', argvPrefix: [] })
-  outcome = await listener(call('cp /a /b && echo copied', 'c2'), delegate)
-  check('a fully remembered escalation is approved without a card', outcome === 'allowed-once', outcome)
-  check('and it does not double-count the rule use', store.readRules(escalationFile).every(rule => (rule.hits ?? 0) <= 1), JSON.stringify(store.readRules(escalationFile).map(rule => [rule.executable, rule.hits])))
-
-  const manualPendings = store.createPendingStore()
-  const manualListener = host.createApprovalListener({
-    config: { ...listenerConfig, autoApproveEscalations: false },
+console.log('audit')
+const audit = readFileSync(auditFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+check('the audit log recorded decisions', audit.length > 0, String(audit.length))
+check('with the effect paths and the decision',
+  audit.some(entry => entry.decision === 'prompt' && entry.effects.some(effect => effect.operation === 'delete')), JSON.stringify(audit[0]))
+const secretAudit = join(root, 'secret.ndjson')
+const secretGate = host.createGate({
+  engine: host.createEngine({
+    config: { ...config, auditFile: secretAudit },
     home: HOME,
-    pendings: manualPendings,
-    logger,
-  })
-  outcome = await manualListener(call('cp /a /b && echo copied', 'c5'), delegate)
-  check('the escalation can be kept manual by configuration', outcome === 'delegated', outcome)
+    grants,
+    pendings: store.createPendingStore(),
+    ctx,
+  }),
+  pendings: store.createPendingStore(),
+  logger,
+})
+await secretGate(exec('curl -H "Authorization: Bearer abc123" https://example.invalid'), next)
+const secretLine = readFileSync(secretAudit, 'utf8')
+check('credential-shaped text is redacted', secretLine.includes('[redacted]') && !secretLine.includes('abc123'), secretLine.slice(0, 200))
 
-  store.addRule(escalationFile, { decision: 'allow', executable: 'rm', argvPrefix: ['-rf', '/'] })
-  outcome = await listener(call('rm -rf /', 'c3'), delegate)
-  check('a remembered catastrophic command is approved silently', outcome === 'allowed-once', outcome)
-  store.addRule(escalationFile, { decision: 'forbidden', executable: 'dd', argvPrefix: [] })
-  outcome = await listener(call('dd if=/dev/zero of=/dev/sda', 'c8'), delegate)
-  check('a user-authored deny rule rejects the escalation', outcome === 'rejected', outcome)
+console.log('approval listener')
+const escalation = (command, callId, id = 's3') => ({
+  agent: {
+    session: {
+      id,
+      seq: 1,
+      header: { cwd: CWD },
+      eventAt: () => ({ type: 'tool/call', data: { callId, name: 'bash', arguments: JSON.stringify({ command }) } }),
+    },
+  },
+  callId,
+})
+let outcome = await approval(escalation('rm -rf build', 'e1'), next)
+check('an escalation for a granted command is approved', outcome === 'allowed-once', String(outcome))
+outcome = await approval(escalation('rm -rf /System/Library/x', 'e2'), next)
+check('an escalation for a protected path is rejected', outcome === 'rejected', String(outcome))
+outcome = await approval(escalation('rm -rf unopened', 'e3'), next)
+check('an escalation for an ungranted command reaches the card', outcome?.kind === 'allow', JSON.stringify(outcome))
+check('and has a pending record of its own', pendings.get('s3', 'e3') !== null)
+outcome = await approval(escalation('rm -rf unopened', 'e4', 's4'), next)
+check('a session grant belongs to one session only', outcome?.kind === 'allow', JSON.stringify(outcome))
 
-  const inlinePendings = store.createPendingStore()
-  const inlineListener = host.createApprovalListener({ config: listenerConfig, home: HOME, pendings: inlinePendings, logger })
-  outcome = await inlineListener(call('node -e "x"', 'c4'), delegate)
-  check('an unpinned inline escalation reaches the card', outcome === 'delegated', outcome)
-  check('and the card offers an exact rule', inlinePendings.get('s1', 'c4')?.exact === true && inlinePendings.get('s1', 'c4')?.labels?.[0] === 'node -e x', JSON.stringify(inlinePendings.get('s1', 'c4')?.labels))
-  store.addRule(escalationFile, { decision: 'allow', executable: 'node', argvPrefix: ['-e', 'x'] })
-  outcome = await inlineListener(call('node -e "x"', 'c6'), delegate)
-  check('the same inline command is then approved silently', outcome === 'allowed-once', outcome)
-  outcome = await inlineListener(call('node -e "y"', 'c7'), delegate)
-  check('different inline code still asks', outcome === 'delegated', outcome)
-}
+console.log('/allow')
+const allow = input => host.runAllowCommand({ file: rulesFile, workspaceRoot: WORKSPACE, mode: 'workspace-write' }, input)
+check('list names the stored rule', allow('').text.includes('delete') && allow('').text.includes(`${WORKSPACE}/build`), allow('').text)
+check('status explains the defaults and the OS coverage',
+  allow('status').text.includes('沙箱模式') && allow('status').text.includes('file-write-unlink'), allow('status').text)
+check('add writes a rule', allow('add delete,write other folder').kind === 'success'
+  && store.readRules(rulesFile).some(rule => rule.path === `${WORKSPACE}/other` && rule.access.write === true))
+check('add can pin one exact file', allow('add read notes.txt file').kind === 'success'
+  && store.readRules(rulesFile).some(rule => rule.path === `${WORKSPACE}/notes.txt` && rule.recursive === false))
+check('add refuses an unknown operation', allow('add destroy other').kind === 'error')
+check('add refuses a whole-disk rule', allow('add write / folder').kind === 'error')
+check('remove drops one', allow('remove 1').kind === 'success')
+check('clear empties the file', allow('clear').kind === 'success' && store.readRules(rulesFile).length === 0)
+check('an unknown verb is an error', allow('nonsense').kind === 'error')
 
-console.log('broad capability rules are refused')
-{
-  const broadFile = join(root, 'broad.json')
-  for (const [executable, argvPrefix] of [['bash', []], ['bash', ['-c']], ['python', ['-c']], ['node', ['-e']], ['python', ['-']]]) {
-    let refused = false
-    try {
-      store.addRule(broadFile, { decision: 'allow', executable, argvPrefix })
-    }
-    catch {
-      refused = true
-    }
-    check(`the store refuses "${[executable, ...argvPrefix].join(' ')}"`, refused)
-  }
-  store.addRule(broadFile, { decision: 'allow', executable: 'python', argvPrefix: ['tools/check.py'] })
-  check('and accepts a pinned one', store.readRules(broadFile).length === 1, JSON.stringify(store.readRules(broadFile)))
-  check('a broad rule already on disk is ignored by the reader', (() => {
-    const { writeFileSync } = require('node:fs')
-    writeFileSync(broadFile, JSON.stringify({ version: 2, rules: [
-      { id: 'stale', decision: 'allow', executable: 'python', argvPrefix: ['-c'] },
-      { id: 'good', decision: 'allow', executable: 'python', argvPrefix: ['tools/check.py'] },
-    ] }))
-    return store.readRules(broadFile).length === 1 && store.readRules(broadFile)[0].id === 'good'
-  })())
-}
+console.log('session grants expire')
+const clock = { now: 1000 }
+const expiring = store.createGrantStore({ ttlMs: 100, now: () => clock.now })
+expiring.grant('s1', [{ path: `${WORKSPACE}/gone`, recursive: false, access: { delete: true } }])
+check('a grant is readable', expiring.rulesFor('s1').length === 1)
+clock.now += 500
+check('and expires', expiring.rulesFor('s1').length === 0)
 
-console.log('/allow command')
-rmSync(rulesFile, { force: true })
-check('an empty list explains itself', host.runAllowCommand(rulesFile, '').text.includes('还没有记住任何规则'))
-check('add stores a structured rule', host.runAllowCommand(rulesFile, 'add allow git status').kind === 'success' && store.readRules(rulesFile)[0]?.argvPrefix?.[0] === 'status')
-check('list renders it', host.runAllowCommand(rulesFile, 'list').text.includes('allow · git status'), host.runAllowCommand(rulesFile, 'list').text)
-check('an invalid decision is refused', host.runAllowCommand(rulesFile, 'add sometimes git').kind === 'error')
-check('a broad interpreter rule is refused with a reason', (() => {
-  const result = host.runAllowCommand(rulesFile, 'add allow python -c')
-  return result.kind === 'error' && result.text.includes('内联代码')
-})(), JSON.stringify(host.runAllowCommand(rulesFile, 'add allow python -c')))
-check('a pinned interpreter rule is accepted', host.runAllowCommand(rulesFile, 'add allow python tools/check.py').kind === 'success')
-check('remove drops the pinned rule', host.runAllowCommand(rulesFile, 'remove 2').kind === 'success' && store.readRules(rulesFile).length === 1, JSON.stringify(store.readRules(rulesFile)))
-check('an unknown verb explains the usage', host.runAllowCommand(rulesFile, 'wat').kind === 'error')
+console.log('config')
+check('grants are accepted from configuration',
+  store.resolveConfig({ grants: [{ path: `${WORKSPACE}/out`, access: { write: true } }] }, root).grants[0].path === `${WORKSPACE}/out`)
+check('a grant without a path is refused',
+  (() => { try { store.resolveConfig({ grants: [{}] }, root); return false } catch { return true } })())
+check('a grant with no operation is refused',
+  (() => { try { store.resolveConfig({ grants: [{ path: '/w', access: {} }] }, root); return false } catch { return true } })())
+check('an invalid ttl is refused',
+  (() => { try { store.resolveConfig({ sessionGrantTtlMs: 0 }, root); return false } catch { return true } })())
+check('configured paths are canonical',
+  fspolicy.pathWithin(WORKSPACE, store.resolveConfig({ grants: [{ path: `${WORKSPACE}/a/../b`, access: { read: true } }] }, root).grants[0].path))
 
 console.log('apply')
 const registered = { listeners: [], commands: [], routes: [] }
-const ctx = {
+const pluginCtx = {
   logger,
   on: (name, listener, options) => { registered.listeners.push({ name, options }) },
   get: () => undefined,
@@ -312,17 +286,17 @@ const ctx = {
     factory({ effect: create => create(), commands: { register: definition => { registered.commands.push(definition); return () => {} } } })
   },
 }
-host.apply(ctx, { rulesFile, auditFile })
-check('the forbidden-pin switch defaults off', store.resolveConfig({}, '/tmp').allowForbiddenSource === false)
-check('and can be turned on by configuration', store.resolveConfig({ allowForbiddenSource: true }, '/tmp').allowForbiddenSource === true)
+host.apply(pluginCtx, { rulesFile, auditFile })
 check('both listeners are prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
 check('the gate listens on tools/pre-execute', registered.listeners.some(entry => entry.name === 'tools/pre-execute'))
 check('the card listens on approval/request', registered.listeners.some(entry => entry.name === 'approval/request'))
-check('both routes are registered', registered.routes.map(route => route.path).join(',') === '/dsh-allow/pending,/dsh-allow/remember', JSON.stringify(registered.routes.map(route => route.path)))
+check('all three routes are registered',
+  registered.routes.map(route => route.path).join(',') === '/dsh-allow/pending,/dsh-allow/remember,/dsh-allow/once',
+  JSON.stringify(registered.routes.map(route => route.path)))
 check('/allow is registered', registered.commands[0]?.name === 'allow')
 check('a bad config fails loud', (() => {
   try {
-    host.apply(ctx, { defaultDecision: 'maybe' })
+    host.apply(pluginCtx, { sessionGrantTtlMs: -1 })
     return false
   }
   catch {

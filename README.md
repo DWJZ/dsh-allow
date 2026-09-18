@@ -1,22 +1,22 @@
 ---
-description: "dsh-allow: a deterministic approval layer over shell commands — parse, classify, allow / prompt / forbid, remember narrow rules."
+description: "dsh-allow: filesystem permissions (read / write / create / delete / execute) per path for DSH shell calls, with deny / allow once / always allow."
 ---
 
 # dsh-allow
 
 English | [中文](README.zh.md)
 
-A deterministic approval layer over every shell command the agent runs: the line is parsed, each simple command is classified, and the whole request gets the strictest verdict — `allow`, `prompt`, or `forbidden`. An approval card can remember a narrow structured rule; a remembered command never lets a different command ride along.
+A filesystem permission layer over every shell command the agent runs. A command is judged by the filesystem capabilities it needs, never by how dangerous its name sounds: `rm build` asks because `delete(/…/build)` is not granted, `chmod 600 build` asks because `write(/…/build)` is not granted, and `echo x > new.txt` runs because `create` is granted in the workspace. Granting one path never opens its neighbours, and granting `execute` for one binary never opens the rest of its prefix.
 
 ```
-touch x && rm -rf /        →  forbidden   (even with "always allow touch")
-git status && touch foo    →  allow
-git status && rm file      →  prompt
-echo "rm -rf /"            →  allow       (quoted text is not a command)
-bash -c 'rm -rf /'         →  forbidden   (wrapper parsed recursively)
-bash -c "$UNKNOWN"         →  prompt      (cannot be proven)
-python -c '…'              →  prompt      (arbitrary code)
-echo k > ~/.ssh/authorized_keys → prompt  (credential path)
+cat README.md               →  allow    (read inside the workspace)
+echo x > out.md             →  allow    (create inside the workspace)
+rm -rf build                →  prompt   (delete is not granted in the workspace)
+mkdir build && rm -rf build →  prompt   (as strict as its strictest member)
+python3 -c '…'              →  allow    (see "Inline programs": the sandbox fences it)
+gh pr list                  →  prompt   (execute is not granted for that binary)
+echo x > /Users/me/other/o  →  prompt   (create outside the workspace)
+sudo rm -rf /System/Library →  forbid   (the platform reserves that path)
 ```
 
 ## Where it hooks in
@@ -26,155 +26,173 @@ model writes a command
       ↓
 bash / pwsh tool call
       ↓
-tools/pre-execute  ← this plugin: parse → policy → decide
-      ↓ allow                 ↓ prompt                    ↓ forbidden
-   sandbox (unchanged)   approval card: allow once /   deny, no escalation
-                         always allow / deny
+tools/pre-execute  ← this plugin: parse → derive effects → resolve (path, capability)
+      ↓ allow                    ↓ prompt                     ↓ forbidden
+  DSH sandbox (unchanged)   approval card: deny / always    refuse, no escalation
+                            allow / allow once
       ↓
 process execution
 ```
 
-`tools/pre-execute` is the documented policy seam (see the TODO in `tool-bash`), and it is the only path a shell command takes, so no execution path bypasses the gate. The pre-execute listener is registered with `prepend: true`, so a `forbidden` verdict cannot be overridden by another listener.
+`tools/pre-execute` is the documented policy seam and the only path a shell command takes, so nothing bypasses the gate. The listener is registered with `prepend: true`, so a `forbidden` verdict cannot be overridden by another policy.
 
-## Decisions
+## Capabilities and rules
 
-- **allow** — no policy rule objects; execution continues to the sandbox, which stays the fence for filesystem writes. A stored `allow` rule also lands here.
-- **prompt** — the approval card asks. `Allow once` answers only the current call and writes nothing; `Always allow` stores the suggested rules — one per parsable command (`cp` + `echo`), or the exact command text when part of the line cannot be pinned. `Deny` refuses the call.
-- **remembered** — a command line whose every member matches an allow rule also answers the sandbox's escalation question silently, so a command you allowed once stops asking for good. Set `autoApproveEscalations: false` to keep every widening manual.
-- **forbidden** — denied outright with a reason. No approval is requested and no escalation is possible, because the denied operation is destructive regardless of who approves it.
+Five capabilities are modelled, and a rule grants some of them for one path:
 
-## How a command is analysed
+| capability | means |
+| --- | --- |
+| `read` | read a file, list a directory |
+| `write` | change an existing file (content, mode, owner, times) |
+| `create` | create a new file or directory |
+| `delete` | unlink, remove, rmdir, rename away |
+| `execute` | start a file as a program |
 
-1. `src/parse.js` parses with **tree-sitter + tree-sitter-bash** — a real bash grammar — and only reads the tree it returns: statements, pipelines, `&&`/`||`/`;`, `for`/`if`/`while`/`case`, subshells, command substitution, redirections, here-documents. `echo "a && b"` is one command; the commands inside `for f in a b; do echo $f; done` are judged individually; a here-document body is its own node and is never read as shell source.
-2. `bash -lc '…'` / `sh -c '…'` are parsed **recursively** (depth 4) and their inner commands are judged with the same rules; an inner program the grammar cannot reduce leaves the whole call opaque, which prompts.
-3. `$(…)` and backticks join the same line: their commands run first and aggregate with it, and a **substituted program name** (`$(printf rm) -rf /`) makes the whole line unanalysable.
-4. Input the grammar rejects (an unterminated quote, an `if` without `fi`) is **denied outright**: the shell could not run it either, so it is not worth an approval and gets no rule.
+`execute` does not mean "no script may run": `python3 foo.py` needs `execute` for the interpreter and `read` for `foo.py`, because `foo.py` is never `execve`'d.
 
-5. Here-document bodies (`<<EOF … EOF`) are **stdin data, not shell source**, so they are removed before parsing — a Python line inside one is no longer read as a command. The reader is still judged: `python3 -` or a shell without `-c` takes its program from stdin, which is code execution — pinned only as the exact command text.
-4. `$(…)` and backticks are parsed recursively too: the substituted commands join the same line and are aggregated with it (`echo "$(rm -rf /)"` is forbidden). A substitution the parser cannot reduce makes the whole line a prompt, and a substituted **program name** is always unanalysable, so `$(printf rm) -rf /` is never allowed.
-6. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
-7. Unanalysable lines are `prompt` and match no per-command rule — the fail-closed rule for shell syntax this parser does not model. They can still be pinned as one exact command, which is the only rule that reaches them.
-
-## Inline execution: shell wrappers and interpreters
-
-A capable interpreter may run, but its capability is never remembered broadly. One function, `validatePersistentRule()`, decides what may be stored; `RuleStore` re-checks on write and again on read, so a UI bug, a future caller, or a hand-edited file cannot persist `bash -c` or `python -c` as an always-allow rule.
-
-| Command | Handling |
-|---|---|
-| `bash -lc 'cargo test'` | the inner shell source is parsed recursively and judged as `cargo test`; Always allow stores `["cargo","test"]`, never `bash -lc` |
-| `bash -lc 'touch x && rm -rf /'` | the inner commands are judged and aggregated → `forbidden`; the outer shell cannot hide them |
-| `bash -lc 'X=$Y; $X foo'` | the inner source cannot be parsed → the invocation is **opaque** → `prompt` |
-| `python -c 'print(123)'` | inline code is **opaque arbitrary execution** → `prompt`; the only rule offered pins the exact text: `["python","-c","print(123)"]` |
-| `python tools/check.py` | a script file, pinned as `["python","tools/check.py"]`, which also covers `… --verbose` |
-| `python -` / `bash` without `-c`, here-documents | the program comes from stdin, so argv cannot pin it → `prompt`, but the whole line can be pinned to its own text (an exact-source rule) |
-| Anything the parser cannot reduce (`for …; do …; done`) | `prompt`, likewise pinnable to its own text |
-
-**Exact-source rules**: when nothing per-command can be pinned (stdin programs, here-documents, syntax the parser does not model), the card adds *Always allow this exact command*. The rule stores the whole command text and matches only byte-identical text (surrounding whitespace ignored) — the same text runs the same program.
-
-- **A mixed line gets both**: the parsable members keep their minimal capability rules and the whole line is added as an exact pin, so no command is left unsilenceable.
-- **Hard denials are the one exception**: the built-in catastrophic verdicts (`rm -rf /`, `mkfs`, `dd of=/dev/…`) are not rememberable by default. A deployment that wants to pin those exact lines sets `allowForbiddenSource: true` (default `false`); only then does the card offer the pin and honour it.
-
-**The built-in policy hard-denies exactly one thing**: a line the grammar cannot parse, which could not run as written. Every other risk becomes a `prompt` with one concrete rule to remember; `forbidden` survives for rules **you** write (`/allow add forbidden …`), and none are shipped.
-
-**Broad rules that are refused** (the store throws on write; the reader ignores them):
-
-```
-bash · sh · zsh · dash · ksh · fish · pwsh        (alone)
-bash -c · bash -lc · sh -c · zsh -c …             (a flag with no program text)
-python · python3 · node · perl · ruby · lua · deno eval · php -r · osascript -e
-python - · node -                                 (program from stdin)
-eval · source · exec                              (alone)
-```
-
-Programs that run code *selected by their arguments* follow the same standard (a rule must name the operation, not just the program): `git` (`-c alias.x='!cmd'`, `--exec-path`), `npm`/`pnpm`/`yarn`/`bun`, `make`, `docker`/`podman`/`kubectl`, `ssh`, `sudo`/`su`/`doas`, `env`/`xargs`/`nohup`/`timeout`/`nice`. So a bare `git` rule is refused while `git status` is fine, and a bare `sudo` rule is refused while `sudo apt update` is fine.
-
-The test is whether the rule pins the program that will run — the code string after an inline flag, or a script path. `python -c 'print(123)'` and `python -c 'print(456)'` are different capabilities. `forbidden` always wins: an exact allow rule never covers `rm -rf /`, not even inside `bash -lc 'rm -rf /'`.
-
-The card says which one it is: inline code gets **Always allow this exact command**, while a parsed wrapper names the inner command (`Always allow "cargo test"`).
-
-## Built-in policy
-
-Argument-aware, not a name blacklist. Destructive shapes are recognised from the flags and targets:
-
-| Area | Example | Verdict |
-|---|---|---|
-| catastrophic | `rm -rf /`, `rm -rf ~`, `rm -rf /*`, `rm -rf .` at `/`, `mkfs*`, `dd of=/dev/sda`, `> /dev/sda` | forbidden |
-| destructive | `rm`, `rmdir`, `mv`, `truncate`, `dd`, `shred`, `git reset --hard`, `git clean -fdx`, `git push --force` | prompt |
-| privilege | `sudo`, `su`, `doas` | prompt |
-| permissions | `chmod`, `chown` (recursive or world-writable noted) | prompt |
-| process / service | `kill`, `pkill`, `killall`, `systemctl`, `service`, `launchctl`, `mount`, `umount` | prompt |
-| code execution | `sh` without `-c`, `python -c`, `node -e`, `eval`, `exec`, `source` | prompt |
-| environment | `PATH=`, `LD_PRELOAD=`, `DYLD_*`, `PYTHONPATH=`, `NODE_OPTIONS=`, `BASH_ENV=`, `export PATH=…` | prompt |
-| redirection | `> /etc/*`, `> ~/.ssh/*`, `> ~/.bashrc`, any dynamic target | prompt |
-| background | `cmd &` | prompt |
-| network | `curl -o`, `wget -O`, `ssh`, `scp`, `rsync`, `nc` | prompt |
-| containers | `docker`, `podman` | prompt |
-| paths | `rm -rf .` at `/` or `$HOME`; `~`, `..`, and `/x/..` are normalized before comparison | forbidden / prompt by cwd |
-
-When one member of a line can never be remembered (inline code, a substituted program name), the other members still get their suggestions and the card says that part of the line keeps asking; a line containing a forbidden command suggests nothing at all.
-
-Suggestions are parameter-aware without pinning the whole line: a destructive program keeps a couple of arguments (`rm -rf build` → `["-rf","build"]`, so `rm -rf other` still asks), `chmod 777 /etc/x` keeps `["777","/etc/x"]`, and `git reset --hard` keeps `["reset"]`. A prompt caused by a redirection offers both the minimal rule and the whole-line exact pin.
-
-A command nothing matches defers to the sandbox (`defaultDecision: allow`); set `defaultDecision: prompt` to gate everything.
-
-## Persistent rules are structured
-
-`$DSH_HOME/dsh-allow.json`:
+A stored rule is a path plus an access map, never a command line:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "rules": [
-    { "id": "r1", "decision": "allow", "executable": "git", "argvPrefix": ["status"], "hits": 4 },
-    { "id": "r2", "decision": "forbidden", "executable": "dd", "argvPrefix": [] }
+    { "id": "f1", "path": "/Users/me/project/build", "recursive": true,
+      "access": { "write": true, "create": true, "delete": true },
+      "hits": 2, "createdAt": "2026-01-01T00:00:00.000Z" }
   ]
 }
 ```
 
-Matching is structural: executable (basename, so `/usr/bin/git` and `git` are one program) plus a literal argv prefix. `git reset --hard` does not match `['git','status']`. A command carrying an expanded argument (`git status "$X"`) is **not** covered by an `allow` rule. Suggestions are the narrowest useful form: the executable, plus the leading subcommand for programs that have one (`git status`, `pnpm install`); flags and paths are never included.
+`recursive: true` covers the whole subtree; `recursive: false` covers exactly that path, which is what the card's "always allow this file" writes for a single binary or file.
+
+## Precedence
+
+Highest first; the lowest level that states the capability answers, and inside one level the more specific path wins:
+
+1. **Platform-protected paths** — `/System`, `/bin`, `/sbin`, `/usr` (except `/usr/local`), `/AppleInternal`, `/private/var/db` and `/dev` refuse `write`/`create`/`delete` for every writer, user rules included. `/dev/null`, the standard streams and `/usr/local` are excepted.
+2. **Explicit rules** — the rules file (`source: user`) and this session's "allow once" grants (`source: session`).
+3. **Workspace rules** — a `.dsh-allow.json` in the session workspace.
+4. **Platform baseline** — the workspace, the temp areas, the harness home, and the system paths macOS needs.
+5. **Global default** — not granted.
+
+Paths are compared as canonical absolute paths, component by component: `~`, relative spellings, `.`, `..` and symlinked ancestors are resolved before matching, so `/tmp/x` and `/private/tmp/x` are one path and no rule can be escaped with `../`. Every operation is resolved against both the spelling used and the path behind its symlinks, which is how a grant for `/opt/homebrew/bin/gh` and a grant for the Cellar binary it points at each work without opening the rest of the prefix.
+
+## Defaults and the platform baseline
+
+Inside the workspace: `read`, `write`, `create` and `execute` are allowed, `delete` is not.
+
+The plugin's temp areas and the harness home grant all five. System paths grant what macOS itself needs: `read` + `execute` for `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/usr/lib`, `/usr/libexec`, `/System`, `/Library/Apple` and `/Library/Developer`; `read` for `/etc`, `/var`, `/usr`, `/usr/share`, `/Library`, `/Applications`, `/dev` and `/opt/homebrew`.
+
+Everything else — including `$HOME` outside the workspace — is closed until the user opens it. A `read-only` session narrows the baseline the same way the sandbox mode does: the workspace keeps `read` + `execute` and loses the rest.
+
+## Homebrew and symlinked executables
+
+Homebrew is deliberately not a granted prefix: `/opt/homebrew` is readable, but `/opt/homebrew/**` is not executable, so every Homebrew binary is authorized one file at a time. `always allow` on `execute /opt/homebrew/bin/gh` stores grants for both the name the user saw and the Cellar binary it resolves to, and neither grant covers a second tool.
+
+## How effects are read from a command
+
+The line is parsed with `tree-sitter` + `tree-sitter-bash` (structure — pipelines, lists, control flow, substitutions, redirections, here-documents), and each simple command is turned into `(path, capability)` pairs from what the program does with its arguments: `rm` deletes its operands, `mkdir` creates them, `mv` deletes the sources and creates the target, `cp` reads the sources and creates the target, `grep` reads its path argument but never its pattern, `sed -i` reads and writes its file, `dd if=` reads and `of=` creates, `curl -o` creates. Redirections are effects too: `>` writes or creates its target, `<` reads it, and the null device and the standard streams are ignored. `sudo`, `doas`, `env`, `nice`, `nohup`, `timeout`, `command` and `exec` are followed to the program they start, so `sudo rm -rf build` is still a delete of `build`.
+
+Nothing is inferred from a program's name beyond that reading, and only the execute effect is derived for programs outside the table — a program whose file effects are invisible from the command line (`git status`) needs no path grant at all.
+
+## Inline programs: no exact-source approval
+
+`python3 -c '…'`, `node -e '…'`, `eval` and a shell program the parser cannot reduce are not judged by their text and are not pinned to it: two different `python3 -c` lines with the same capabilities behave the same way, so the second one does not ask because the source differs. The sandbox confines the process, and only when no sandbox mode is enforcing (an unknown mode, or `danger-full-access`) does such a line ask — that is the fail-closed branch.
+
+A computed path for a visible operation is different: `rm -rf "$DIR"` states a delete whose target cannot be checked, so it asks rather than riding on a grant. Once the operation is granted for the working directory the line stops asking, and the sandbox bounds the run-time path to what was opened.
+
+## The card
+
+`deny`, `always allow this file`, `always allow this folder` (when the two differ) and `allow once`, plus the real missing capability:
+
+```
+Filesystem permission required
+Operation: delete
+Path:      /Users/me/project/build
+Command:   rm -rf build
+Sandbox:   workspace-write
+```
+
+`always allow` writes a persistent rule; `allow once` grants the capability to this session only, in memory, for ten minutes, and never touches the rules file.
+
+## The macOS backend
+
+`src/macos.js` compiles a rule set into a Seatbelt (`sandbox-exec`) profile, and the mapping was measured against the kernel, not assumed:
+
+| capability | SBPL operations |
+| --- | --- |
+| `read` | `file-read*` |
+| `write` | `file-write-data`, `file-write-attributes`, `file-write-mode`, `file-write-flags`, `file-write-owner`, `file-write-times` |
+| `create` | `file-write-create` |
+| `delete` | `file-write-unlink` |
+| `execute` | `process-exec` |
+
+`delete` is genuinely separable from `write` on macOS: a profile that allows `file-write-data` and `file-write-create` under a subtree while withholding `file-write-unlink` lets a process rewrite and create files there while `rm`, `rmdir` and `rename` all fail with EPERM — including for child processes, which inherit the profile. Seatbelt filters match the path the kernel resolved, so rule paths are canonicalized before they are rendered.
+
+`test/sandbox.integration.mjs` proves all of this against the real kernel: workspace read/write/create allowed, delete denied, a delete grant making it work again, writes outside the workspace denied, an execute fence denying ungranted binaries, symlinked binaries matched through their real path, `python3 -c 'os.remove(…)'` and a child shell denied, and a profile the kernel refuses running nothing.
+
+## What is enforced, and where
+
+| capability | command-level gate (this plugin) | OS sandbox today |
+| --- | --- | --- |
+| `write`, `create` | yes | yes — anything outside the workspace roots is denied by DSH's Seatbelt profile |
+| `delete` | yes, for effects visible in the line | **not yet** — DSH's profile grants `file-write*` under the workspace, which includes unlink |
+| `read` | yes | no — reads pass through every mode |
+| `execute` | yes | no — the profile does not fence `process-exec` |
+
+The honest consequence: an opaque program (`python3 -c 'os.remove(…)'`) is not stopped by the policy, and a read outside the workspace that the line does not spell out is not stopped by the sandbox. Closing the delete gap is one line in `@deepseek-ai/dsh-sandbox-local`'s profile — `(deny file-write-unlink (subpath …))` for roots whose rules withhold delete — fed by the capability set; `/allow status` prints the same table in the terminal.
 
 ## `/allow`
 
 ```
-/allow                                        # list rules with hit counts
-/allow add allow git status                   # add a rule by hand
-/allow add forbidden dd
+/allow                          list the stored rules
+/allow status                   the defaults and the enforcement table
+/allow add delete,write build folder
+/allow add execute /opt/homebrew/bin/gh file
 /allow remove 2
 /allow clear
 ```
 
 ## Audit log
 
-Every decision appends one NDJSON line to `$DSH_HOME/dsh-allow-audit.ndjson`: timestamp, tool, cwd, raw command, parsed commands, decision, reason, risk, whether the line was analysable, and the matched rules. Credential-shaped text (`api_key=…`, `Authorization: Bearer …`, private keys) is redacted before writing; environment values are never recorded.
+Every non-silent decision is appended to `$DSH_HOME/dsh-allow-audit.ndjson` as one JSON line: the command, the working directory, the decision, the mode, and the `(capability, path)` pairs behind it. Credential-shaped text is redacted before it is written.
 
 ## Configuration
 
 ```yaml
 - id: dsh-allow
   config:
-    rulesFile: /path/to/rules.json
-    auditFile: /path/to/audit.ndjson
-    audit: true
-    defaultDecision: allow      # or prompt: gate every command
-    autoApproveEscalations: true # false: a remembered command still asks before widening the sandbox
-    allowForbiddenSource: false   # true: also offer/honour an exact pin for hard-denied lines
+    rulesFile: /path/to/rules.json          # default $DSH_HOME/dsh-allow.json
+    auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
+    audit: true                             # false turns the audit log off
+    sessionGrantTtlMs: 600000               # how long "allow once" lasts
+    autoApproveEscalations: true            # a granted command answers its own escalation
+    grants:                                 # deployment grants, same shape as a stored rule
+      - path: /opt/homebrew
+        recursive: true
+        access: { read: true, execute: true }
 ```
+
+A `rules.json` written by dsh-allow 0.1 (the command-prefix model) reads as empty and is kept as `<rulesFile>.v2.bak` on the first write; those rules said nothing about filesystem capabilities and cannot be translated.
 
 ## Test
 
 ```sh
-npm test        # policy suite, host suite, browser suite
+npm test              # units, host wiring, card render, and the real-sandbox suite
+npm run test:unit     # policy, effects, decisions
+npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start sandbox-exec)
 ```
 
-`test/policy.spec.mjs` runs the required cases and bypass attempts (`touch x; rm -rf /`, `||`, `|`, `(rm -rf /)`, `bash -c`, `eval`, `$COMMAND -rf /`, `$(printf rm)`, `rm -rf "$TARGET"`, `for … do rm …`, `if … then rm …`) and asserts that none of them is `allow`. `test/smoke.mjs` covers the gate, routes, rule store, audit redaction, the broad-rule refusals, and `/allow`. `test/client.smoke.mjs` renders the card (set `DSH_CHECKOUT` for that assertion).
+The sandbox suite skips with a notice when `sandbox-exec` cannot apply a profile — including when the test itself runs inside another Seatbelt sandbox — so run it from a plain terminal to exercise the kernel.
 
 ## Limits
 
-- The parser models a restricted shell, not bash. Anything outside it is `prompt`; only an exact command pin can reach it, never a per-command rule.
-- A rule is scoped to one tool family (`bash`/`pwsh` commands); `write`/`edit` tools keep their own sandbox escalation.
-- The card is this plugin's own render of the approval UI (the built-in card's action row is not extensible). It claims sandbox-escalation asks and policy prompts (a policy reason is marked with a `dsh-allow: ` prefix); other approvals keep the built-in card.
-- Network egress is not sandboxed by DSH, so `curl`/`wget`/`ssh` are policy prompts rather than enforced restrictions.
+- The card decides per command line; a program whose effects the line does not show is fenced by the sandbox, not by this policy.
+- `read` and `execute` are command-level today (see the enforcement table); the macOS mapping that would move them into the kernel is implemented and tested in `src/macos.js`.
+- `create` alone cannot produce a non-empty file on macOS: filling it needs `file-write-data` too, which is why grants for creating usually also carry `write`.
+- Renaming needs `delete` for the source plus `create` for the target.
+- Read effects are derived for a fixed table of programs; an effect this table does not know is left to the sandbox rather than guessed.
 
 ## License
 
-[MIT](LICENSE)
+MIT

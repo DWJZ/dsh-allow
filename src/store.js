@@ -1,18 +1,22 @@
 /**
- * Persistent structured rules, the pending-approval scratch space, and the
- * decision audit log.
+ * Persistent filesystem rules, per-session grants, the pending-approval
+ * scratch space, and the decision audit log.
  *
- * A rule is an executable plus a literal argv prefix — never a raw substring —
- * so `git status` and `git reset --hard` cannot share one. The audit log is
- * NDJSON and never records environment values or credential-shaped text.
+ * A stored rule is a path plus the capabilities granted there — never a command
+ * line — so `rm build` and `rm src` cannot share one unless the user opened the
+ * folder they share on purpose. The audit log is NDJSON and never records
+ * environment values or credential-shaped text.
  */
-import { appendFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { validatePersistentRule } from './policy.js'
+import { dirname, join, resolve } from 'node:path'
+import { OPERATIONS, canonicalPath, describeRule, makeRule, normalizeStoredRule } from './fspolicy.js'
 
 /** Default file name for stored rules below the harness home. */
 const RULES_FILE_NAME = 'dsh-allow.json'
+
+/** Rule file a workspace may carry for itself. */
+export const WORKSPACE_RULES_FILE_NAME = '.dsh-allow.json'
 
 /** Default file name for the audit log below the harness home. */
 const AUDIT_FILE_NAME = 'dsh-allow-audit.ndjson'
@@ -23,8 +27,14 @@ const PENDING_LIMIT = 100
 /** How long a pending approval stays addressable, in milliseconds. */
 const PENDING_TTL_MS = 15 * 60 * 1000
 
+/** How long an "allow once" grant survives, in milliseconds. */
+const SESSION_GRANT_TTL_MS = 10 * 60 * 1000
+
 /** Separator between a session id and a call id inside one pending key. */
 const PENDING_SEPARATOR = '\u0000'
+
+/** The rule-file format this version writes. */
+const RULES_VERSION = 3
 
 /**
  * Resolve the harness home: `$DSH_HOME` when set, otherwise `~/.dsh`.
@@ -38,10 +48,34 @@ export function resolveHome(env = process.env) {
 }
 
 /**
+ * Resolve one configured grant into a rule.
+ * @param entry - `{path, recursive, access}` from the plugin configuration.
+ * @param home - harness home, used for `~` in configured paths.
+ * @returns the rule.
+ */
+function configGrantRule(entry, home) {
+  if (entry === null || typeof entry !== 'object' || typeof entry.path !== 'string') {
+    throw new TypeError(`dsh-allow: config grants entries need a path, got ${JSON.stringify(entry)}`)
+  }
+  const access = {}
+  for (const operation of OPERATIONS) if (entry.access?.[operation] === true) access[operation] = true
+  if (Object.keys(access).length === 0) {
+    throw new TypeError(`dsh-allow: config grant for ${entry.path} grants no operation`)
+  }
+  return makeRule({
+    path: canonicalPath(entry.path, { cwd: process.cwd(), home }),
+    recursive: entry.recursive !== false,
+    access,
+    source: 'user',
+    note: 'configured grant',
+  })
+}
+
+/**
  * Resolve the rules and audit paths for one harness home.
  * @param config - raw plugin configuration.
  * @param home - resolved harness home.
- * @returns absolute paths plus the default decision.
+ * @returns absolute paths, the configured grants, and the deployment flags.
  */
 export function resolveConfig(config, home) {
   const text = (value, field, fallback) => {
@@ -51,93 +85,140 @@ export function resolveConfig(config, home) {
     }
     return value
   }
-  const defaultDecision = config?.defaultDecision ?? 'allow'
-  if (!['allow', 'prompt'].includes(defaultDecision)) {
-    throw new TypeError(`dsh-allow: config defaultDecision must be "allow" or "prompt", got ${JSON.stringify(defaultDecision)}`)
+  const sessionGrantTtlMs = config?.sessionGrantTtlMs ?? SESSION_GRANT_TTL_MS
+  if (typeof sessionGrantTtlMs !== 'number' || !Number.isFinite(sessionGrantTtlMs) || sessionGrantTtlMs <= 0) {
+    throw new TypeError(`dsh-allow: config sessionGrantTtlMs must be a positive number, got ${JSON.stringify(sessionGrantTtlMs)}`)
+  }
+  const grants = config?.grants === undefined ? [] : config.grants
+  if (!Array.isArray(grants)) {
+    throw new TypeError('dsh-allow: config grants must be a list of {path, access, recursive} entries')
   }
   return {
     rulesFile: text(config?.rulesFile, 'rulesFile', join(home, RULES_FILE_NAME)),
     auditFile: text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME)),
     audit: config?.audit !== false,
-    defaultDecision,
-    // A remembered command also answers the sandbox's escalation question:
-    // that is what "stop asking for this command" means for a path outside
-    // the workspace. Turn it off to keep every widening manual.
+    sessionGrantTtlMs,
+    grants: grants.map(entry => configGrantRule(entry, home)),
+    // An approval for one call also answers the sandbox's escalation question:
+    // that is what "stop asking for this path" means once the run needs a wider
+    // mode. Turn it off to keep every widening manual.
     autoApproveEscalations: config?.autoApproveEscalations !== false,
-    // Off by default: the built-in catastrophic denials stay final. Turning it
-    // on lets the user pin one of those exact lines to its own text.
-    allowForbiddenSource: config?.allowForbiddenSource === true,
   }
 }
 
 /**
- * Read the stored rules.
- * @param file - absolute rules-file path.
- * @returns the rules; an unreadable file reads as none.
+ * Read one JSON file.
+ * @param file - absolute path.
+ * @returns the parsed value, or null.
  */
-export function readRules(file) {
-  let parsed
+function readJson(file) {
   try {
-    parsed = JSON.parse(readFileSync(file, 'utf8'))
+    return JSON.parse(readFileSync(file, 'utf8'))
   }
   catch {
-    // Missing or hand-broken file means "no rules"; approvals must still work.
-    return []
+    // Missing or hand-broken file means "nothing configured"; approvals must
+    // still work, so this is not an error the caller has to handle.
+    return null
   }
-  const rules = parsed?.rules
-  if (!Array.isArray(rules)) return []
-  return rules.filter(rule => typeof rule?.id === 'string'
-    && ['allow', 'prompt', 'forbidden'].includes(rule?.decision)
-    && typeof rule?.executable === 'string')
-    // A rule that hands out a code-execution capability is ignored even when it
-    // was written by an older version or by hand: the store refuses new ones,
-    // and the reader refuses old ones.
-    .filter(rule => validatePersistentRule(rule).ok)
 }
 
 /**
- * Replace the whole rule set atomically.
+ * Read the stored rules. A file from an older rule model reads as empty: its
+ * command-shaped rules say nothing about filesystem capabilities, and the
+ * writer keeps a backup of it rather than rewriting it in place.
+ * @param file - absolute rules-file path.
+ * @returns the rules.
+ */
+export function readRules(file) {
+  const parsed = readJson(file)
+  if (!Array.isArray(parsed?.rules)) return []
+  if (parsed.version !== undefined && parsed.version !== RULES_VERSION) return []
+  return parsed.rules.map(rule => normalizeStoredRule(rule, 'user')).filter(rule => rule !== null)
+}
+
+/**
+ * Read the rules one workspace carries for itself.
+ * @param workspaceRoot - the session workspace root.
+ * @returns the workspace rules.
+ */
+export function readWorkspaceRules(workspaceRoot) {
+  if (typeof workspaceRoot !== 'string' || workspaceRoot === '') return []
+  const parsed = readJson(resolve(workspaceRoot, WORKSPACE_RULES_FILE_NAME))
+  if (!Array.isArray(parsed?.rules)) return []
+  return parsed.rules.map(rule => normalizeStoredRule(rule, 'workspace')).filter(rule => rule !== null)
+}
+
+/**
+ * Replace the whole rule set atomically, keeping one backup of a file written
+ * by an earlier rule model.
  * @param file - absolute rules-file path.
  * @param rules - the complete list.
  */
 export function writeRules(file, rules) {
   mkdirSync(dirname(file), { recursive: true })
+  const previous = readJson(file)
+  if (previous !== null && previous.version !== undefined && previous.version !== RULES_VERSION
+    && !existsSync(`${file}.v${String(previous.version)}.bak`)) {
+    renameSync(file, `${file}.v${String(previous.version)}.bak`)
+  }
   const temporary = `${file}.tmp`
-  writeFileSync(temporary, `${JSON.stringify({ version: 2, rules }, null, 2)}\n`, 'utf8')
+  writeFileSync(temporary, `${JSON.stringify({ version: RULES_VERSION, rules }, null, 2)}\n`, 'utf8')
   renameSync(temporary, file)
+}
+
+/**
+ * Refuse the one rule that would open the whole machine to writers.
+ * @param rule - the rule about to be stored.
+ * @returns whether it may be stored, with the reason when it may not.
+ */
+export function validateRule(rule) {
+  const operations = OPERATIONS.filter(operation => rule.access?.[operation] === true)
+  if (operations.length === 0) return { ok: false, reason: '这条规则没有授予任何权限' }
+  if (rule.path === '/' && rule.recursive === true
+    && operations.some(operation => operation !== 'read' && operation !== 'execute')) {
+    return { ok: false, reason: '拒绝写入「整个磁盘可写」的规则；请把范围收窄到具体目录' }
+  }
+  return { ok: true }
 }
 
 /**
  * Store one rule, replacing an identical one.
  * @param file - absolute rules-file path.
- * @param fields - decision, executable, and argv prefix.
+ * @param fields - path, access, and recursive flag.
  * @returns the stored rule.
  */
 export function addRule(file, fields) {
-  // Second line of defense: the builder already validates, and the store
-  // validates again so no path (UI bug, future caller, imported config) can
-  // persist a rule that hands out arbitrary code execution.
-  const check = validatePersistentRule(fields)
-  if (!check.ok) {
-    throw new TypeError(`dsh-allow: 拒绝写入宽泛规则 — ${check.reason}`)
-  }
+  const rule = makeRule({ ...fields, source: 'user' })
+  const check = validateRule(rule)
+  if (!check.ok) throw new TypeError(`dsh-allow: ${check.reason}`)
   const rules = readRules(file)
-  const same = rules.find(rule => rule.decision === fields.decision
-    && rule.executable === fields.executable
-    && (rule.argvPrefix ?? []).join('\u0000') === (fields.argvPrefix ?? []).join('\u0000'))
+  const same = rules.find(existing => existing.path === rule.path
+    && existing.recursive === rule.recursive
+    && OPERATIONS.every(operation => existing.access[operation] === rule.access[operation]))
   if (same !== undefined) return same
   const stored = {
-    id: `r${String(Date.now())}${String(rules.length)}`,
-    decision: fields.decision,
-    executable: fields.executable,
-    argvPrefix: [...(fields.argvPrefix ?? [])],
+    id: `f${String(Date.now())}${String(rules.length)}`,
+    path: rule.path,
+    recursive: rule.recursive,
+    access: rule.access,
     hits: 0,
     createdAt: new Date().toISOString(),
-    ...(fields.exact === true ? { exact: true } : {}),
-    ...(fields.note === undefined ? {} : { note: fields.note }),
+    ...(rule.note === undefined ? {} : { note: rule.note }),
   }
-  writeRules(file, [...rules, stored])
-  return stored
+  writeRules(file, [...readRulesRaw(file), stored])
+  return normalizeStoredRule(stored, 'user')
+}
+
+/**
+ * Read the stored records without normalization, so a rewrite keeps every field.
+ * @param file - absolute rules-file path.
+ * @returns the raw records.
+ */
+function readRulesRaw(file) {
+  const parsed = readJson(file)
+  if (!Array.isArray(parsed?.rules)) return []
+  if (parsed.version !== undefined && parsed.version !== RULES_VERSION) return []
+  return parsed.rules
 }
 
 /**
@@ -147,11 +228,11 @@ export function addRule(file, fields) {
  * @returns the removed rule, or null when the position is out of range.
  */
 export function removeRule(file, position) {
-  const rules = readRules(file)
+  const rules = readRulesRaw(file)
   if (!Number.isSafeInteger(position) || position < 1 || position > rules.length) return null
   const [removed] = rules.splice(position - 1, 1)
   writeRules(file, rules)
-  return removed ?? null
+  return removed === undefined ? null : normalizeStoredRule(removed, 'user')
 }
 
 /**
@@ -160,7 +241,7 @@ export function removeRule(file, position) {
  * @returns how many rules were removed.
  */
 export function clearRules(file) {
-  const count = readRules(file).length
+  const count = readRulesRaw(file).length
   try {
     unlinkSync(file)
   }
@@ -177,11 +258,61 @@ export function clearRules(file) {
  */
 export function countHit(file, id) {
   try {
-    const rules = readRules(file)
+    const rules = readRulesRaw(file)
     writeRules(file, rules.map(rule => (rule.id === id ? { ...rule, hits: (Number(rule.hits) || 0) + 1 } : rule)))
   }
   catch {
     // Bookkeeping only.
+  }
+}
+
+/**
+ * Create the "allow once" store: capability grants that live in this process
+ * only, for a bounded time, and are never written to the rules file.
+ * @param options - lifetime and clock.
+ * @returns grant/read/release operations.
+ */
+export function createGrantStore({ ttlMs = SESSION_GRANT_TTL_MS, now = Date.now } = {}) {
+  const entries = new Map()
+  const prune = () => {
+    for (const [key, entry] of entries) if (now() - entry.at > ttlMs) entries.delete(key)
+  }
+  return {
+    /**
+     * Grant capabilities for one session until the grant expires.
+     * @param sessionId - owning session id.
+     * @param rules - the rules to remember, in `makeRule` fields.
+     * @returns the granted rules.
+     */
+    grant(sessionId, rules) {
+      if (typeof sessionId !== 'string') return []
+      prune()
+      const current = entries.get(sessionId)?.rules ?? []
+      const stored = rules.map((fields, index) => makeRule({
+        ...fields,
+        source: 'session',
+        id: `s${String(now())}${String(index)}`,
+      }))
+      entries.set(sessionId, { rules: [...current, ...stored], at: now() })
+      return stored
+    },
+    /**
+     * The session's live grants.
+     * @param sessionId - owning session id.
+     * @returns the rules.
+     */
+    rulesFor(sessionId) {
+      if (typeof sessionId !== 'string') return []
+      prune()
+      return entries.get(sessionId)?.rules ?? []
+    },
+    /**
+     * Drop one session's grants.
+     * @param sessionId - owning session id.
+     */
+    release(sessionId) {
+      if (typeof sessionId === 'string') entries.delete(sessionId)
+    },
   }
 }
 
@@ -240,7 +371,7 @@ export function createPendingStore({ ttlMs = PENDING_TTL_MS, limit = PENDING_LIM
      * Record one approval that is now on screen.
      * @param sessionId - owning session id.
      * @param callId - tool call id.
-     * @param record - decision, reason, cwd, command, and suggested rule.
+     * @param record - decision, missing capabilities, cwd, command, suggestions.
      */
     remember(sessionId, callId, record) {
       const key = pendingKey(sessionId, callId)
@@ -275,4 +406,13 @@ export function createPendingStore({ ttlMs = PENDING_TTL_MS, limit = PENDING_LIM
       if (key !== null) entries.delete(key)
     },
   }
+}
+
+/**
+ * Render one rule for the command line.
+ * @param rule - stored or suggested rule.
+ * @returns the human label.
+ */
+export function renderRule(rule) {
+  return describeRule(rule)
 }

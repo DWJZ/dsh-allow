@@ -1,177 +1,198 @@
 ---
-description: "dsh-allow：shell 命令的确定性审批层——解析、分类、allow / prompt / forbidden，并把最窄的规则记下来。"
+description: "dsh-allow:按路径授予 DSH shell 调用的 read / write / create / delete / execute 文件权限,卡片上给「拒绝 / 允许一次 / 总是允许」。"
 ---
 
 # dsh-allow
 
 [English](README.md) | 中文
 
-对 agent 要跑的每条 shell 命令做确定性审批：先解析命令行，逐条判定每个简单命令，整条请求取**最严**的结果——`allow`、`prompt` 或 `forbidden`。审批卡片可以记住一条**结构化窄规则**；记住过一条命令，绝不会让别的命令搭便车。
+给 agent 每次 shell 调用加一层**文件系统权限**。判断依据是这条命令需要哪些文件能力,而不是命令名听起来多危险:`rm build` 会问,是因为 `delete(/…/build)` 没被授予;`chmod 600 build` 会问,是因为 `write(/…/build)` 没被授予;`echo x > new.txt` 直接通过,是因为 workspace 里 `create` 是允许的。授权一个路径不会顺带打开它的邻居,授权一个可执行文件也不会打开它所在的整个前缀。
 
 ```
-touch x && rm -rf /        →  forbidden   (即使已经「总是允许 touch」)
-git status && touch foo    →  allow
-git status && rm file      →  prompt
-echo "rm -rf /"            →  allow       (引号里的是文本，不是命令)
-bash -c 'rm -rf /'         →  forbidden   (wrapper 递归解析)
-bash -c "$UNKNOWN"         →  prompt      (无法证明)
-python -c '…'              →  prompt      (任意代码)
-echo k > ~/.ssh/authorized_keys → prompt  (凭据路径)
+cat README.md               →  允许    (workspace 内 read)
+echo x > out.md             →  允许    (workspace 内 create)
+rm -rf build                →  询问    (workspace 默认不授予 delete)
+mkdir build && rm -rf build →  询问    (整行取最严的一条)
+python3 -c '…'              →  允许    (见「内联程序」:交给系统层沙箱)
+gh pr list                  →  询问    (这个二进制没被授予 execute)
+echo x > /Users/me/other/o  →  询问    (workspace 外 create)
+sudo rm -rf /System/Library →  拒绝    (平台保留路径)
 ```
 
 ## 挂在哪一层
 
 ```
-模型写出命令
+模型写出一条命令
       ↓
 bash / pwsh 工具调用
       ↓
-tools/pre-execute  ← 本插件：解析 → 策略 → 决策
-      ↓ allow                 ↓ prompt                    ↓ forbidden
-   沙箱(不变,仍是写围栏)   审批卡片: 允许一次 /            直接拒绝,不可升级
-                          总是允许 / 拒绝
+tools/pre-execute  ← 本插件:解析 → 推导文件效果 → 逐条解析 (路径, 能力)
+      ↓ 允许                     ↓ 询问                        ↓ 拒绝
+  DSH 沙箱(不改动)         审批卡片:拒绝 / 总是允许 /        直接拒绝,不能提权
+                          允许一次
       ↓
-真正执行
+进程执行
 ```
 
-`tools/pre-execute` 是文档指定的策略接缝（`tool-bash` 里的 TODO 正指向它），也是 shell 命令的唯一路径，所以不存在绕过审批的执行路径。监听器以 `prepend: true` 注册，`forbidden` 不会被别的监听器覆盖。
+`tools/pre-execute` 是文档化的策略接缝,也是 shell 命令唯一的路径,没有旁路。监听器用 `prepend: true` 注册,所以别人无法覆盖「拒绝」。
 
-## 三种决策
+## 能力与规则
 
-- **allow** —— 没有规则反对，交给沙箱（沙箱仍是文件写入的围栏）；命中已记住的 `allow` 规则也走这里。
-- **prompt** —— 弹审批卡片。`允许一次` 只回答本次、不写任何东西；`总是允许` 写入建议的规则——可解析的每条命令一条（如 `cp` + `echo`），钉不住时则写入**整条命令原文**；`拒绝` 拒绝本次调用。
-- **已记住** —— 整行每条命令都被 allow 规则覆盖时，沙箱的提权询问也会被静默批准，于是「允许过的命令」以后彻底不再问。想保留每次手动确认，把 `autoApproveEscalations` 设为 `false`。
-- **forbidden** —— 直接拒绝并给理由，不询问、也不可升级：这类操作无论谁批准都是破坏性的。
+模型里有五种文件能力,一条规则只为某个路径授予其中若干种:
 
-## 命令怎么被分析
+| 能力 | 含义 |
+| --- | --- |
+| `read` | 读文件、列目录 |
+| `write` | 修改已有文件(内容、权限位、属主、时间) |
+| `create` | 新建文件或目录 |
+| `delete` | unlink / remove / rmdir / rename 移走 |
+| `execute` | 把某个文件作为程序启动 |
 
-1. `src/parse.js` 用 **tree-sitter + tree-sitter-bash**（真正的 bash 语法）解析，只读它给出的树：语句、管道、`&&`/`||`/`;`、`for`/`if`/`while`/`case`、子 shell、命令替换、重定向、here-doc 都由语法决定。`echo "a && b"` 是一条命令；`for f in a b; do echo $f; done` 里的命令会被逐条判定；here-doc 正文是独立节点，不会被当成命令。
-2. `bash -lc '…'`、`sh -c '…'` 的**内层程序会递归解析**（深度 4），逐条判定后取最严；内层解析不出来则整个调用视为 opaque → `prompt`。
-3. `$(…)` 与反引号里的命令**算作同一行的命令**，先于外层执行并参与聚合；被替换出来的**程序名**（`$(printf rm) -rf /`）视为动态可执行 → 整行无法分析。
-4. 语法树报错的输入（真正的语法错误，如引号不闭合、`if` 没有 `fi`）**直接拒绝**：shell 本来也跑不了它，所以不给审批、也不给规则。
-3. 每个简单命令的 argv 由内置表分类、与存储规则匹配，然后整条请求取最严：`forbidden > prompt > allow`。
-4. 无法分析的行是 `prompt`，且不会命中任何「按命令」的规则——这就是对 parser 不理解的 shell 语法的 fail-closed；但这类行仍可按**整条原文**固化，那也是唯一能命中它们的规则。
+`execute` 不等于「禁止运行任何脚本」:`python3 foo.py` 需要解释器的 `execute` 和 `foo.py` 的 `read`,因为 `foo.py` 本身没有被 `execve`。
 
-## 内联代码执行（shell wrapper 与解释器）
-
-高能力程序可以执行，但**不能把「任意代码执行」记成宽泛规则**。规则写不写得进去由 `validatePersistentRule()` 一处判定，`RuleStore` 写入前再判一次，读取时第三次过滤——所以 UI bug、未来调用方、手改配置都塞不进 `bash -c` / `python -c` 这类规则。
-
-| 命令 | 处理 |
-|---|---|
-| `bash -lc 'cargo test'` | **递归解析**内部 shell → 按 `cargo test` 判定；Always Allow 生成的是 `["cargo","test"]`，不是 `bash -lc` |
-| `bash -lc 'touch x && rm -rf /'` | 内部逐条判定后取最严 → `forbidden`（外层是 bash 不能绕过） |
-| `bash -lc 'X=$Y; $X foo'` | 内层解析失败 → 整个调用视为 **opaque** → `prompt` |
-| `python -c 'print(123)'` | 内联代码视为 **opaque 任意代码** → `prompt`；Always Allow 只能生成**精确到原文**的规则 `["python","-c","print(123)"]` |
-| `python tools/check.py` | 属于**脚本文件执行**，生成 `["python","tools/check.py"]`，之后 `… --verbose` 等不同参数照样命中 |
-| `python -` / `bash`（无 `-c`）、heredoc 程序 | 程序来自 stdin，argv 钉不住 → `prompt`；但可以**把整条命令原文钉死**（exact-source 规则） |
-| 无法解析的行（`for …; do …; done` 等） | `prompt`；同样可以按原文钉死 |
-
-**exact-source 规则**：当 per-command 钉不住（stdin 程序、heredoc、parser 不支持的语法）时，卡片补一条「总是允许这条完全相同的命令」——规则记录**整条命令文本**，只有文本完全相同（忽略首尾空白）才命中。同文本 ⇒ 同能力。
-
-- **混合行两条都给**：可解析的部分照旧给最小 capability 规则（`cd`、`git add`…），整行再补一条 exact pin，所以**没有命令是你无法永久放行的**。
-- **硬拒绝是唯一例外**：`rm -rf /`、`mkfs`、`dd of=/dev/…` 这类内置灾难判定默认仍不可记忆。想让它们也能按原文固化的部署，把配置 `allowForbiddenSource` 设为 `true`（默认 `false`）——打开后卡片会给「总是允许这条完全相同的命令」，且该 pin 才会生效。
-
-**内置策略只有两类硬结果**：语法错误 → 直接拒绝（无法运行的命令没必要审批）；其余风险一律收拢成 `prompt` + 一条具体规则。`forbidden` 另外保留给**你自己**写的规则（`/allow add forbidden …`），默认一条都没有。
-
-**被明确拒绝的宽泛规则**（写入时抛错，读取时忽略）：
-
-```
-bash · sh · zsh · dash · ksh · fish · pwsh        （单独出现）
-bash -c · bash -lc · sh -c · zsh -c …             （只有开关，没有代码文本）
-python · python3 · node · perl · ruby · lua · deno eval · php -r · osascript -e
-python - · node -                                 （从 stdin 读程序）
-eval · source · exec                              （单独出现）
-```
-
-另外，**靠参数选择要运行什么**的程序也按同一标准（规则必须带具体操作，不能只写程序名）：`git`（`-c alias.x='!cmd'`、`--exec-path`）、`npm`/`pnpm`/`yarn`/`bun`、`make`、`docker`/`podman`/`kubectl`、`ssh`、`sudo`/`su`/`doas`、`env`/`xargs`/`nohup`/`timeout`/`nice`。所以 `git` 单独一条会被拒绝，`git status` 可以；`sudo` 单独一条会被拒绝，`sudo apt update` 可以。
-
-判定规则：**规则必须把「将要运行的程序」钉死**——要么是内联开关后的那段代码文本，要么是脚本路径。`python -c 'print(123)'` 与 `python -c 'print(456)'` 是两条不同的能力，前者不会覆盖后者。`forbidden` 永远优先：即使存在精确 allow 规则，`rm -rf /` 仍然拒绝（`bash -lc 'rm -rf /'` 也一样）。
-
-卡片上的文案也跟着区分：内联代码给的是「**总是允许这条完全相同的命令**」，解析成功的外层则显示内层命令（`总是允许「cargo test」`）。
-
-## 内置策略
-
-看参数，不看名字黑名单：
-
-| 类别 | 例子 | 决策 |
-|---|---|---|
-| 灾难性 | `rm -rf /`、`rm -rf ~`、`rm -rf /*`、cwd 为 `/` 时的 `rm -rf .`、`mkfs*`、`dd of=/dev/sda`、`> /dev/sda` | forbidden |
-| 破坏性 | `rm`、`rmdir`、`mv`、`truncate`、`dd`、`shred`、`git reset --hard`、`git clean -fdx`、`git push --force` | prompt |
-| 提权 | `sudo`、`su`、`doas` | prompt |
-| 权限 | `chmod`、`chown`（递归/全局可写会额外标注） | prompt |
-| 进程/服务 | `kill`、`pkill`、`killall`、`systemctl`、`service`、`launchctl`、`mount`、`umount` | prompt |
-| 代码执行 | 不带 `-c` 的 `sh`、`python -c`、`node -e`、`eval`、`exec`、`source` | prompt |
-| 环境变量 | `PATH=`、`LD_PRELOAD=`、`DYLD_*`、`PYTHONPATH=`、`NODE_OPTIONS=`、`BASH_ENV=`、`export PATH=…` | prompt |
-| 重定向 | `> /etc/*`、`> ~/.ssh/*`、`> ~/.bashrc`、动态目标 | prompt |
-| 后台 | `cmd &` | prompt |
-| 网络 | `curl -o`、`wget -O`、`ssh`、`scp`、`rsync`、`nc` | prompt |
-| 容器 | `docker`、`podman` | prompt |
-| 路径 | cwd 为 `/` 或 `$HOME` 时的 `rm -rf .`；比较前先归一化 `~`、`..`、`/x/..` | 按 cwd 给 forbidden / prompt |
-
-一行里只要有一条命令钉不住（stdin 程序、被替换出来的程序名、parser 不支持的语法），其余命令的最小 capability 规则照旧给，**整行再补一条 exact pin**，所以不存在无法永久放行的行；含硬拒绝（可解析的 `rm -rf /` 等）的行默认不给建议，除非打开 `allowForbiddenSource`。
-
-建议规则的粒度：**风险程序多记参数、但不全量匹配**——`rm -rf build` → `["-rf","build"]`（因此 `rm -rf other` 仍会问）、`chmod 777 /etc/x` → `["777","/etc/x"]`、`git reset --hard` → `["reset"]`；重定向触发的提示会**同时**给出最小能力规则和整行 exact。
-
-没有任何规则命中的命令交给沙箱（`defaultDecision: allow`）；想全量把关就把它设成 `prompt`。
-
-## 持久规则是结构化的
-
-`$DSH_HOME/dsh-allow.json`：
+持久规则是「路径 + 能力表」,不是命令行:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "rules": [
-    { "id": "r1", "decision": "allow", "executable": "git", "argvPrefix": ["status"], "hits": 4 },
-    { "id": "r2", "decision": "forbidden", "executable": "dd", "argvPrefix": [] }
+    { "id": "f1", "path": "/Users/me/project/build", "recursive": true,
+      "access": { "write": true, "create": true, "delete": true },
+      "hits": 2, "createdAt": "2026-01-01T00:00:00.000Z" }
   ]
 }
 ```
 
-匹配是结构化的：可执行文件名（取 basename，所以 `/usr/bin/git` 与 `git` 是同一个程序）+ 字面量 argv 前缀。`git reset --hard` 不会命中 `['git','status']`；带展开参数的命令（`git status "$X"`）**不会**被 `allow` 规则覆盖。建议规则取最窄可用形式：程序名，加上有子命令的程序的子命令（`git status`、`pnpm install`）；选项和路径永不进入建议。
+`recursive: true` 覆盖整棵子树;`recursive: false` 只覆盖这一个路径 —— 卡片上的「总是允许这个文件」写的就是后者(单个二进制、单个文件)。
+
+## 优先级
+
+从高到低,某个能力第一次被某一级明确表态就按它执行;同一级内部,路径更具体的优先:
+
+1. **平台保留路径** —— `/System`、`/bin`、`/sbin`、`/usr`(除 `/usr/local`)、`/AppleInternal`、`/private/var/db`、`/dev` 的 `write`/`create`/`delete` 对任何人(包括用户规则)都拒绝;`/dev/null`、标准流与 `/usr/local` 例外。
+2. **显式规则** —— 规则文件(`source: user`)与本会话的「允许一次」(`source: session`)。
+3. **工作区规则** —— 会话 workspace 里的 `.dsh-allow.json`。
+4. **平台基线** —— workspace、临时目录、harness home,以及 macOS 自身需要的系统路径。
+5. **全局默认** —— 未授予。
+
+路径按规范化后的绝对路径逐段比较:`~`、相对路径、`.`、`..`、以及符号链接祖先都会先解析,所以 `/tmp/x` 与 `/private/tmp/x` 是同一条路径,也无法用 `../` 绕过规则。每次判定会同时拿「写法路径」和「真实路径」去匹配,因此 `/opt/homebrew/bin/gh` 的授权和它指向的 Cellar 二进制的授权各自有效,又都不会打开 `/opt/homebrew` 其余部分。
+
+## 默认权限与平台基线
+
+workspace 内:`read`、`write`、`create`、`execute` 允许,`delete` 默认拒绝。
+
+插件自己的临时目录与 harness home 五种全允许。系统路径给 macOS 必需的部分:`/bin`、`/sbin`、`/usr/bin`、`/usr/sbin`、`/usr/lib`、`/usr/libexec`、`/System`、`/Library/Apple`、`/Library/Developer` 给 `read` + `execute`;`/etc`、`/var`、`/usr`、`/usr/share`、`/Library`、`/Applications`、`/dev`、`/opt/homebrew` 只给 `read`。
+
+其余位置(包括 workspace 之外的 `$HOME`)在你打开之前都是关着的。`read-only` 会话会把基线收窄得和沙箱模式一致:workspace 只保留 `read` + `execute`。
+
+## Homebrew 与符号链接可执行文件
+
+Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/homebrew/**` 不可执行,因此每个 Homebrew 二进制都要单独授权一次。对 `execute /opt/homebrew/bin/gh` 点「总是允许」会同时写两条授权:你看到的那个名字,以及它解析到的 Cellar 二进制;两条都不覆盖第二个工具。
+
+## 命令的文件效果怎么读出来
+
+命令行用 `tree-sitter` + `tree-sitter-bash` 解析(结构:管道、列表、控制流、替换、重定向、here-document),然后按程序对参数做了什么,把每条简单命令变成 `(路径, 能力)`:`rm` 删除操作数、`mkdir` 创建、`mv` 删源建目标、`cp` 读源建目标、`grep` 读路径参数但绝不把 pattern 当路径、`sed -i` 读写同一个文件、`dd if=` 读而 `of=` 建、`curl -o` 建。重定向也算效果:`>` 写或建、`<` 读,空设备与标准流忽略。`sudo`、`doas`、`env`、`nice`、`nohup`、`timeout`、`command`、`exec` 会被跟到真正启动的程序,所以 `sudo rm -rf build` 仍然是一次对 `build` 的 delete。
+
+除此之外不从程序名推断任何东西;不在表里的程序只推导 `execute` —— 命令行看不出文件效果的程序(`git status`)完全不需要路径授权。
+
+## 内联程序:不再按整行原文审批
+
+`python3 -c '…'`、`node -e '…'`、`eval`,以及解析器无法还原的 shell 程序,既不会按文本判定,也不会被固定成原文规则:两条源码不同、能力相同的 `python3 -c` 行为一致,不会因为源码变了再问一次。运行由沙箱约束进程;只有在**没有**任何沙箱模式在约束时(模式未知,或 `danger-full-access`)这种行才会询问 —— 这是 fail closed 的那一支。
+
+「操作可见但路径是算出来的」是另一回事:`rm -rf "$DIR"` 明确是一次 delete,但路径无法核对,所以它会问,而不是搭上一条已有授权。一旦该操作在工作目录上被授予,它就不再询问,而沙箱会把运行期路径限制在你打开的范围里。
+
+## 卡片
+
+`拒绝`、`总是允许这个文件`、`总是允许这个文件夹`(两者不同时都给),以及`允许一次`,并显示真正缺的那一项:
+
+```
+需要文件权限
+操作: delete
+路径: /Users/me/project/build
+命令: rm -rf build
+沙箱: workspace-write
+```
+
+「总是允许」写持久规则;「允许一次」只在内存里给本会话授权,默认十分钟后过期,绝不写规则文件。
+
+## macOS 后端
+
+`src/macos.js` 会把规则集编译成 Seatbelt(`sandbox-exec`)profile,映射是对内核实测出来的,不是照抄的:
+
+| 能力 | SBPL 操作 |
+| --- | --- |
+| `read` | `file-read*` |
+| `write` | `file-write-data`、`file-write-attributes`、`file-write-mode`、`file-write-flags`、`file-write-owner`、`file-write-times` |
+| `create` | `file-write-create` |
+| `delete` | `file-write-unlink` |
+| `execute` | `process-exec` |
+
+macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `file-write-data` 与 `file-write-create`、同时不授予 `file-write-unlink`,进程就能改写和新建文件,而 `rm`、`rmdir`、`rename` 全部 EPERM —— 子进程同样继承这个 profile。Seatbelt 的过滤器匹配内核解析后的路径,所以渲染前必须先规范化。
+
+`test/sandbox.integration.mjs` 拿真内核验证了以上全部:workspace 读/写/建允许、删除被拒、授予 delete 后又能删、workspace 外写入被拒、execute 围栏拒绝未授权二进制、符号链接二进制按真实路径匹配、`python3 -c 'os.remove(…)'` 与子 shell 都被拒、内核拒绝的 profile 一个字节也不执行。
+
+## 到底在哪里被强制
+
+| 能力 | 命令级闸门(本插件) | 今天的 OS 沙箱 |
+| --- | --- | --- |
+| `write`、`create` | 有 | 有 —— workspace 根之外一律被 DSH 的 Seatbelt profile 拒绝 |
+| `delete` | 有,限于命令行能看出的效果 | **还没有** —— DSH profile 在 workspace 下授予 `file-write*`,其中包含 unlink |
+| `read` | 有 | 没有 —— 任何模式下读都放行 |
+| `execute` | 有 | 没有 —— profile 不管 `process-exec` |
+
+诚实的结果:看不清效果的程序(`python3 -c 'os.remove(…)'`)不会被策略拦下;命令行没写出来的 workspace 外读取也不会被沙箱拦下。把 delete 下沉到内核只差 `@deepseek-ai/dsh-sandbox-local` profile 里的一行 —— 对「规则未授予 delete」的根加 `(deny file-write-unlink (subpath …))`,由能力集喂给它;`/allow status` 会在终端打印上面这张表。
 
 ## `/allow`
 
 ```
-/allow                                        # 列出规则与命中次数
-/allow add allow git status                   # 手工加一条
-/allow add forbidden dd
+/allow                          列出已记住的规则
+/allow status                   默认权限与强制层现状
+/allow add delete,write build folder
+/allow add execute /opt/homebrew/bin/gh file
 /allow remove 2
 /allow clear
 ```
 
 ## 审计日志
 
-每次决策往 `$DSH_HOME/dsh-allow-audit.ndjson` 追加一行 NDJSON：时间、工具、cwd、原始命令、解析出的命令、决策、理由、风险、是否可分析、命中的规则。写入前会脱敏凭据形态的文本（`api_key=…`、`Authorization: Bearer …`、私钥），环境变量的值从不记录。
+每次非静默判定都会往 `$DSH_HOME/dsh-allow-audit.ndjson` 追加一行 JSON:命令、工作目录、决策、沙箱模式,以及支撑它的 `(能力, 路径)` 列表。凭据形状的文本在落盘前会被打码。
 
 ## 配置
 
 ```yaml
 - id: dsh-allow
   config:
-    rulesFile: /path/to/rules.json
-    auditFile: /path/to/audit.ndjson
-    audit: true
-    defaultDecision: allow      # 或 prompt：全量把关
-    autoApproveEscalations: true # false：已记住的命令在扩大沙箱权限时仍需确认
-    allowForbiddenSource: false   # true：硬拒绝的行也提供并认可「整条原文」的固化
+    rulesFile: /path/to/rules.json          # 默认 $DSH_HOME/dsh-allow.json
+    auditFile: /path/to/audit.ndjson        # 默认 $DSH_HOME/dsh-allow-audit.ndjson
+    audit: true                             # false 关闭审计
+    sessionGrantTtlMs: 600000               # 「允许一次」的有效期
+    autoApproveEscalations: true            # 已授权的命令自己回答提权询问
+    grants:                                 # 部署级授权,字段与持久规则一致
+      - path: /opt/homebrew
+        recursive: true
+        access: { read: true, execute: true }
 ```
+
+dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,并在第一次写入时留成 `<rulesFile>.v2.bak`:那些规则描述的是命令,不是文件能力,无法翻译。
 
 ## 测试
 
 ```sh
-npm test        # 策略套件 + 宿主套件 + 浏览器套件
+npm test              # 单元 + 宿主接线 + 卡片渲染 + 真实沙箱
+npm run test:unit     # 策略、效果推导、决策
+npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的宿主)
 ```
 
-`test/policy.spec.mjs` 跑规定用例与绕过尝试（`touch x; rm -rf /`、`||`、`|`、`(rm -rf /)`、`bash -c`、`eval`、`$COMMAND -rf /`、`$(printf rm)`、`rm -rf "$TARGET"`、`for … do rm …`、`if … then rm …`），断言其中没有任何一个是 `allow`。`test/smoke.mjs` 覆盖 gate、两条路由、规则存储、审计脱敏、宽规则拒绝与 `/allow`。`test/client.smoke.mjs` 渲染卡片（设置 `DSH_CHECKOUT` 才跑该断言）。
+当 `sandbox-exec` 无法应用 profile 时(包括测试本身跑在另一层 Seatbelt 沙箱里),集成套件会打印明显的 SKIP;要在真内核上验证,请从普通终端运行它。
 
 ## 限制
 
-- parser 建模的是受限 shell，不是 bash。它覆盖不到的语法一律 `prompt`，只有「整条原文」的固化能命中，按命令的规则永远不行。
-- 规则只作用于 `bash`/`pwsh` 命令行；`write`/`edit` 工具仍走自己的沙箱升级。
-- 卡片是本插件自己渲染的审批界面（内置卡片的按钮行不可扩展）：它接管沙箱升级请求与策略提示（策略提示的 reason 以 `dsh-allow: ` 开头做标记），其它审批仍走内置卡片。
-- DSH 目前不对网络出站做沙箱，因此 `curl`/`wget`/`ssh` 是策略提示，而不是强制限制。
+- 卡片按命令行判定;命令行看不出效果的程序由沙箱约束,而不是由本策略约束。
+- `read` 与 `execute` 目前是命令级的(见强制层表格);把它们下沉到内核所需的 macOS 映射已经在 `src/macos.js` 里实现并测试。
+- macOS 上只有 `create` 无法写出非空文件:填内容还需要 `file-write-data`,所以创建类授权通常同时带 `write`。
+- 改名需要源的 `delete` 加目标的 `create`。
+- 读效果只为固定的一张程序表推导;表里没有的效果交给沙箱,而不是猜。
 
 ## 许可证
 
-[MIT](LICENSE)
+MIT
