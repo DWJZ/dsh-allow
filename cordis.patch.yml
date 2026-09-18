@@ -3,7 +3,10 @@
 # 可选配置:
 #   - id: dsh-allow
 #     config:
-#       rulesFile: /path/to/dsh-allow.json   # 默认 $DSH_HOME/dsh-allow.json
+#       rulesFile: /path/to/rules.json        # 默认 $DSH_HOME/dsh-allow.json
+#       auditFile: /path/to/audit.ndjson      # 默认 $DSH_HOME/dsh-allow-audit.ndjson
+#       audit: true                           # 关掉审计写 false
+#       defaultDecision: allow                # 或 prompt: 全量把关
 - insert:
     - id: dsh-allow
       name: dsh-allow

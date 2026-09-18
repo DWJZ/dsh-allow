@@ -1,172 +1,74 @@
 /**
  * dsh-allow — host half.
  *
- * Remembers sandbox-escalation approvals, so a command the user already
- * allowed stops asking. It hooks the `approval/request` waterfall ahead of the
- * interactive answerer:
+ * A deterministic approval layer over shell tool calls, evaluated before
+ * anything executes:
  *
- * - A request whose logged tool call asks for `sandbox_permissions` (the
- *   sandbox-escalation shape) is matched against the stored rules.
- * - A hit allows the call without asking anyone.
- * - A miss asks the user with three answers: allow once, always allow this
- *   command prefix, or reject. "Always" stores a rule first, then allows.
- * - Every other approval request is delegated unchanged.
+ *   model writes a command
+ *     → tools/pre-execute gate: parse, classify, match stored rules
+ *     → allow: continue to the sandbox (which remains the write fence)
+ *       prompt: raise the approval card (allow once / always allow / deny)
+ *       forbidden: deny outright, no escalation possible
  *
- * A rule is scoped by tool, requested sandbox mode, and the command's leading
- * words, so allowing `pnpm dsh plugin` never allows `rm`. Rules live in
- * `$DSH_HOME/dsh-allow.json` and are managed with `/allow`.
+ * The gate consults the policy engine in `./policy.js`; the card consults this
+ * process through two loopback routes, because the browser knows only the tool
+ * name and call id. `always allow` stores the narrow structured rule the engine
+ * suggested, never the raw command line.
  */
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename } from 'node:path'
+import { describeRule, evaluateCommandLine } from './policy.js'
+import {
+  addRule, appendAudit, clearRules, countHit, createPendingStore, readRules, removeRule, resolveConfig, resolveHome,
+} from './store.js'
 
 /** Stable Cordis plugin name. */
 export const name = 'dsh-allow'
 
-/** Default rules-file name below the harness home. */
-const RULES_FILE_NAME = 'dsh-allow.json'
+/** Tools whose call carries a shell command line. */
+const SHELL_TOOLS = new Set(['bash', 'pwsh'])
 
-/** How many trailing session events one lookup scans for the tool call. */
+/** How many trailing session events one tool-call lookup scans. */
 const MAX_SCAN_EVENTS = 2000
 
-/** Longest command prefix a rule may store. */
-const MAX_PREFIX_WORDS = 4
-
 /**
- * Resolve the harness home: `$DSH_HOME` when set, otherwise `~/.dsh`.
- * @param env - environment to read.
- * @returns the absolute harness home.
+ * The command line one shell tool call carries, or null for other calls.
+ * @param exec - the pending tool execution.
+ * @returns the raw command, or null.
  */
-export function resolveHome(env = process.env) {
-  const configured = env.DSH_HOME
-  if (typeof configured === 'string' && configured.trim() !== '') return configured.trim()
-  return join(homedir(), '.dsh')
+export function commandOf(exec) {
+  if (!SHELL_TOOLS.has(exec?.name)) return null
+  const args = exec?.arguments
+  if (args === null || typeof args !== 'object') return null
+  return typeof args.command === 'string' && args.command.trim() !== '' ? args.command : null
 }
 
-/** Shell syntax that makes one line more than a single operation. */
-const COMPOUND_OPERATORS = /(?:&&|\|\||;|\||&|>|<|\$\(|`)/u
-
 /**
- * Whether one shell line is a single command a prefix rule may authorize.
- *
- * A rule grants the whole line, so a line that chains several operations —
- * `brew install gh && rm -rf /` — shares the prefix of the command it names
- * but not its effect. Leading `cd … &&` chains are stripped first, because the
- * rule names the program after them. Anything else carrying a second
- * operation, a substitution, or a redirect is not rememberable and always asks.
- * @param command - the raw shell command.
- * @returns true only for one simple command.
+ * The working directory one call runs in.
+ * @param exec - the pending tool execution.
+ * @param fallback - value used when neither the call nor its session names one.
+ * @returns the effective cwd.
  */
-export function isSimpleCommand(command) {
-  if (typeof command !== 'string') return false
-  if (command.includes('\n')) return false
-  let text = command.trim()
-  if (text === '') return false
-  for (;;) {
-    const cd = /^cd\s+(?:'[^']*'|"[^"]*"|\S+)\s*&&\s*/u.exec(text)
-    if (cd === null) break
-    text = text.slice(cd[0].length)
+export function cwdOf(exec, fallback = process.cwd()) {
+  const args = exec?.arguments
+  if (args !== null && typeof args === 'object' && typeof args.workdir === 'string' && args.workdir !== '') {
+    return args.workdir
   }
-  return text !== '' && !COMPOUND_OPERATORS.test(text)
+  const sessionCwd = exec?.agent?.session?.header?.cwd
+  return typeof sessionCwd === 'string' && sessionCwd !== '' ? sessionCwd : fallback
 }
 
 /**
- * Reduce a shell command to the stable leading words a rule can match.
- *
- * Leading `cd … &&` chains and `VAR=value` assignments are dropped. The first
- * word is the program and is reduced to its basename, so a rule recorded for
- * `/opt/homebrew/bin/gh repo view …` also covers a later `gh repo view …`; the
- * remaining words are kept until the first flag, path, assignment, or shell
- * operator. The result is what the dialog shows the user, so it stays short
- * and readable.
- * @param command - the raw shell command.
- * @returns the prefix, or an empty string when nothing usable remains.
- */
-export function commandPrefix(command) {
-  if (typeof command !== 'string') return ''
-  let text = command.trim()
-  for (;;) {
-    const cd = /^cd\s+(?:'[^']*'|"[^"]*"|\S+)\s*&&\s*/u.exec(text)
-    if (cd === null) break
-    text = text.slice(cd[0].length)
-  }
-  const words = text.split(/\s+/u).filter((word) => word !== '')
-  let start = 0
-  while (start < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[start])) start += 1
-  const kept = []
-  for (let index = start; index < words.length && kept.length < MAX_PREFIX_WORDS; index += 1) {
-    const word = words[index]
-    if (kept.length === 0) {
-      const program = word.split(/[\\/]/u).pop() ?? ''
-      if (program === '' || program === '.' || program === '..' || /[;&|<>()]/u.test(program)) break
-      kept.push(program)
-      continue
-    }
-    if (word.startsWith('-') || word.includes('/') || word.includes('=') || /[;&|<>()]/u.test(word)) break
-    kept.push(word)
-  }
-  return kept.join(' ')
-}
-
-/**
- * Read the stored rules.
- * @param file - absolute rules-file path.
- * @returns the rules, empty when the file is absent or unusable.
- */
-export function readRules(file) {
-  let parsed
-  try {
-    parsed = JSON.parse(readFileSync(file, 'utf8'))
-  }
-  catch {
-    // Missing or unparseable file reads as "no rules"; a broken file must not
-    // block approvals, which is the state a first run and a hand-edit share.
-    return []
-  }
-  const rules = parsed?.rules
-  if (!Array.isArray(rules)) return []
-  return rules.filter((rule) => typeof rule?.id === 'string'
-    && typeof rule?.tool === 'string'
-    && typeof rule?.mode === 'string'
-    && typeof rule?.prefix === 'string')
-}
-
-/**
- * Persist the rules, replacing the file atomically.
- * @param file - absolute rules-file path.
- * @param rules - the complete rule list.
- */
-export function writeRules(file, rules) {
-  mkdirSync(dirname(file), { recursive: true })
-  const temporary = `${file}.tmp`
-  writeFileSync(temporary, `${JSON.stringify({ version: 1, rules }, null, 2)}\n`, 'utf8')
-  renameSync(temporary, file)
-}
-
-/**
- * Find the rule that covers one escalation.
- * @param rules - stored rules.
- * @param query - tool, requested mode, and command prefix of the request.
- * @returns the matching rule, or null.
- */
-export function matchRule(rules, query) {
-  return rules.find((rule) => rule.tool === query.tool
-    && rule.mode === query.mode
-    && rule.prefix === query.prefix) ?? null
-}
-
-/**
- * Read one logged tool call's parsed arguments.
+ * Read the arguments of one logged tool call.
  * @param session - the session that logged the call.
- * @param callId - the approval request's call id.
- * @param maxScan - how many trailing events to scan.
- * @returns the parsed arguments object, or null when unavailable.
+ * @param callId - the call id.
+ * @returns the parsed arguments, or null when unavailable.
  */
-export function toolCallArguments(session, callId, maxScan = MAX_SCAN_EVENTS) {
+export function toolCallArguments(session, callId) {
   if (session === undefined || session === null || typeof callId !== 'string') return null
   const end = Number(session.seq)
   if (!Number.isFinite(end)) return null
-  const floor = Math.max(0, end - maxScan)
+  const floor = Math.max(0, end - MAX_SCAN_EVENTS)
   for (let seq = end - 1; seq >= floor; seq -= 1) {
     const event = session.eventAt(seq)
     if (event?.type !== 'tool/call' || event.data?.callId !== callId) continue
@@ -175,7 +77,7 @@ export function toolCallArguments(session, callId, maxScan = MAX_SCAN_EVENTS) {
       return typeof parsed === 'object' && parsed !== null ? parsed : null
     }
     catch {
-      // A malformed arguments blob is not an escalation this plugin recognizes.
+      // A malformed arguments blob carries no command to judge.
       return null
     }
   }
@@ -183,240 +85,118 @@ export function toolCallArguments(session, callId, maxScan = MAX_SCAN_EVENTS) {
 }
 
 /**
- * Recognize the sandbox-escalation shape in one tool call's arguments.
- * @param args - parsed tool-call arguments.
- * @returns the requested mode, command, and justification, or null.
+ * Record one decision in the pending store, when the call can address it.
+ * @param pendings - the pending store.
+ * @param exec - the pending call.
+ * @param decision - the engine's decision.
+ * @param command - the raw command.
+ * @param cwd - the effective cwd.
+ * @returns whether a record was written.
  */
-export function escalationOf(args) {
-  if (args === null || typeof args !== 'object') return null
-  const mode = args.sandbox_permissions
-  if (typeof mode !== 'string' || mode === '') return null
-  const command = typeof args.command === 'string' ? args.command : ''
-  if (command.trim() === '') return null
-  return {
-    mode,
+function remember(pendings, exec, decision, command, cwd) {
+  const sessionId = exec?.agent?.session?.id
+  const callId = exec?.callId
+  if (typeof callId !== 'string') return false
+  pendings.remember(sessionId, callId, {
     command,
-    justification: typeof args.justification === 'string' ? args.justification : '',
-  }
+    cwd,
+    decision: decision.decision,
+    reason: decision.reason,
+    risk: decision.risk,
+    analyzable: decision.analyzable,
+    label: decision.suggestion === null ? null : describeRule(decision.suggestion),
+    suggestion: decision.suggestion,
+    triggers: decision.triggers.map(trigger => trigger.command),
+  })
+  return true
 }
 
 /**
- * Add one rule, replacing an identical rule and keeping ids stable.
- * @param file - absolute rules-file path.
- * @param rule - tool, mode, and prefix to remember.
- * @returns the stored rule.
+ * Evaluate one command line against the stored rules and audit the outcome.
+ * @param options - configuration, home, the call, command, and cwd.
+ * @returns the engine's decision.
  */
-export function addRule(file, rule) {
-  const rules = readRules(file)
-  const existing = matchRule(rules, rule)
-  if (existing !== null) return existing
-  const stored = { id: `r${String(Date.now())}`, hits: 0, ...rule }
-  writeRules(file, [...rules, stored])
-  return stored
+export function decide({ config, home, exec, command, cwd }) {
+  const rules = readRules(config.rulesFile)
+  const decision = evaluateCommandLine({ command, cwd, home, rules, defaultDecision: config.defaultDecision })
+  for (const rule of decision.matchedRules) {
+    if (rule.decision === 'allow') countHit(config.rulesFile, rule.id)
+  }
+  if (config.audit) {
+    appendAudit(config.auditFile, {
+      tool: exec?.name ?? 'unknown',
+      cwd,
+      command,
+      commands: decision.commands,
+      decision: decision.decision,
+      reason: decision.reason,
+      risk: decision.risk,
+      analyzable: decision.analyzable,
+      matchedRules: decision.matchedRules.map(rule => ({
+        id: rule.id, decision: rule.decision, executable: rule.executable, argvPrefix: rule.argvPrefix,
+      })),
+    })
+  }
+  return decision
 }
 
 /**
- * Count one rule's use, best effort: a failed bookkeeping write must never
- * change the approval outcome.
- * @param file - absolute rules-file path.
- * @param id - rule id to count.
- */
-function countHit(file, id) {
-  try {
-    const rules = readRules(file)
-    const next = rules.map((rule) => (rule.id === id ? { ...rule, hits: (Number(rule.hits) || 0) + 1 } : rule))
-    writeRules(file, next)
-  }
-  catch {
-    // Bookkeeping only; the grant already happened.
-  }
-}
-
-/**
- * Create the approval listener.
- *
- * A remembered rule settles the ask here, before any UI sees it. Everything
- * else is handed to the next answerer — the browser approval card — after
- * recording what the card's "always allow" button would need to store, so the
- * button can ask this process what the command was.
- * @param options - rules file, logger, and the pending-escalation store.
+ * The `tools/pre-execute` gate.
+ * @param options - configuration, home, logger, and the pending store.
  * @returns the waterfall listener.
  */
-export function createApprovalListener({ file, logger, pendings }) {
-  return async (request, next) => {
-    const parsed = escalationOf(toolCallArguments(request?.agent?.session, request?.callId))
-    if (parsed === null) return next()
-    const prefix = commandPrefix(parsed.command)
-    if (prefix === '') {
-      // No rule can be offered for a command whose program is unreadable here;
-      // say so, so a delegation is diagnosable instead of silent.
-      logger.warn(`dsh-allow: no command prefix in ${JSON.stringify(parsed.command)} — delegating this approval`)
-      return next()
-    }
-    const query = { tool: request.toolName, mode: parsed.mode, prefix }
-    // A rule grants the whole shell line, so it may only settle a line that IS
-    // the command it names: a compound line shares the prefix without sharing
-    // the effect, and always asks.
-    const rememberable = isSimpleCommand(parsed.command)
-    if (rememberable) {
-      const hit = matchRule(readRules(file), query)
-      if (hit !== null) {
-        logger.info(`dsh-allow: allowed "${query.tool}" ${query.prefix} (rule ${hit.id}, ${query.mode}) without asking`)
-        countHit(file, hit.id)
-        return 'allowed-once'
+export function createGate({ config, home, logger, pendings }) {
+  return async (exec, next) => {
+    const command = commandOf(exec)
+    if (command === null) return next()
+    const cwd = cwdOf(exec)
+    const decision = decide({ config, home, exec, command, cwd })
+    if (decision.decision === 'allow') return next()
+    remember(pendings, exec, decision, command, cwd)
+    const headline = decision.triggers[0]?.command ?? command
+    if (decision.decision === 'forbidden') {
+      logger.warn(`dsh-allow: denied ${JSON.stringify(headline)} — ${decision.reason}`)
+      return {
+        kind: 'deny',
+        reason: `dsh-allow refused this command: ${decision.reason}. Do not retry it, and do not look for another way to perform the same operation.`,
       }
     }
-    pendings.remember(request, query, parsed.command, rememberable)
+    logger.info(`dsh-allow: asking about ${JSON.stringify(headline)} — ${decision.reason}`)
+    return { kind: 'ask', reason: `${decision.reason} (${headline})` }
+  }
+}
+
+/**
+ * The approval listener: give an escalation that skipped the gate a pending
+ * record of its own, then let the card answer it.
+ * @param options - configuration, home, and the pending store.
+ * @returns the waterfall listener.
+ */
+export function createApprovalListener({ config, home, pendings }) {
+  return async (request, next) => {
+    const sessionId = request?.agent?.session?.id
+    const callId = request?.callId
+    if (typeof callId === 'string' && pendings.get(sessionId, callId) === null) {
+      const args = toolCallArguments(request?.agent?.session, callId)
+      const command = typeof args?.command === 'string' && args.command.trim() !== '' ? args.command : null
+      if (command !== null) {
+        const sessionCwd = request?.agent?.session?.header?.cwd
+        const cwd = typeof args?.workdir === 'string' && args.workdir !== ''
+          ? args.workdir
+          : (typeof sessionCwd === 'string' && sessionCwd !== '' ? sessionCwd : process.cwd())
+        const decision = decide({ config, home, exec: { name: 'bash', callId }, command, cwd })
+        remember(pendings, { callId, agent: request.agent }, decision, command, cwd)
+      }
+    }
     return next()
   }
-}
-
-/** Separator between a session id and a call id in one pending key. */
-const PENDING_SEPARATOR = '\u0000'
-
-/**
- * The key one approval request's pending entry is stored under.
- * @param session - the requesting session, when known.
- * @param callId - the tool call under decision.
- * @returns the key, or null when either half is unavailable.
- */
-export function pendingKey(session, callId) {
-  const id = typeof session === 'string' ? session : session?.id
-  if (typeof id !== 'string' || typeof callId !== 'string') return null
-  return `${id}${PENDING_SEPARATOR}${callId}`
-}
-
-/**
- * Create the store of escalations whose prompt is currently on screen.
- *
- * It exists so the card's "always allow" button can ask this process what the
- * command was: the browser only knows the tool name and call id, and the rule
- * needs the command prefix.
- * @param options - entry lifetime, entry cap, and clock.
- * @returns the pending store.
- */
-export function createPendingStore({ ttlMs = 15 * 60 * 1000, limit = 100, now = Date.now } = {}) {
-  const entries = new Map()
-  const prune = () => {
-    for (const [key, entry] of entries) {
-      if (now() - entry.at > ttlMs) entries.delete(key)
-    }
-  }
-  return {
-    /**
-     * Record one escalation that was just handed to the interactive answerer.
-     * @param request - the approval request being delegated.
-     * @param query - tool, mode, and prefix the rule would use.
-     * @param command - the full command shown to the user.
-     * @param rememberable - whether a rule may cover this command at all.
-     */
-    remember(request, query, command, rememberable = true) {
-      const key = pendingKey(request?.agent?.session, request?.callId)
-      if (key === null) return
-      prune()
-      entries.set(key, { ...query, command, rememberable, at: now() })
-      while (entries.size > limit) {
-        const oldest = entries.keys().next().value
-        if (oldest === undefined) break
-        entries.delete(oldest)
-      }
-    },
-    /**
-     * Read one pending escalation.
-     * @param session - the requesting session, or its id.
-     * @param callId - the tool call under decision.
-     * @returns the recorded entry, or null.
-     */
-    get(session, callId) {
-      const key = pendingKey(session, callId)
-      if (key === null) return null
-      prune()
-      return entries.get(key) ?? null
-    },
-  }
-}
-
-/**
- * Render the stored rules for `/allow`.
- * @param file - absolute rules-file path.
- * @returns the command's answer text.
- */
-export function renderRules(file) {
-  const rules = readRules(file)
-  if (rules.length === 0) {
-    return '还没有记住任何命令。下次权限弹窗里选「总是允许…」，规则就会出现在这里。'
-  }
-  const lines = [`已记住 ${String(rules.length)} 条允许规则：`]
-  for (const [index, rule] of rules.entries()) {
-    const hits = Number(rule.hits) || 0
-    lines.push(`${String(index + 1)}. ${rule.tool} · ${rule.mode} · 「${rule.prefix}」${hits > 0 ? `（已用 ${String(hits)} 次）` : ''}`)
-  }
-  lines.push('用 /allow remove <编号> 删除一条，/allow clear 清空。')
-  return lines.join('\n')
-}
-
-/**
- * Answer `/allow`.
- * @param file - absolute rules-file path.
- * @param rawInput - text after the command name.
- * @returns the command result.
- */
-export function runAllowCommand(file, rawInput) {
-  const input = rawInput.trim()
-  if (input === '') return { kind: 'success', text: renderRules(file) }
-  const [verb, ...rest] = input.split(/\s+/u)
-  if (verb === 'list') return { kind: 'success', text: renderRules(file) }
-  if (verb === 'clear') {
-    const count = readRules(file).length
-    try {
-      unlinkSync(file)
-    }
-    catch {
-      // An absent file already means "no rules".
-    }
-    return { kind: 'success', text: `已清空 ${String(count)} 条规则。` }
-  }
-  if (verb === 'remove') {
-    const rules = readRules(file)
-    const index = Number(rest[0])
-    if (!Number.isSafeInteger(index) || index < 1 || index > rules.length) {
-      return { kind: 'error', text: `用法：/allow remove <编号>（1-${String(rules.length)}）` }
-    }
-    const removed = rules[index - 1]
-    writeRules(file, rules.filter((_, position) => position !== index - 1))
-    return { kind: 'success', text: `已删除规则「${removed.tool} · ${removed.prefix}」。` }
-  }
-  if (verb === 'add') {
-    const [tool, mode, ...prefixWords] = rest
-    const prefix = prefixWords.join(' ')
-    if (tool === undefined || mode === undefined || prefix === '') {
-      return { kind: 'error', text: '用法：/allow add <tool> <模式> <命令前缀>，例如 /allow add bash danger-full-access pnpm dsh plugin' }
-    }
-    const stored = addRule(file, { tool, mode, prefix })
-    return { kind: 'success', text: `已记住：${stored.tool} · ${stored.mode} · 「${stored.prefix}」` }
-  }
-  return { kind: 'error', text: '用法：/allow [list|add <tool> <模式> <前缀>|remove <编号>|clear]' }
-}
-
-/**
- * Normalize the plugin configuration.
- * @param config - raw config object from cordis.yml, possibly absent.
- * @param home - resolved harness home.
- * @returns the rules-file path.
- */
-export function resolveConfig(config, home) {
-  const configured = config?.rulesFile
-  if (configured !== undefined && (typeof configured !== 'string' || configured === '')) {
-    throw new TypeError(`dsh-allow: config rulesFile must be a non-empty string, got ${JSON.stringify(configured)}`)
-  }
-  return { file: configured ?? join(home, RULES_FILE_NAME) }
 }
 
 /**
  * Answer one route with JSON.
  * @param res - the response to own.
- * @param statusCode - HTTP status to send.
- * @param payload - value serialized as the body.
+ * @param statusCode - HTTP status.
+ * @param payload - JSON body.
  */
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload)
@@ -436,10 +216,6 @@ function isLoopback(req) {
 
 /**
  * Whether a state-changing request came from this Web host itself.
- *
- * Storing a rule is a durable grant, so the peer address and a matching
- * Origin/Host pair are the whole authorization: a forwarding header means the
- * loopback peer is a proxy rather than the page.
  * @param req - incoming request.
  * @returns true only for a direct same-origin loopback request.
  */
@@ -465,7 +241,7 @@ function sameOriginLoopback(req) {
  * Read one JSON request body.
  * @param req - incoming request.
  * @param limit - largest accepted body in bytes.
- * @returns the parsed body, or an empty object for an empty body.
+ * @returns the parsed body.
  */
 async function readJsonBody(req, limit = 64 * 1024) {
   const chunks = []
@@ -480,8 +256,8 @@ async function readJsonBody(req, limit = 64 * 1024) {
 }
 
 /**
- * The card's read route: what one pending escalation would remember.
- * @param options - the pending-escalation store.
+ * The card's read route.
+ * @param options - the pending store.
  * @returns a Web-host route handler.
  */
 export function createPendingHandler({ pendings }) {
@@ -496,30 +272,31 @@ export function createPendingHandler({ pendings }) {
       return
     }
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    const entry = pendings.get(url.searchParams.get('sessionId'), url.searchParams.get('callId'))
-    if (entry === null) {
+    const record = pendings.get(url.searchParams.get('sessionId'), url.searchParams.get('callId'))
+    if (record === null) {
       sendJson(res, 404, { ok: false })
       return
     }
     sendJson(res, 200, {
       ok: true,
-      rememberable: entry.rememberable === true,
-      ...entry.rememberable === true ? {} : { reason: 'compound' },
-      tool: entry.tool,
-      mode: entry.mode,
-      prefix: entry.prefix,
-      command: entry.command,
+      rememberable: record.suggestion !== null && record.decision !== 'forbidden',
+      label: record.label,
+      command: record.command,
+      cwd: record.cwd,
+      reason: record.reason,
+      risk: record.risk,
+      decision: record.decision,
+      triggers: record.triggers,
     })
   }
 }
 
 /**
- * The card's "always allow" route: store the rule, then let the card grant the
- * call. A second identical click finds the rule already present.
- * @param options - pending-escalation store, rules file, and logger.
+ * The card's "always allow" route.
+ * @param options - pending store, configuration, and logger.
  * @returns a Web-host route handler.
  */
-export function createRememberHandler({ pendings, file, logger }) {
+export function createRememberHandler({ pendings, config, logger }) {
   return async (req, res) => {
     if (req.method !== 'POST') {
       res.writeHead(405, { allow: 'POST' })
@@ -532,18 +309,22 @@ export function createRememberHandler({ pendings, file, logger }) {
     }
     try {
       const body = await readJsonBody(req)
-      const entry = pendings.get(body?.sessionId, body?.callId)
-      if (entry === null) {
+      const record = pendings.get(body?.sessionId, body?.callId)
+      if (record === null) {
         sendJson(res, 404, { ok: false, error: 'this approval is no longer pending' })
         return
       }
-      if (entry.rememberable !== true) {
-        sendJson(res, 409, { ok: false, error: '这是复合命令,不会被记住' })
+      if (record.suggestion === null || record.decision === 'forbidden') {
+        sendJson(res, 409, { ok: false, error: 'this command cannot be remembered' })
         return
       }
-      const stored = addRule(file, { tool: entry.tool, mode: entry.mode, prefix: entry.prefix })
-      logger.info(`dsh-allow: remembered "${stored.tool}" ${stored.prefix} (${stored.mode}) as rule ${stored.id}`)
-      sendJson(res, 200, { ok: true, tool: stored.tool, mode: stored.mode, prefix: stored.prefix })
+      const stored = addRule(config.rulesFile, record.suggestion)
+      logger.info(`dsh-allow: remembered "${describeRule(stored)}" as rule ${stored.id}`)
+      sendJson(res, 200, {
+        ok: true,
+        label: describeRule(stored),
+        rule: { decision: stored.decision, executable: stored.executable, argvPrefix: stored.argvPrefix },
+      })
     }
     catch (error) {
       sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
@@ -552,19 +333,67 @@ export function createRememberHandler({ pendings, file, logger }) {
 }
 
 /**
- * Wire the approval listener, the card's two routes, and the `/allow` command.
- * @param ctx - Cordis context of this plugin's fiber.
- * @param config - validated plugin configuration from cordis.yml.
+ * Render the stored rules.
+ * @param file - rules-file path.
+ * @returns the command's answer text.
  */
-export function apply(ctx, config) {
-  const { file } = resolveConfig(config, resolveHome())
+export function renderRules(file) {
+  const rules = readRules(file)
+  if (rules.length === 0) return '还没有记住任何规则。审批卡片上选「总是允许…」就会写入一条。'
+  const lines = [`已记住 ${String(rules.length)} 条规则：`]
+  for (const [index, rule] of rules.entries()) {
+    const hits = Number(rule.hits) || 0
+    lines.push(`${String(index + 1)}. ${rule.decision} · ${describeRule(rule)}${hits > 0 ? `（已用 ${String(hits)} 次）` : ''}`)
+  }
+  lines.push('用 /allow remove <编号> 删除，/allow clear 清空。')
+  return lines.join('\n')
+}
+
+/**
+ * Answer `/allow`.
+ * @param file - rules-file path.
+ * @param rawInput - text after the command name.
+ * @returns the command result.
+ */
+export function runAllowCommand(file, rawInput) {
+  const input = rawInput.trim()
+  if (input === '' || input === 'list') return { kind: 'success', text: renderRules(file) }
+  const [verb, ...rest] = input.split(/\s+/u)
+  if (verb === 'clear') return { kind: 'success', text: `已清空 ${String(clearRules(file))} 条规则。` }
+  if (verb === 'remove') {
+    const removed = removeRule(file, Number(rest[0]))
+    return removed === null
+      ? { kind: 'error', text: `用法：/allow remove <编号>（1-${String(readRules(file).length)}）` }
+      : { kind: 'success', text: `已删除规则「${describeRule(removed)}」。` }
+  }
+  if (verb === 'add') {
+    const [decision, executable, ...argvPrefix] = rest
+    if (!['allow', 'prompt', 'forbidden'].includes(decision) || executable === undefined) {
+      return { kind: 'error', text: '用法：/allow add <allow|prompt|forbidden> <程序> [参数前缀…]，例如 /allow add allow git status' }
+    }
+    const stored = addRule(file, { decision, executable: basename(executable), argvPrefix })
+    return { kind: 'success', text: `已记住：${stored.decision} · ${describeRule(stored)}` }
+  }
+  return { kind: 'error', text: '用法：/allow [list|add <决策> <程序> [参数…]|remove <编号>|clear]' }
+}
+
+/**
+ * Wire the gate, the approval listener, the card routes, and `/allow`.
+ * @param ctx - Cordis context of this plugin's fiber.
+ * @param pluginConfig - plugin configuration from cordis.yml.
+ */
+export function apply(ctx, pluginConfig) {
+  const config = resolveConfig(pluginConfig, resolveHome())
+  const home = homedir()
   const pendings = createPendingStore()
-  const listener = createApprovalListener({ file, logger: ctx.logger, pendings })
-  // Ahead of the interactive answerer: a remembered rule must settle the ask
-  // before the browser is troubled with it.
-  ctx.on('approval/request', (request, next) => listener(request, next), { prepend: true })
+  const gate = createGate({ config, home, logger: ctx.logger, pendings })
+  // Ahead of every other pre-execute listener: a forbidden command must be
+  // denied before any other policy can allow it.
+  ctx.on('tools/pre-execute', (exec, next) => gate(exec, next), { prepend: true })
+  const approvalListener = createApprovalListener({ config, home, pendings })
+  ctx.on('approval/request', (request, next) => approvalListener(request, next), { prepend: true })
   const pendingHandler = createPendingHandler({ pendings })
-  const rememberHandler = createRememberHandler({ pendings, file, logger: ctx.logger })
+  const rememberHandler = createRememberHandler({ pendings, config, logger: ctx.logger })
   ctx.inject(['webServer'], (webCtx) => {
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact',
@@ -580,9 +409,9 @@ export function apply(ctx, config) {
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.effect(() => commandCtx.commands.register({
       name: 'allow',
-      description: 'List or change the commands that no longer ask for approval',
-      input: { hint: '[list|add <tool> <mode> <prefix>|remove <number>|clear]' },
-      handler: (invocation) => runAllowCommand(file, invocation.rawInput),
+      description: 'List or change the shell commands that no longer ask for approval',
+      input: { hint: '[list|add <decision> <program> [args…]|remove <number>|clear]' },
+      handler: invocation => runAllowCommand(config.rulesFile, invocation.rawInput),
     }), 'dsh-allow: /allow command')
   })
 }

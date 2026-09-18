@@ -1,7 +1,6 @@
 /**
- * dsh-allow host smoke test — drives the approval listener, the pending store,
- * the card's two routes, and `/allow` against a fake session and fake HTTP
- * objects. No host, no network.
+ * Host wiring suite: the pre-execute gate, the card routes, the rule store, the
+ * audit log, and `/allow`. No host, no network.
  *
  * Usage: `node test/smoke.mjs`.
  */
@@ -11,10 +10,15 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const PLUGIN = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const plugin = await import(pathToFileURL(join(PLUGIN, 'src/index.js')).href)
+const host = await import(pathToFileURL(join(PLUGIN, 'src/index.js')).href)
+const store = await import(pathToFileURL(join(PLUGIN, 'src/store.js')).href)
 
 const root = mkdtempSync(join(tmpdir(), 'dsh-allow-'))
-const file = join(root, 'dsh-allow.json')
+const rulesFile = join(root, 'rules.json')
+const auditFile = join(root, 'audit.ndjson')
+const config = { rulesFile, auditFile, audit: true, defaultDecision: 'allow' }
+const HOME = '/Users/tester'
+const CWD = '/Users/tester/project'
 
 let failures = 0
 const check = (name, condition, detail = '') => {
@@ -25,20 +29,16 @@ const check = (name, condition, detail = '') => {
   }
 }
 
-/** One fake session holding the given `tool/call` events. */
-const makeSession = (calls, id = 's1') => ({
-  id,
-  seq: calls.length,
-  eventAt: (seq) => (calls[seq] === undefined ? undefined : { type: 'tool/call', data: calls[seq] }),
+const logger = { info: () => {}, warn: () => {}, error: () => {} }
+const session = { id: 's1', header: { cwd: CWD } }
+const exec = (command, { name = 'bash', callId = 'c1', workdir } = {}) => ({
+  name,
+  callId,
+  arguments: { command, ...(workdir === undefined ? {} : { workdir }) },
+  agent: { session },
 })
 
-const call = (callId, args) => ({ callId, name: 'bash', arguments: JSON.stringify(args) })
-const escalationCall = (callId, command, mode = 'danger-full-access') => call(callId, { command, sandbox_permissions: mode, justification: '需要写 profile' })
-
-/** One approval request for a session's call. */
-const request = (session, callId = 'c1', toolName = 'bash') => ({ agent: { session }, toolName, callId, reason: 'escalate sandbox to danger-full-access: 需要写 profile' })
-
-/** A request object as a Web route sees it. */
+/** A Web route request. */
 function fakeRequest({ method = 'GET', url = '/', headers = {}, body, remoteAddress = '127.0.0.1' } = {}) {
   return {
     method,
@@ -51,7 +51,7 @@ function fakeRequest({ method = 'GET', url = '/', headers = {}, body, remoteAddr
   }
 }
 
-/** A response object recording what the handler wrote. */
+/** A response object recording what a handler wrote. */
 function fakeResponse() {
   return {
     statusCode: 0,
@@ -61,150 +61,109 @@ function fakeResponse() {
   }
 }
 
-const logger = { info: () => {}, warn: () => {}, error: () => {} }
-
-console.log('command prefix')
-const prefixes = [
-  ['pnpm dsh plugin --profile web add link:/Users/x', 'pnpm dsh plugin'],
-  ['CI=true pnpm dsh plugin --profile web remove dsh-balance', 'pnpm dsh plugin'],
-  ['cd /tmp && brew install gh', 'brew install gh'],
-  ['git push -u origin main', 'git push'],
-  ['node /tmp/script.mjs 25000', 'node'],
-  ['rm -rf /', 'rm'],
-  ['/opt/homebrew/bin/gh repo view DWJZ/dsh-allow --json name 2>&1 | head -3', 'gh repo view'],
-  ['/bin/rm -rf /tmp/x', 'rm'],
-  ['cd /tmp && /usr/local/bin/node script.mjs', 'node script.mjs'],
-  ['~/bin/tool --flag', 'tool'],
-  ['   ', ''],
-]
-for (const [command, expected] of prefixes) {
-  check(`"${command}" → "${expected}"`, plugin.commandPrefix(command) === expected, plugin.commandPrefix(command))
-}
-
-console.log('escalation shape')
-check('a sandbox escalation is recognized', plugin.escalationOf({ command: 'ls /root', sandbox_permissions: 'danger-full-access' })?.mode === 'danger-full-access')
-check('an ordinary call is not an escalation', plugin.escalationOf({ command: 'ls' }) === null)
-check('an escalation without a command is ignored', plugin.escalationOf({ sandbox_permissions: 'danger-full-access' }) === null)
-
-console.log('tool call lookup')
-const session = makeSession([call('other', { command: 'ls' }), escalationCall('c1', 'pnpm dsh plugin --profile web add x')])
-check('the logged call is found by id', plugin.toolCallArguments(session, 'c1')?.command === 'pnpm dsh plugin --profile web add x')
-check('an unknown call id yields null', plugin.toolCallArguments(session, 'nope') === null)
-
-console.log('rules file')
-rmSync(file, { force: true })
-check('a missing file reads as no rules', plugin.readRules(file).length === 0)
-const stored = plugin.addRule(file, { tool: 'bash', mode: 'danger-full-access', prefix: 'pnpm dsh plugin' })
-check('a rule is stored with an id', typeof stored.id === 'string' && plugin.readRules(file).length === 1)
-plugin.addRule(file, { tool: 'bash', mode: 'danger-full-access', prefix: 'pnpm dsh plugin' })
-check('an identical rule is not duplicated', plugin.readRules(file).length === 1)
-check('a matching query finds the rule', plugin.matchRule(plugin.readRules(file), { tool: 'bash', mode: 'danger-full-access', prefix: 'pnpm dsh plugin' }) !== null)
-check('another tool does not match', plugin.matchRule(plugin.readRules(file), { tool: 'write', mode: 'danger-full-access', prefix: 'pnpm dsh plugin' }) === null)
-check('another mode does not match', plugin.matchRule(plugin.readRules(file), { tool: 'bash', mode: 'workspace-write', prefix: 'pnpm dsh plugin' }) === null)
-check('another prefix does not match', plugin.matchRule(plugin.readRules(file), { tool: 'bash', mode: 'danger-full-access', prefix: 'pnpm install' }) === null)
+console.log('rule store')
+rmSync(rulesFile, { force: true })
+check('a missing file reads as no rules', store.readRules(rulesFile).length === 0)
+const rule = store.addRule(rulesFile, { decision: 'allow', executable: 'git', argvPrefix: ['status'] })
+check('a rule is stored with an id and a prefix', rule.id !== undefined && rule.argvPrefix[0] === 'status', JSON.stringify(rule))
+store.addRule(rulesFile, { decision: 'allow', executable: 'git', argvPrefix: ['status'] })
+check('an identical rule is not duplicated', store.readRules(rulesFile).length === 1)
+check('removing by position works', store.removeRule(rulesFile, 1)?.executable === 'git' && store.readRules(rulesFile).length === 0)
+check('an out-of-range removal is refused', store.removeRule(rulesFile, 5) === null)
+store.addRule(rulesFile, { decision: 'allow', executable: 'touch', argvPrefix: [] })
+check('clear empties the file', store.clearRules(rulesFile) === 1 && store.readRules(rulesFile).length === 0)
 
 console.log('pending store')
 const clock = { now: 1000 }
-const pendings = plugin.createPendingStore({ ttlMs: 100, now: () => clock.now })
-pendings.remember(request(session), { tool: 'bash', mode: 'danger-full-access', prefix: 'mkdir' }, 'mkdir -p /x')
-check('a remembered escalation is readable by ids', pendings.get('s1', 'c1')?.prefix === 'mkdir')
-check('an unknown call id reads as null', pendings.get('s1', 'c2') === null)
-check('another session does not see it', pendings.get('s2', 'c1') === null)
+const pendings = store.createPendingStore({ ttlMs: 100, now: () => clock.now })
+pendings.remember('s1', 'c1', { command: 'rm x', suggestion: { decision: 'allow', executable: 'rm', argvPrefix: [] } })
+check('a pending record is readable', pendings.get('s1', 'c1')?.command === 'rm x')
+check('another call id is not', pendings.get('s1', 'c2') === null)
 clock.now += 500
-check('an expired entry is pruned', pendings.get('s1', 'c1') === null)
-check('a request without a session id is not remembered',
-  (() => {
-    const other = plugin.createPendingStore()
-    other.remember({ callId: 'c9' }, { tool: 'bash', mode: 'm', prefix: 'p' }, 'p')
-    return other.get(undefined, 'c9') === null
-  })())
+check('an expired record is pruned', pendings.get('s1', 'c1') === null)
 
-console.log('approval listener')
-rmSync(file, { force: true })
-const pendingStore = plugin.createPendingStore()
-const listener = plugin.createApprovalListener({ file, logger, pendings: pendingStore })
+console.log('pre-execute gate')
+rmSync(rulesFile, { force: true })
+rmSync(auditFile, { force: true })
+const gatePendings = store.createPendingStore()
+const gate = host.createGate({ config, home: HOME, logger, pendings: gatePendings })
 let nextCalls = 0
-const next = () => { nextCalls += 1; return Promise.resolve('delegated') }
+const next = () => { nextCalls += 1; return Promise.resolve({ kind: 'allow' }) }
 
-let outcome = await listener(request(session), next)
-check('an unmatched escalation is delegated to the card', outcome === 'delegated', outcome)
-check('and recorded for the card button', pendingStore.get('s1', 'c1')?.prefix === 'pnpm dsh plugin', JSON.stringify(pendingStore.get('s1', 'c1')))
-check('the record carries the command', pendingStore.get('s1', 'c1')?.command.startsWith('pnpm dsh plugin'), pendingStore.get('s1', 'c1')?.command)
+let decision = await gate(exec('ls -la'), next)
+check('an unremarkable command continues to the sandbox', decision.kind === 'allow' && nextCalls === 1, JSON.stringify(decision))
 
-plugin.addRule(file, { tool: 'bash', mode: 'danger-full-access', prefix: 'pnpm dsh plugin' })
-outcome = await listener(request(session), next)
-check('a stored rule allows without any card', outcome === 'allowed-once', outcome)
-check('the hit is counted', plugin.readRules(file)[0]?.hits === 1, JSON.stringify(plugin.readRules(file)[0]))
+decision = await gate(exec('git reset --hard'), next)
+check('a destructive command asks for approval', decision.kind === 'ask', JSON.stringify(decision))
+check('and the reason names the command', String(decision.reason).includes('git reset --hard'), decision.reason)
+check('and a pending record exists for the card', gatePendings.get('s1', 'c1')?.suggestion?.executable === 'git', JSON.stringify(gatePendings.get('s1', 'c1')))
+check('the suggested rule keeps the subcommand', gatePendings.get('s1', 'c1')?.label === 'git reset', String(gatePendings.get('s1', 'c1')?.label))
 
-const plainSession = makeSession([call('c1', { command: 'ls /root' })])
+decision = await gate(exec('rm -rf /'), next)
+check('a catastrophic command is denied outright', decision.kind === 'deny', JSON.stringify(decision))
+
 const before = nextCalls
-outcome = await listener(request(plainSession), next)
-check('a non-escalation delegates', outcome === 'delegated' && nextCalls === before + 1, `${outcome} / ${String(nextCalls)}`)
+decision = await gate(exec('ls', { name: 'read' }), next)
+check('a non-shell tool is untouched', decision.kind === 'allow' && nextCalls === before + 1, JSON.stringify(decision))
 
-console.log('compound commands')
-check('a simple command is rememberable', plugin.isSimpleCommand('brew install gh') === true)
-check('a cd-prefixed simple command is rememberable', plugin.isSimpleCommand('cd /tmp && brew install gh') === true)
-check('a chained command is not', plugin.isSimpleCommand('brew install gh && rm -rf /') === false)
-check('a semicolon chain is not', plugin.isSimpleCommand('brew install gh; rm -rf /') === false)
-check('a pipe is not', plugin.isSimpleCommand('cat list | sh') === false)
-check('a redirect is not', plugin.isSimpleCommand('echo hi > /etc/hosts') === false)
-check('a substitution is not', plugin.isSimpleCommand('rm -rf $(cat list)') === false)
-check('a backtick substitution is not', plugin.isSimpleCommand('rm -rf `cat list`') === false)
-check('a multi-line command is not', plugin.isSimpleCommand('touch a\nrm -rf /') === false)
-check('an empty command is not', plugin.isSimpleCommand('   ') === false)
+store.addRule(rulesFile, { decision: 'allow', executable: 'git', argvPrefix: ['status'] })
+decision = await gate(exec('git status'), next)
+check('a stored rule allows the covered command', decision.kind === 'allow', JSON.stringify(decision))
+check('and counts the hit', store.readRules(rulesFile)[0]?.hits === 1, JSON.stringify(store.readRules(rulesFile)[0]))
 
-rmSync(file, { force: true })
-plugin.addRule(file, { tool: 'bash', mode: 'danger-full-access', prefix: 'brew install gh' })
-const compoundSession = makeSession([escalationCall('c1', 'brew install gh && rm -rf /')])
-const compoundStore = plugin.createPendingStore()
-const compoundListener = plugin.createApprovalListener({ file, logger, pendings: compoundStore })
-outcome = await compoundListener(request(compoundSession), next)
-check('a compound line never rides a stored rule', outcome === 'delegated', outcome)
-check('and is recorded as not rememberable', compoundStore.get('s1', 'c1')?.rememberable === false, JSON.stringify(compoundStore.get('s1', 'c1')))
-check('the stored rule stays un-hit', (plugin.readRules(file)[0]?.hits ?? 1) === 0, JSON.stringify(plugin.readRules(file)[0]))
+decision = await gate(exec('touch x && rm -rf /'), next)
+check('a chained catastrophic command is still denied', decision.kind === 'deny', JSON.stringify(decision))
+
+console.log('audit log')
+const lines = readFileSync(auditFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+check('every decision is logged', lines.length >= 5, String(lines.length))
+check('the log records the decision and the parsed commands', lines.some(line => line.decision === 'forbidden' && Array.isArray(line.commands)), JSON.stringify(lines.at(-1)))
+const secretGate = host.createGate({
+  config: { ...config, auditFile: join(root, 'secret.ndjson') },
+  home: HOME,
+  logger,
+  pendings: store.createPendingStore(),
+})
+await secretGate(exec('curl -H "Authorization: Bearer abc123" https://x'), next)
+const secretLine = readFileSync(join(root, 'secret.ndjson'), 'utf8')
+check('credential-shaped text is redacted', secretLine.includes('[redacted]') && !secretLine.includes('abc123'), secretLine.slice(0, 200))
 
 console.log('card routes')
-const routeStore = plugin.createPendingStore()
-routeStore.remember(request(session), { tool: 'bash', mode: 'danger-full-access', prefix: 'mkdir' }, 'mkdir -p /x')
-const pendingHandler = plugin.createPendingHandler({ pendings: routeStore })
-
+const routePendings = store.createPendingStore()
+routePendings.remember('s1', 'c1', {
+  command: 'rm -rf build',
+  cwd: CWD,
+  decision: 'prompt',
+  reason: 'rm deletes files',
+  risk: 'destructive',
+  analyzable: true,
+  label: 'rm',
+  suggestion: { decision: 'allow', executable: 'rm', argvPrefix: [] },
+  triggers: ['rm -rf build'],
+})
+const pendingHandler = host.createPendingHandler({ pendings: routePendings })
 let response = fakeResponse()
 pendingHandler(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1' }), response)
-check('the pending route answers the card', response.statusCode === 200 && JSON.parse(response.body).prefix === 'mkdir', response.body)
+const payload = JSON.parse(response.body)
+check('the card learns the label, risk, and cwd', payload.label === 'rm' && payload.risk === 'destructive' && payload.cwd === CWD, response.body)
 response = fakeResponse()
-pendingHandler(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=nope' }), response)
-check('an unknown pending is a 404', response.statusCode === 404, String(response.statusCode))
+pendingHandler(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=none' }), response)
+check('an unknown approval is a 404', response.statusCode === 404, String(response.statusCode))
 response = fakeResponse()
 pendingHandler(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1', remoteAddress: '10.0.0.5' }), response)
-check('the pending route is loopback only', response.statusCode === 403, String(response.statusCode))
+check('the route is loopback only', response.statusCode === 403, String(response.statusCode))
 response = fakeResponse()
 pendingHandler(fakeRequest({ url: '/dsh-allow/pending', method: 'POST' }), response)
-check('the pending route refuses POST', response.statusCode === 405, String(response.statusCode))
+check('the route refuses POST', response.statusCode === 405, String(response.statusCode))
 
 {
-  const compoundStoreForCard = plugin.createPendingStore()
-  compoundStoreForCard.remember(request(session), { tool: 'bash', mode: 'danger-full-access', prefix: 'brew install gh' }, 'brew install gh && rm -rf /', false)
-  const res = fakeResponse()
-  plugin.createPendingHandler({ pendings: compoundStoreForCard })(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1' }), res)
-  const body = JSON.parse(res.body)
-  check('the card is told a compound line is not rememberable', body.rememberable === false && body.reason === 'compound', res.body)
-
-  const res2 = fakeResponse()
-  await plugin.createRememberHandler({ pendings: compoundStoreForCard, file, logger })(fakeRequest({
-    method: 'POST',
-    url: '/dsh-allow/remember',
-    headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId: 's1', callId: 'c1' }),
-  }), res2)
-  check('the remember route refuses a compound line', res2.statusCode === 409, String(res2.statusCode))
-}
-
-{
-  const ruleFile = join(root, 'remember.json')
-  const rememberStore = plugin.createPendingStore()
-  rememberStore.remember(request(session), { tool: 'bash', mode: 'danger-full-access', prefix: 'gh repo view' }, 'gh repo view x')
-  const rememberHandler = plugin.createRememberHandler({ pendings: rememberStore, file: ruleFile, logger })
-
+  const rememberFile = join(root, 'remember.json')
+  const rememberPendings = store.createPendingStore()
+  rememberPendings.remember('s1', 'c1', {
+    command: 'git reset --hard', cwd: CWD, decision: 'prompt', reason: 'discards changes', risk: 'destructive',
+    analyzable: true, label: 'git reset', suggestion: { decision: 'allow', executable: 'git', argvPrefix: ['reset'] }, triggers: [],
+  })
+  const rememberHandler = host.createRememberHandler({ pendings: rememberPendings, config: { ...config, rulesFile: rememberFile }, logger })
   let res = fakeResponse()
   await rememberHandler(fakeRequest({
     method: 'POST',
@@ -212,83 +171,68 @@ check('the pending route refuses POST', response.statusCode === 405, String(resp
     headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
     body: JSON.stringify({ sessionId: 's1', callId: 'c1' }),
   }), res)
-  check('the remember route stores the rule', res.statusCode === 200 && JSON.parse(res.body).prefix === 'gh repo view', res.body)
-  check('and the rules file gained it', plugin.readRules(ruleFile).some((rule) => rule.prefix === 'gh repo view'), JSON.stringify(plugin.readRules(ruleFile)))
-
+  check('always-allow stores the suggested rule', res.statusCode === 200 && JSON.parse(res.body).label === 'git reset', res.body)
+  check('and the rule landed in the file', store.readRules(rememberFile)[0]?.argvPrefix?.[0] === 'reset', JSON.stringify(store.readRules(rememberFile)))
   res = fakeResponse()
   await rememberHandler(fakeRequest({
-    method: 'POST',
-    url: '/dsh-allow/remember',
-    headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId: 's1', callId: 'gone' }),
-  }), res)
-  check('an unknown pending is refused', res.statusCode === 404, String(res.statusCode))
-
-  res = fakeResponse()
-  await rememberHandler(fakeRequest({
-    method: 'POST',
-    url: '/dsh-allow/remember',
+    method: 'POST', url: '/dsh-allow/remember',
     headers: { origin: 'http://evil.test', 'content-type': 'application/json' },
     body: JSON.stringify({ sessionId: 's1', callId: 'c1' }),
   }), res)
   check('a cross-origin remember is refused', res.statusCode === 403, String(res.statusCode))
 
+  const forbiddenPendings = store.createPendingStore()
+  forbiddenPendings.remember('s1', 'c9', {
+    command: 'rm -rf /', cwd: CWD, decision: 'forbidden', reason: 'filesystem root', risk: 'catastrophic',
+    analyzable: true, label: null, suggestion: null, triggers: [],
+  })
   res = fakeResponse()
-  await rememberHandler(fakeRequest({
-    method: 'POST',
-    url: '/dsh-allow/remember',
+  await host.createRememberHandler({ pendings: forbiddenPendings, config, logger })(fakeRequest({
+    method: 'POST', url: '/dsh-allow/remember',
     headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
-    body: 'not json',
+    body: JSON.stringify({ sessionId: 's1', callId: 'c9' }),
   }), res)
-  check('a malformed body is a 400', res.statusCode === 400, String(res.statusCode))
+  check('a forbidden command can never be remembered', res.statusCode === 409, String(res.statusCode))
 }
 
 console.log('/allow command')
-rmSync(file, { force: true })
-check('an empty list explains itself', plugin.runAllowCommand(file, '').text.includes('还没有记住任何命令'))
-const added = plugin.runAllowCommand(file, 'add bash danger-full-access make build')
-check('add stores a rule', added.kind === 'success' && plugin.readRules(file).length === 1, JSON.stringify(added))
-check('list renders the rule', plugin.runAllowCommand(file, 'list').text.includes('make build'), plugin.runAllowCommand(file, 'list').text)
-check('remove needs a valid index', plugin.runAllowCommand(file, 'remove 9').kind === 'error')
-check('remove drops the rule', plugin.runAllowCommand(file, 'remove 1').kind === 'success' && plugin.readRules(file).length === 0)
-plugin.runAllowCommand(file, 'add bash danger-full-access make build')
-check('clear empties the file', plugin.runAllowCommand(file, 'clear').kind === 'success' && plugin.readRules(file).length === 0)
-check('an unknown verb explains the usage', plugin.runAllowCommand(file, 'wat').kind === 'error')
+rmSync(rulesFile, { force: true })
+check('an empty list explains itself', host.runAllowCommand(rulesFile, '').text.includes('还没有记住任何规则'))
+check('add stores a structured rule', host.runAllowCommand(rulesFile, 'add allow git status').kind === 'success' && store.readRules(rulesFile)[0]?.argvPrefix?.[0] === 'status')
+check('list renders it', host.runAllowCommand(rulesFile, 'list').text.includes('allow · git status'), host.runAllowCommand(rulesFile, 'list').text)
+check('an invalid decision is refused', host.runAllowCommand(rulesFile, 'add sometimes git').kind === 'error')
+check('remove drops it', host.runAllowCommand(rulesFile, 'remove 1').kind === 'success' && store.readRules(rulesFile).length === 0)
+check('an unknown verb explains the usage', host.runAllowCommand(rulesFile, 'wat').kind === 'error')
 
 console.log('apply')
 const registered = { listeners: [], commands: [], routes: [] }
 const ctx = {
   logger,
-  on: (name, listener, options) => { registered.listeners.push({ name, options }); registered.listener = listener },
+  on: (name, listener, options) => { registered.listeners.push({ name, options }) },
   get: () => undefined,
   inject: (names, factory) => {
     if (names.includes('webServer')) {
-      factory({
-        effect: (create) => create(),
-        webServer: { register: (route) => { registered.routes.push(route); return () => {} } },
-      })
+      factory({ effect: create => create(), webServer: { register: route => { registered.routes.push(route); return () => {} } } })
       return
     }
-    factory({ effect: (create) => create(), commands: { register: (definition) => { registered.commands.push(definition); return () => {} } } })
+    factory({ effect: create => create(), commands: { register: definition => { registered.commands.push(definition); return () => {} } } })
   },
 }
-plugin.apply(ctx, { rulesFile: file })
-check('the approval listener is prepended', registered.listeners[0]?.name === 'approval/request' && registered.listeners[0]?.options?.prepend === true, JSON.stringify(registered.listeners))
-check('both card routes are registered', registered.routes.map((route) => route.path).join(',') === '/dsh-allow/pending,/dsh-allow/remember', JSON.stringify(registered.routes.map((route) => route.path)))
-check('/allow is registered', registered.commands[0]?.name === 'allow' && registered.commands[0]?.description.includes('approval'))
-check('an invalid rulesFile config fails loud', (() => {
+host.apply(ctx, { rulesFile, auditFile })
+check('both listeners are prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
+check('the gate listens on tools/pre-execute', registered.listeners.some(entry => entry.name === 'tools/pre-execute'))
+check('the card listens on approval/request', registered.listeners.some(entry => entry.name === 'approval/request'))
+check('both routes are registered', registered.routes.map(route => route.path).join(',') === '/dsh-allow/pending,/dsh-allow/remember', JSON.stringify(registered.routes.map(route => route.path)))
+check('/allow is registered', registered.commands[0]?.name === 'allow')
+check('a bad config fails loud', (() => {
   try {
-    plugin.apply(ctx, { rulesFile: '' })
+    host.apply(ctx, { defaultDecision: 'maybe' })
     return false
   }
   catch {
     return true
   }
 })())
-
-console.log('persistence')
-plugin.runAllowCommand(file, 'add bash danger-full-access make build')
-check('the file is valid JSON with a version', JSON.parse(readFileSync(file, 'utf8')).version === 1)
 
 rmSync(root, { recursive: true, force: true })
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)

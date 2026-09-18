@@ -18,7 +18,7 @@
   ],
   "main": "src/index.js",
   "scripts": {
-    "test": "node test/smoke.mjs && node test/client.smoke.mjs"
+    "test": "node test/policy.spec.mjs && node test/smoke.mjs && node test/client.smoke.mjs"
   },
   "exports": {
     ".": "./src/index.js",
