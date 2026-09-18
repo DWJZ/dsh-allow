@@ -66,7 +66,10 @@ A capable interpreter may run, but its capability is never remembered broadly. O
 | `python -` / `bash` without `-c`, here-documents | the program comes from stdin, so argv cannot pin it → `prompt`, but the whole line can be pinned to its own text (an exact-source rule) |
 | Anything the parser cannot reduce (`for …; do …; done`) | `prompt`, likewise pinnable to its own text |
 
-**Exact-source rules**: when nothing per-command can be pinned (stdin programs, here-documents, syntax the parser does not model), the card offers *Always allow this exact command*. The rule stores the whole command text and matches only byte-identical text (surrounding whitespace ignored) — the same text runs the same program. Refuse-only guard: an unparsable line containing a recursive `rm`, `mkfs`, `dd of=/dev/`, or a raw-device redirect is neither offered nor matched by such a rule.
+**Exact-source rules**: when nothing per-command can be pinned (stdin programs, here-documents, syntax the parser does not model), the card adds *Always allow this exact command*. The rule stores the whole command text and matches only byte-identical text (surrounding whitespace ignored) — the same text runs the same program.
+
+- **A mixed line gets both**: the parsable members keep their minimal capability rules and the whole line is added as an exact pin, so no command is left unsilenceable.
+- **Hard denials are the one exception**: the built-in catastrophic verdicts (`rm -rf /`, `mkfs`, `dd of=/dev/…`) are not rememberable by default. A deployment that wants to pin those exact lines sets `allowForbiddenSource: true` (default `false`); only then does the card offer the pin and honour it.
 
 **Broad rules that are refused** (the store throws on write; the reader ignores them):
 

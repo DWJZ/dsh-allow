@@ -64,6 +64,9 @@ export function resolveConfig(config, home) {
     // that is what "stop asking for this command" means for a path outside
     // the workspace. Turn it off to keep every widening manual.
     autoApproveEscalations: config?.autoApproveEscalations !== false,
+    // Off by default: the built-in catastrophic denials stay final. Turning it
+    // on lets the user pin one of those exact lines to its own text.
+    allowForbiddenSource: config?.allowForbiddenSource === true,
   }
 }
 

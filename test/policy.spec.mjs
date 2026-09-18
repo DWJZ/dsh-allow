@@ -170,8 +170,9 @@ console.log('a mixed line still offers what it can remember')
 const mixed = "cd /tmp && python3 - <<'PY'\nprint(1)\nPY\ngit add -A && git commit -m x"
 const mixedDecision = evaluate(mixed)
 check('a line with inline code still prompts', mixedDecision.decision === 'prompt', mixedDecision.decision)
-check('and it still suggests rules for the other commands', mixedDecision.suggestions.map(policy.describeRule).join(' + ') === 'cd + git add + git commit', JSON.stringify(mixedDecision.suggestions))
-check('while flagging that part of it can never be remembered', mixedDecision.partial === true)
+check('and it still suggests rules for the other commands', ['cd', 'git add', 'git commit'].every(name => mixedDecision.suggestions.some(rule => rule.exact !== true && policy.describeRule(rule) === name)), JSON.stringify(mixedDecision.suggestions.map(rule => policy.describeRule(rule))))
+check('and adds the whole line as an exact pin', mixedDecision.suggestions.some(rule => rule.exact === true), JSON.stringify(mixedDecision.suggestions.map(rule => rule.exact)))
+check('so nothing in it is left unsilenceable', mixedDecision.partial === false)
 check('and it is not covered', mixedDecision.covered === false)
 const clean = evaluate('git add -A && git commit -m x')
 check('the same commands without inline code are fully rememberable', clean.partial === false && clean.suggestions.length === 2, JSON.stringify(clean.suggestions))
@@ -182,6 +183,21 @@ check('the python heredoc reader prompts as code execution', evaluate("python3 -
 check('and it is offered as an exact command', evaluate("python3 - <<'PY'\nprint(1)\nPY").suggestions[0]?.exact === true)
 check('a shell heredoc reader prompts too', evaluate('bash <<EOF\nrm -rf /\nEOF').decision === 'prompt')
 check('quoted << is not a heredoc', evaluate('echo "a << b"').decision === 'allow')
+
+console.log('everything can be pinned, directly or through the opt-in')
+check('an unparsable line always offers its own text', evaluate('for f in a; do rm -rf /; done').suggestions.some(rule => rule.exact === true))
+check('a partly pinnable line offers both', (() => {
+  const mixed2 = evaluate('cd /tmp && python3 - <<PY\nprint(1)\nPY')
+  return mixed2.suggestions.some(rule => rule.exact === true) && mixed2.suggestions.some(rule => rule.exact !== true)
+})(), JSON.stringify(evaluate('cd /tmp && python3 - <<PY\nprint(1)\nPY').suggestions))
+const forbiddenFlag = (command, rules, allowForbiddenSource) => policy.evaluateCommandLine({
+  command, cwd: CWD, home: HOME, rules, allowForbiddenSource,
+})
+check('a hard denial offers nothing by default', forbiddenFlag('rm -rf /', [], false).suggestions.length === 0)
+check('and offers its exact text when the deployment opts in', forbiddenFlag('rm -rf /', [], true).suggestions[0]?.exact === true)
+const forbiddenPin = [{ id: 'pin', decision: 'allow', executable: 'rm', argvPrefix: [], source: 'rm -rf /', exact: true }]
+check('that pin is ignored while the switch is off', forbiddenFlag('rm -rf /', forbiddenPin, false).decision === 'forbidden')
+check('and honoured while it is on', forbiddenFlag('rm -rf /', forbiddenPin, true).decision === 'allow')
 
 console.log('unparsable lines are rememberable exactly')
 const heredocCommand = "python3 - <<'PY'\nprint(1)\nPY"
@@ -200,8 +216,7 @@ check('and is offered as an exact command', loopPinned.suggestions[0]?.exact ===
 const loopRule = [{ id: 'loop', decision: 'allow', executable: 'for', argvPrefix: [], source: loopLine, exact: true }]
 check('the identical construct is then allowed', evaluate(loopLine, loopRule).decision === 'allow')
 check('a different construct is not', evaluate('for f in a c; do echo $f; done', loopRule).decision === 'prompt')
-check('a catastrophic unparsable line is never offered', evaluate('for f in a; do rm -rf /; done').suggestions.length === 0)
-check('nor matched by a source rule', evaluate('for f in a; do rm -rf /; done', [{ id: 'bad', decision: 'allow', executable: 'for', argvPrefix: [], source: 'for f in a; do rm -rf /; done', exact: true }]).decision === 'prompt')
+check('an unparsable line keeps its own text as the pin', evaluate('for f in a; do rm -rf /; done', [{ id: 'bad', decision: 'allow', executable: 'for', argvPrefix: [], source: 'for f in a; do rm -rf /; done', exact: true }]).decision === 'allow')
 check('a source rule is a valid persistent rule', policy.validatePersistentRule({ decision: 'allow', executable: 'python3', argvPrefix: [], source: 'python3 -c x' }).ok === true)
 
 console.log('redirections are not sequencing')

@@ -309,6 +309,8 @@ const ctx = {
   },
 }
 host.apply(ctx, { rulesFile, auditFile })
+check('the forbidden-pin switch defaults off', store.resolveConfig({}, '/tmp').allowForbiddenSource === false)
+check('and can be turned on by configuration', store.resolveConfig({ allowForbiddenSource: true }, '/tmp').allowForbiddenSource === true)
 check('both listeners are prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
 check('the gate listens on tools/pre-execute', registered.listeners.some(entry => entry.name === 'tools/pre-execute'))
 check('the card listens on approval/request', registered.listeners.some(entry => entry.name === 'approval/request'))

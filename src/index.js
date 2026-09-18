@@ -124,7 +124,9 @@ function remember(pendings, exec, decision, command, cwd) {
  */
 export function decide({ config, home, exec, command, cwd, silent = false }) {
   const rules = readRules(config.rulesFile)
-  const decision = evaluateCommandLine({ command, cwd, home, rules, defaultDecision: config.defaultDecision })
+  const decision = evaluateCommandLine({
+    command, cwd, home, rules, defaultDecision: config.defaultDecision, allowForbiddenSource: config.allowForbiddenSource,
+  })
   // A silent re-judgement (the escalation listener) must not count a use.
   if (!silent) {
     for (const rule of decision.matchedRules) {

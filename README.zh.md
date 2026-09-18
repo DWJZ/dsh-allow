@@ -66,7 +66,10 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
 | `python -` / `bash`（无 `-c`）、heredoc 程序 | 程序来自 stdin，argv 钉不住 → `prompt`；但可以**把整条命令原文钉死**（exact-source 规则） |
 | 无法解析的行（`for …; do …; done` 等） | `prompt`；同样可以按原文钉死 |
 
-**exact-source 规则**：当 per-command 钉不住（stdin 程序、heredoc、parser 不支持的语法）时，卡片给的是「总是允许这条完全相同的命令」——规则记录**整条命令文本**，只有文本完全相同（忽略首尾空白）才命中。同文本 ⇒ 同能力。安全兜底：parser 无法分析的行若含递归 `rm` / `mkfs` / `dd of=/dev/` / 写裸设备，**不给**这条规则，也不被这类规则命中（只能拒绝，永远不会放行）。
+**exact-source 规则**：当 per-command 钉不住（stdin 程序、heredoc、parser 不支持的语法）时，卡片补一条「总是允许这条完全相同的命令」——规则记录**整条命令文本**，只有文本完全相同（忽略首尾空白）才命中。同文本 ⇒ 同能力。
+
+- **混合行两条都给**：可解析的部分照旧给最小 capability 规则（`cd`、`git add`…），整行再补一条 exact pin，所以**没有命令是你无法永久放行的**。
+- **硬拒绝是唯一例外**：`rm -rf /`、`mkfs`、`dd of=/dev/…` 这类内置灾难判定默认仍不可记忆。想让它们也能按原文固化的部署，把配置 `allowForbiddenSource` 设为 `true`（默认 `false`）——打开后卡片会给「总是允许这条完全相同的命令」，且该 pin 才会生效。
 
 **被明确拒绝的宽泛规则**（写入时抛错，读取时忽略）：
 
