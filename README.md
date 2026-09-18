@@ -39,7 +39,7 @@ process execution
 ## Decisions
 
 - **allow** — no policy rule objects; execution continues to the sandbox, which stays the fence for filesystem writes. A stored `allow` rule also lands here.
-- **prompt** — the approval card asks. `Allow once` answers only the current call and writes nothing; `Always allow` stores the suggested rule (one per command in the line, e.g. `cp` + `echo`); `Deny` refuses the call.
+- **prompt** — the approval card asks. `Allow once` answers only the current call and writes nothing; `Always allow` stores the suggested rules — one per parsable command (`cp` + `echo`), or the exact command text when part of the line cannot be pinned. `Deny` refuses the call.
 - **remembered** — a command line whose every member matches an allow rule also answers the sandbox's escalation question silently, so a command you allowed once stops asking for good. Set `autoApproveEscalations: false` to keep every widening manual.
 - **forbidden** — denied outright with a reason. No approval is requested and no escalation is possible, because the denied operation is destructive regardless of who approves it.
 
@@ -47,10 +47,10 @@ process execution
 
 1. `src/parse.js` splits the line on unquoted `&&`, `||`, `;`, `|`, `&`, and newlines, then tokenizes each segment with quoting and escapes intact. `echo "a && b"` is one command; `$(…)`, backticks, globs, subshells, groups, control keywords, here-documents, and dynamic executables all make the line **unanalysable**.
 2. `sh -c '…'`, `bash -lc '…'`, and `eval '…'` are parsed **recursively** (depth 4). A wrapper whose program is dynamic is unanalysable.
-3. Here-document bodies (`<<EOF … EOF`) are **stdin data, not shell source**, so they are removed before parsing — a Python line inside one is no longer read as a command. The reader is still judged: `python3 -` or a shell without `-c` takes its program from stdin, which is code execution and is never rememberable.
+3. Here-document bodies (`<<EOF … EOF`) are **stdin data, not shell source**, so they are removed before parsing — a Python line inside one is no longer read as a command. The reader is still judged: `python3 -` or a shell without `-c` takes its program from stdin, which is code execution — pinned only as the exact command text.
 4. `$(…)` and backticks are parsed recursively too: the substituted commands join the same line and are aggregated with it (`echo "$(rm -rf /)"` is forbidden). A substitution the parser cannot reduce makes the whole line a prompt, and a substituted **program name** is always unanalysable, so `$(printf rm) -rf /` is never allowed.
 5. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
-6. Unanalysable lines are `prompt` and can never match an `allow` rule — the fail-closed rule for shell syntax this parser does not model.
+6. Unanalysable lines are `prompt` and match no per-command rule — the fail-closed rule for shell syntax this parser does not model. They can still be pinned as one exact command, which is the only rule that reaches them.
 
 ## Inline execution: shell wrappers and interpreters
 
@@ -150,6 +150,7 @@ Every decision appends one NDJSON line to `$DSH_HOME/dsh-allow-audit.ndjson`: ti
     audit: true
     defaultDecision: allow      # or prompt: gate every command
     autoApproveEscalations: true # false: a remembered command still asks before widening the sandbox
+    allowForbiddenSource: false   # true: also offer/honour an exact pin for hard-denied lines
 ```
 
 ## Test
@@ -158,11 +159,11 @@ Every decision appends one NDJSON line to `$DSH_HOME/dsh-allow-audit.ndjson`: ti
 npm test        # policy suite, host suite, browser suite
 ```
 
-`test/policy.spec.mjs` runs the required cases and bypass attempts (`touch x; rm -rf /`, `||`, `|`, `(rm -rf /)`, `bash -c`, `eval`, `$COMMAND -rf /`, `$(printf rm)`, `rm -rf "$TARGET"`, `for … do rm …`, `if … then rm …`) and asserts that none of them is `allow`. `test/smoke.mjs` covers the gate, routes, rule store, audit redaction, and `/allow`. `test/client.smoke.mjs` renders the card (set `DSH_CHECKOUT` for that assertion).
+`test/policy.spec.mjs` runs the required cases and bypass attempts (`touch x; rm -rf /`, `||`, `|`, `(rm -rf /)`, `bash -c`, `eval`, `$COMMAND -rf /`, `$(printf rm)`, `rm -rf "$TARGET"`, `for … do rm …`, `if … then rm …`) and asserts that none of them is `allow`. `test/smoke.mjs` covers the gate, routes, rule store, audit redaction, the broad-rule refusals, and `/allow`. `test/client.smoke.mjs` renders the card (set `DSH_CHECKOUT` for that assertion).
 
 ## Limits
 
-- The parser models a restricted shell, not bash. Anything outside it is `prompt`, never `allow`.
+- The parser models a restricted shell, not bash. Anything outside it is `prompt`; only an exact command pin can reach it, never a per-command rule.
 - A rule is scoped to one tool family (`bash`/`pwsh` commands); `write`/`edit` tools keep their own sandbox escalation.
 - The card is this plugin's own render of the approval UI (the built-in card's action row is not extensible). It claims sandbox-escalation asks and policy prompts (a policy reason is marked with a `dsh-allow: ` prefix); other approvals keep the built-in card.
 - Network egress is not sandboxed by DSH, so `curl`/`wget`/`ssh` are policy prompts rather than enforced restrictions.
