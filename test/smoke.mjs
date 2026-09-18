@@ -95,6 +95,7 @@ check('an unremarkable command continues to the sandbox', decision.kind === 'all
 
 decision = await gate(exec('git reset --hard'), next)
 check('a destructive command asks for approval', decision.kind === 'ask', JSON.stringify(decision))
+check('and the prompt carries the card marker', String(decision.reason).startsWith(host.POLICY_REASON_PREFIX), decision.reason)
 check('and the reason names the command', String(decision.reason).includes('git reset --hard'), decision.reason)
 check('and a pending record exists for the card', gatePendings.get('s1', 'c1')?.suggestions?.[0]?.executable === 'git', JSON.stringify(gatePendings.get('s1', 'c1')))
 check('the suggested rule keeps the subcommand', gatePendings.get('s1', 'c1')?.label === 'git reset', String(gatePendings.get('s1', 'c1')?.label))

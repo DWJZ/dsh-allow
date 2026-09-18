@@ -58,6 +58,8 @@ const pending = {
 }
 check('a sandbox escalation is taken over', client.escalationOf(pending) === pending)
 check('another approval is left to the built-in card', client.escalationOf({ ...pending, reason: 'hook requires approval' }) === null)
+const policyPrompt = { ...pending, reason: 'dsh-allow: rm deletes files (rm -rf build)' }
+check('a policy prompt is claimed by this card', client.escalationOf(policyPrompt) === policyPrompt)
 check('a non-approval interaction is ignored', client.escalationOf({ kind: 'question' }) === null)
 check('an absent interaction is ignored', client.escalationOf(undefined) === null)
 

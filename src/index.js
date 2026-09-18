@@ -28,6 +28,9 @@ export const name = 'dsh-allow'
 /** Tools whose call carries a shell command line. */
 const SHELL_TOOLS = new Set(['bash', 'pwsh'])
 
+/** Marks a policy-layer approval reason, so the card claims it. */
+export const POLICY_REASON_PREFIX = 'dsh-allow: '
+
 /** How many trailing session events one tool-call lookup scans. */
 const MAX_SCAN_EVENTS = 2000
 
@@ -163,7 +166,9 @@ export function createGate({ config, home, logger, pendings }) {
       }
     }
     logger.info(`dsh-allow: asking about ${JSON.stringify(headline)} — ${decision.reason}`)
-    return { kind: 'ask', reason: `${decision.reason} (${headline})` }
+    // The prefix is the card's marker: it tells the client this prompt belongs
+    // to the policy layer, so the card can offer its rule button.
+    return { kind: 'ask', reason: `${POLICY_REASON_PREFIX}${decision.reason} (${headline})` }
   }
 }
 

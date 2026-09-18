@@ -256,7 +256,7 @@ export function classifyBuiltin(command, context) {
     return { decision: 'prompt', risk: 'destructive', reason: `${program} removes or replaces paths` }
   }
 
-  if (command.dynamicArgv.some(Boolean)) {
+  if (command.dynamicArgv.some(flag => flag === true)) {
     return { decision: 'prompt', risk: 'dynamic-arguments', reason: 'an argument is expanded at run time, so its effect cannot be read from the line' }
   }
 
@@ -277,7 +277,9 @@ export function ruleMatches(rule, command) {
   if (basename(command.argv[0] ?? '') !== rule.executable) return false
   const args = command.argv.slice(1)
   const dynamic = command.dynamicArgv.slice(1)
-  if (rule.decision === 'allow' && dynamic.some(Boolean)) return false
+  // Only an unresolved expansion blocks a rule; a command substitution whose
+  // own commands the policy approved is part of the same judgement.
+  if (rule.decision === 'allow' && dynamic.some(flag => flag === true)) return false
   const prefix = rule.argvPrefix ?? []
   if (args.length < prefix.length) return false
   return prefix.every((word, index) => args[index] === word)

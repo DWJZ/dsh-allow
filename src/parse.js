@@ -32,6 +32,35 @@ const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish
 export const MAX_WRAPPER_DEPTH = 4
 
 /**
+ * Read one balanced `$( … )` body.
+ * @param text - the segment text.
+ * @param start - index just past the opening `$(`.
+ * @returns the body and the index after the closing parenthesis, or null when unbalanced.
+ */
+function readSubstitution(text, start) {
+  let depth = 1
+  let quote = null
+  let index = start
+  while (index < text.length) {
+    const character = text[index]
+    if (quote !== null) {
+      if (character === '\\') { index += 2; continue }
+      if (character === quote) quote = null
+      index += 1
+      continue
+    }
+    if (character === "'" || character === '"') { quote = character; index += 1; continue }
+    if (character === '(') depth += 1
+    else if (character === ')') {
+      depth -= 1
+      if (depth === 0) return { body: text.slice(start, index), end: index + 1 }
+    }
+    index += 1
+  }
+  return null
+}
+
+/**
  * Split a command line into operator-separated raw segments.
  * @param source - the raw command line.
  * @returns segments in order, each with the operator that followed it.
@@ -102,12 +131,14 @@ function tokenize(text, home) {
   let started = false
   let grouping = false
   let index = 0
+  let substitutions = []
   const push = () => {
     if (!started) return
-    words.push({ value, dynamic })
+    words.push({ value, dynamic, substitutions })
     value = ''
     dynamic = false
     started = false
+    substitutions = []
   }
   while (index < text.length) {
     const character = text[index]
@@ -128,7 +159,23 @@ function tokenize(text, home) {
         continue
       }
       if (character === '"') { quote = null; index += 1; continue }
-      if (character === '$' || character === '`') dynamic = true
+      if (character === '$' && text[index + 1] === '(') {
+        const captured = readSubstitution(text, index + 2)
+        if (captured === null) { dynamic = true; value += character; index += 1; continue }
+        substitutions.push(captured.body)
+        value += text.slice(index, captured.end)
+        index = captured.end
+        continue
+      }
+      if (character === '`') {
+        const end = text.indexOf('`', index + 1)
+        if (end === -1) return null
+        substitutions.push(text.slice(index + 1, end))
+        value += text.slice(index, end + 1)
+        index = end + 1
+        continue
+      }
+      if (character === '$') dynamic = true
       value += character
       index += 1
       continue
@@ -150,11 +197,27 @@ function tokenize(text, home) {
       index += 1
       continue
     }
+    if (character === '$' && text[index + 1] === '(') {
+      const captured = readSubstitution(text, index + 2)
+      if (captured === null) { dynamic = true; value += character; index += 1; continue }
+      substitutions.push(captured.body)
+      value += text.slice(index, captured.end)
+      index = captured.end
+      continue
+    }
+    if (character === '`') {
+      const end = text.indexOf('`', index + 1)
+      if (end === -1) return null
+      substitutions.push(text.slice(index + 1, end))
+      value += text.slice(index, end + 1)
+      index = end + 1
+      continue
+    }
     if (character === '(' || character === ')') {
       // Unquoted parentheses are subshell or group syntax, which changes what runs.
       grouping = true
     }
-    if (character === '$' || character === '`') dynamic = true
+    if (character === '$') dynamic = true
     if (character === '*' || character === '?' || character === '[' || character === '{') dynamic = true
     started = true
     value += character
@@ -163,7 +226,7 @@ function tokenize(text, home) {
   if (quote !== null) return null
   push()
   if (words.length > 0 && words[0].value.startsWith('~')) {
-    words[0] = { value: `${home}${words[0].value.slice(1)}`, dynamic: words[0].dynamic }
+    words[0] = { ...words[0], value: `${home}${words[0].value.slice(1)}` }
   }
   return { words, grouping }
 }
@@ -222,6 +285,7 @@ function parseSegment(segment, home) {
     command: {
       argv: argv.map(word => word.value),
       dynamicArgv: argv.map(word => word.dynamic),
+      substitutions: argv.flatMap(word => word.substitutions ?? []),
       env,
       redirections,
       background,
@@ -319,6 +383,25 @@ export function parseCommandLine(source, { home = '/', depth = 0 } = {}) {
     }
     if (command.dynamicArgv[0] === true) {
       return { analyzable: false, reason: 'dynamic executable', commands: [], operators }
+    }
+    if ((command.substitutions ?? []).length > 0 && command.argv
+      .some((_, index) => (command.argv[index] ?? '').includes('$(') && index === 0)) {
+      // A substituted program name is not a program name this parser knows.
+      return { analyzable: false, reason: 'dynamic executable', commands: [], operators }
+    }
+    if ((command.substitutions ?? []).length > 0) {
+      const nested = []
+      for (const body of command.substitutions) {
+        const inner = parseCommandLine(body, { home, depth: depth + 1 })
+        if (!inner.analyzable) {
+          return { analyzable: false, reason: `command substitution: ${inner.reason}`, commands: [], operators }
+        }
+        nested.push(...inner.commands)
+      }
+      // The substitution runs first, so its commands are part of this line.
+      commands.push(...nested)
+      commands.push({ ...command, dynamicArgv: command.dynamicArgv.map(flag => flag === true ? true : 'resolved') })
+      continue
     }
     commands.push(command)
   }

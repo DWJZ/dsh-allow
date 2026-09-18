@@ -79,6 +79,7 @@ window.__ModuleLoader__.load({
 
 		/** 宿主在提权请求的 reason 上打的标记。 */
 		const ESCALATION = /^escalate sandbox to [a-z-]+:/u;
+		const POLICY_REASON = "dsh-allow: ";
 
 		/**
 		 * 这条待审批是不是沙箱提权(只有提权才由本插件接管)。
@@ -88,8 +89,9 @@ window.__ModuleLoader__.load({
 		function escalationOf(pending) {
 			if (pending === null || pending === undefined) return null;
 			if (pending.kind !== "approval") return null;
-			if (typeof pending.reason !== "string" || !ESCALATION.test(pending.reason)) return null;
-			return pending;
+			if (typeof pending.reason !== "string") return null;
+			if (ESCALATION.test(pending.reason) || pending.reason.startsWith(POLICY_REASON)) return pending;
+			return null;
 		}
 
 		/**

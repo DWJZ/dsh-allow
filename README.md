@@ -47,8 +47,9 @@ process execution
 
 1. `src/parse.js` splits the line on unquoted `&&`, `||`, `;`, `|`, `&`, and newlines, then tokenizes each segment with quoting and escapes intact. `echo "a && b"` is one command; `$(…)`, backticks, globs, subshells, groups, control keywords, here-documents, and dynamic executables all make the line **unanalysable**.
 2. `sh -c '…'`, `bash -lc '…'`, and `eval '…'` are parsed **recursively** (depth 4). A wrapper whose program is dynamic is unanalysable.
-3. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
-4. Unanalysable lines are `prompt` and can never match an `allow` rule — the fail-closed rule for shell syntax this parser does not model.
+3. `$(…)` and backticks are parsed recursively too: the substituted commands join the same line and are aggregated with it (`echo "$(rm -rf /)"` is forbidden). A substitution the parser cannot reduce makes the whole line a prompt, and a substituted **program name** is always unanalysable, so `$(printf rm) -rf /` is never allowed.
+4. Every simple command's argv is classified by the built-in table and matched against stored rules, then the request takes the strictest member: `forbidden > prompt > allow`.
+5. Unanalysable lines are `prompt` and can never match an `allow` rule — the fail-closed rule for shell syntax this parser does not model.
 
 ## Built-in policy
 
@@ -125,7 +126,7 @@ npm test        # policy suite, host suite, browser suite
 
 - The parser models a restricted shell, not bash. Anything outside it is `prompt`, never `allow`.
 - A rule is scoped to one tool family (`bash`/`pwsh` commands); `write`/`edit` tools keep their own sandbox escalation.
-- The card is this plugin's own render of the approval UI (the built-in card's action row is not extensible); it matches only commands the policy flagged.
+- The card is this plugin's own render of the approval UI (the built-in card's action row is not extensible). It claims sandbox-escalation asks and policy prompts (a policy reason is marked with a `dsh-allow: ` prefix); other approvals keep the built-in card.
 - Network egress is not sandboxed by DSH, so `curl`/`wget`/`ssh` are policy prompts rather than enforced restrictions.
 
 ## License
