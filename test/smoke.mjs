@@ -225,6 +225,7 @@ console.log('escalation listener')
   store.addRule(escalationFile, { decision: 'allow', executable: 'echo', argvPrefix: [] })
   outcome = await listener(call('cp /a /b && echo copied', 'c2'), delegate)
   check('a fully remembered escalation is approved without a card', outcome === 'allowed-once', outcome)
+  check('and it does not double-count the rule use', store.readRules(escalationFile).every(rule => (rule.hits ?? 0) <= 1), JSON.stringify(store.readRules(escalationFile).map(rule => [rule.executable, rule.hits])))
 
   const manualPendings = store.createPendingStore()
   const manualListener = host.createApprovalListener({
