@@ -19,7 +19,13 @@ DSH keeps a file sandbox: a command that writes outside the session workspace is
   - `允许一次` — allow this call only.
 - **Every other approval request** (hooks, `write`/`edit` path escalations, anything that is not a sandbox escalation) keeps the built-in card untouched.
 
-A rule is scoped by **tool + requested sandbox mode + the command's leading words**, so allowing `pnpm dsh plugin` never allows `rm`, and a rule recorded for `danger-full-access` does not cover a different request. The prefix drops a leading `cd … &&`, drops `VAR=value`, reduces the program to its basename (`/opt/homebrew/bin/gh` → `gh`), and then keeps words until the first flag, path, or shell operator. The button names the exact prefix before you agree to it.
+A rule is scoped by **tool + requested sandbox mode + the command's leading words**, and it only ever covers a **single command** (see below), so allowing `pnpm dsh plugin` never allows `rm`, and a rule recorded for `danger-full-access` does not cover a different request. The prefix drops a leading `cd … &&`, drops `VAR=value`, reduces the program to its basename (`/opt/homebrew/bin/gh` → `gh`), and then keeps words until the first flag, path, or shell operator. The button names the exact prefix before you agree to it.
+
+## What a rule does not cover
+
+**A compound line never rides a rule.** `brew install gh && rm -rf /` starts with the words a rule for `brew install gh` names, but the rule grants the whole line — so the second half would ride along. Such a line is therefore never matched against rules and never offers the always-allow button: the card says why and asks every time. A leading `cd … &&` chain is the one exception, because the rule names the program after it (`cd /tmp && brew install gh` is rememberable as `brew install gh`). Pipes, semicolons, redirects, `$(…)`, backticks, and multi-line commands all count as compound.
+
+**Paths are not part of a rule.** A rule names a command, not a directory. Path scoping is the sandbox's job: under `workspace-write` the *session workspace* plus the platform temp areas are writable with no prompt at all, and everything outside them is denied — which is where this card appears. So "let me write under `~` but ask for `/`" is expressed by making the session workspace `~` (add it as a workspace and start the session there), not by a rule. Rules then only decide which *programs* may reach outside that boundary.
 
 ## Install
 

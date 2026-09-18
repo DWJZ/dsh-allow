@@ -141,6 +141,28 @@ const before = nextCalls
 outcome = await listener(request(plainSession), next)
 check('a non-escalation delegates', outcome === 'delegated' && nextCalls === before + 1, `${outcome} / ${String(nextCalls)}`)
 
+console.log('compound commands')
+check('a simple command is rememberable', plugin.isSimpleCommand('brew install gh') === true)
+check('a cd-prefixed simple command is rememberable', plugin.isSimpleCommand('cd /tmp && brew install gh') === true)
+check('a chained command is not', plugin.isSimpleCommand('brew install gh && rm -rf /') === false)
+check('a semicolon chain is not', plugin.isSimpleCommand('brew install gh; rm -rf /') === false)
+check('a pipe is not', plugin.isSimpleCommand('cat list | sh') === false)
+check('a redirect is not', plugin.isSimpleCommand('echo hi > /etc/hosts') === false)
+check('a substitution is not', plugin.isSimpleCommand('rm -rf $(cat list)') === false)
+check('a backtick substitution is not', plugin.isSimpleCommand('rm -rf `cat list`') === false)
+check('a multi-line command is not', plugin.isSimpleCommand('touch a\nrm -rf /') === false)
+check('an empty command is not', plugin.isSimpleCommand('   ') === false)
+
+rmSync(file, { force: true })
+plugin.addRule(file, { tool: 'bash', mode: 'danger-full-access', prefix: 'brew install gh' })
+const compoundSession = makeSession([escalationCall('c1', 'brew install gh && rm -rf /')])
+const compoundStore = plugin.createPendingStore()
+const compoundListener = plugin.createApprovalListener({ file, logger, pendings: compoundStore })
+outcome = await compoundListener(request(compoundSession), next)
+check('a compound line never rides a stored rule', outcome === 'delegated', outcome)
+check('and is recorded as not rememberable', compoundStore.get('s1', 'c1')?.rememberable === false, JSON.stringify(compoundStore.get('s1', 'c1')))
+check('the stored rule stays un-hit', (plugin.readRules(file)[0]?.hits ?? 1) === 0, JSON.stringify(plugin.readRules(file)[0]))
+
 console.log('card routes')
 const routeStore = plugin.createPendingStore()
 routeStore.remember(request(session), { tool: 'bash', mode: 'danger-full-access', prefix: 'mkdir' }, 'mkdir -p /x')
@@ -158,6 +180,24 @@ check('the pending route is loopback only', response.statusCode === 403, String(
 response = fakeResponse()
 pendingHandler(fakeRequest({ url: '/dsh-allow/pending', method: 'POST' }), response)
 check('the pending route refuses POST', response.statusCode === 405, String(response.statusCode))
+
+{
+  const compoundStoreForCard = plugin.createPendingStore()
+  compoundStoreForCard.remember(request(session), { tool: 'bash', mode: 'danger-full-access', prefix: 'brew install gh' }, 'brew install gh && rm -rf /', false)
+  const res = fakeResponse()
+  plugin.createPendingHandler({ pendings: compoundStoreForCard })(fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1' }), res)
+  const body = JSON.parse(res.body)
+  check('the card is told a compound line is not rememberable', body.rememberable === false && body.reason === 'compound', res.body)
+
+  const res2 = fakeResponse()
+  await plugin.createRememberHandler({ pendings: compoundStoreForCard, file, logger })(fakeRequest({
+    method: 'POST',
+    url: '/dsh-allow/remember',
+    headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: 's1', callId: 'c1' }),
+  }), res2)
+  check('the remember route refuses a compound line', res2.statusCode === 409, String(res2.statusCode))
+}
 
 {
   const ruleFile = join(root, 'remember.json')

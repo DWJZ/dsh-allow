@@ -37,7 +37,8 @@ window.__ModuleLoader__.load({
 				".dsha_headline{color:var(--dsw-alias-label-primary);font-size:15px;font-weight:500;line-height:24px}",
 				".dsha_command{color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);font-size:13px;line-height:20px;word-break:break-all}",
 				".dsha_actions{display:flex;justify-content:flex-end;gap:8px;padding:14px 16px}",
-				".dsha_notice{padding:0 16px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-state-error-primary)}"
+				".dsha_notice{padding:0 16px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-state-error-primary)}",
+				".dsha_hint{padding:0 16px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}"
 			].join("");
 			document.head.appendChild(tag);
 		}
@@ -52,6 +53,7 @@ window.__ModuleLoader__.load({
 			always: "总是允许「{prefix}」开头的命令",
 			remembering: "正在记住…",
 			rememberFailed: "没记住:{message}",
+			compoundHint: "这是复合命令(含 &&、;、| 或重定向),只能允许一次——规则只记住单条命令。",
 			escalation: "需要批准:{toolName}",
 			detailAria: "权限请求详情"
 		};
@@ -62,6 +64,7 @@ window.__ModuleLoader__.load({
 			always: "Always allow commands starting with \u201c{prefix}\u201d",
 			remembering: "Remembering…",
 			rememberFailed: "Not remembered: {message}",
+			compoundHint: "This line chains several operations (&&, ;, |, or a redirect), so it cannot be remembered — rules cover single commands only.",
 			escalation: "Approval required: {toolName}",
 			detailAria: "Approval request detail"
 		};
@@ -166,7 +169,7 @@ window.__ModuleLoader__.load({
 					onClick: () => { answer("rejected"); }
 				}, t("reject"))
 			];
-			if (info !== null) {
+			if (info !== null && info.rememberable === true && typeof info.prefix === "string" && info.prefix !== "") {
 				buttons.push(React.createElement(primitives.Button, {
 					key: "always",
 					variant: "outline",
@@ -192,6 +195,7 @@ window.__ModuleLoader__.load({
 							typeof pending.reason === "string" && pending.reason !== "" ? pending.reason : t("escalation", { toolName: pending.toolName })),
 						info === null ? null : React.createElement("div", { className: "dsha_command" }, info.command)),
 					error === null ? null : React.createElement("div", { className: "dsha_notice" }, t("rememberFailed", { message: error })),
+					info !== null && info.rememberable !== true ? React.createElement("div", { className: "dsha_hint" }, t("compoundHint")) : null,
 					React.createElement("div", { className: "dsha_actions" }, buttons)));
 		}
 

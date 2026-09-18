@@ -43,6 +43,33 @@ export function resolveHome(env = process.env) {
   return join(homedir(), '.dsh')
 }
 
+/** Shell syntax that makes one line more than a single operation. */
+const COMPOUND_OPERATORS = /(?:&&|\|\||;|\||&|>|<|\$\(|`)/u
+
+/**
+ * Whether one shell line is a single command a prefix rule may authorize.
+ *
+ * A rule grants the whole line, so a line that chains several operations —
+ * `brew install gh && rm -rf /` — shares the prefix of the command it names
+ * but not its effect. Leading `cd … &&` chains are stripped first, because the
+ * rule names the program after them. Anything else carrying a second
+ * operation, a substitution, or a redirect is not rememberable and always asks.
+ * @param command - the raw shell command.
+ * @returns true only for one simple command.
+ */
+export function isSimpleCommand(command) {
+  if (typeof command !== 'string') return false
+  if (command.includes('\n')) return false
+  let text = command.trim()
+  if (text === '') return false
+  for (;;) {
+    const cd = /^cd\s+(?:'[^']*'|"[^"]*"|\S+)\s*&&\s*/u.exec(text)
+    if (cd === null) break
+    text = text.slice(cd[0].length)
+  }
+  return text !== '' && !COMPOUND_OPERATORS.test(text)
+}
+
 /**
  * Reduce a shell command to the stable leading words a rule can match.
  *
@@ -227,13 +254,19 @@ export function createApprovalListener({ file, logger, pendings }) {
       return next()
     }
     const query = { tool: request.toolName, mode: parsed.mode, prefix }
-    const hit = matchRule(readRules(file), query)
-    if (hit !== null) {
-      logger.info(`dsh-allow: allowed "${query.tool}" ${query.prefix} (rule ${hit.id}, ${query.mode}) without asking`)
-      countHit(file, hit.id)
-      return 'allowed-once'
+    // A rule grants the whole shell line, so it may only settle a line that IS
+    // the command it names: a compound line shares the prefix without sharing
+    // the effect, and always asks.
+    const rememberable = isSimpleCommand(parsed.command)
+    if (rememberable) {
+      const hit = matchRule(readRules(file), query)
+      if (hit !== null) {
+        logger.info(`dsh-allow: allowed "${query.tool}" ${query.prefix} (rule ${hit.id}, ${query.mode}) without asking`)
+        countHit(file, hit.id)
+        return 'allowed-once'
+      }
     }
-    pendings.remember(request, query, parsed.command)
+    pendings.remember(request, query, parsed.command, rememberable)
     return next()
   }
 }
@@ -275,12 +308,13 @@ export function createPendingStore({ ttlMs = 15 * 60 * 1000, limit = 100, now = 
      * @param request - the approval request being delegated.
      * @param query - tool, mode, and prefix the rule would use.
      * @param command - the full command shown to the user.
+     * @param rememberable - whether a rule may cover this command at all.
      */
-    remember(request, query, command) {
+    remember(request, query, command, rememberable = true) {
       const key = pendingKey(request?.agent?.session, request?.callId)
       if (key === null) return
       prune()
-      entries.set(key, { ...query, command, at: now() })
+      entries.set(key, { ...query, command, rememberable, at: now() })
       while (entries.size > limit) {
         const oldest = entries.keys().next().value
         if (oldest === undefined) break
@@ -467,7 +501,15 @@ export function createPendingHandler({ pendings }) {
       sendJson(res, 404, { ok: false })
       return
     }
-    sendJson(res, 200, { ok: true, tool: entry.tool, mode: entry.mode, prefix: entry.prefix, command: entry.command })
+    sendJson(res, 200, {
+      ok: true,
+      rememberable: entry.rememberable === true,
+      ...entry.rememberable === true ? {} : { reason: 'compound' },
+      tool: entry.tool,
+      mode: entry.mode,
+      prefix: entry.prefix,
+      command: entry.command,
+    })
   }
 }
 
@@ -493,6 +535,10 @@ export function createRememberHandler({ pendings, file, logger }) {
       const entry = pendings.get(body?.sessionId, body?.callId)
       if (entry === null) {
         sendJson(res, 404, { ok: false, error: 'this approval is no longer pending' })
+        return
+      }
+      if (entry.rememberable !== true) {
+        sendJson(res, 409, { ok: false, error: '这是复合命令,不会被记住' })
         return
       }
       const stored = addRule(file, { tool: entry.tool, mode: entry.mode, prefix: entry.prefix })
