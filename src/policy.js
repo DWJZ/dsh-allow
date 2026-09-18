@@ -341,6 +341,7 @@ export function evaluateCommandLine(request) {
       commands: [],
       suggestion: null,
       suggestions: [],
+      partial: false,
       covered: false,
       analyzable: false,
     }
@@ -349,6 +350,7 @@ export function evaluateCommandLine(request) {
   const matchedRules = []
   const suggestions = []
   let suggestionBlocked = false
+  let forbiddenSeen = false
   let covered = true
   let decision = 'allow'
   let reason = 'no policy rule applies'
@@ -369,6 +371,7 @@ export function evaluateCommandLine(request) {
     // once must not make `node -e '…'` allowed forever.
     const unrememberable = builtin !== null && UNREMEMBERABLE_RISKS.has(builtin.risk)
     const allowed = !unrememberable && matched.some(rule => rule.decision === 'allow')
+    if (forbidden) forbiddenSeen = true
     if (forbidden || unrememberable) {
       suggestionBlocked = true
       covered = false
@@ -401,7 +404,10 @@ export function evaluateCommandLine(request) {
     // Unremarkable: the sandbox remains the enforcement layer for this command.
     consider(defaultDecision === 'allow' ? 'allow' : defaultDecision, 'deferred to the sandbox', null)
   }
-  const rememberable = !suggestionBlocked && suggestions.length > 0
+  // A denied line is never stored: remembering the rest of it would only
+  // pre-approve a command that can never run.
+  if (forbiddenSeen) suggestions.length = 0
+  const rememberable = suggestions.length > 0
   return {
     decision,
     reason,
@@ -411,6 +417,9 @@ export function evaluateCommandLine(request) {
     commands: parsed.commands.map(simple => simple.argv),
     suggestion: rememberable ? (suggestions[0] ?? null) : null,
     suggestions: rememberable ? suggestions : [],
+    // Some member can never be remembered (inline code, a substituted program),
+    // so this line keeps asking even after its other commands are stored.
+    partial: suggestionBlocked,
     covered,
     analyzable: true,
   }

@@ -71,6 +71,8 @@ tools/pre-execute  ← 本插件：解析 → 策略 → 决策
 | 容器 | `docker`、`podman` | prompt |
 | 路径 | cwd 为 `/` 或 `$HOME` 时的 `rm -rf .`；比较前先归一化 `~`、`..`、`/x/..` | 按 cwd 给 forbidden / prompt |
 
+一行里只要有一条命令**不可记忆**（内联代码、被替换出来的程序名），其余命令的建议规则仍然会给（卡片上照常出现按钮），同时提示「这行有每次都问的部分」；含 forbidden 的行则不给任何建议。
+
 没有任何规则命中的命令交给沙箱（`defaultDecision: allow`）；想全量把关就把它设成 `prompt`。
 
 ## 持久规则是结构化的

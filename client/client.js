@@ -56,6 +56,7 @@ window.__ModuleLoader__.load({
 			remembering: "正在记住…",
 			rememberFailed: "没记住:{message}",
 			cannotRemember: "这条命令不会被记住:{reason}",
+			partialHint: "这行里含不可记忆的部分(内联代码等),它每次都会问;这个按钮只记住其余命令。",
 			risk: "风险:{risk}",
 			cwd: "工作目录:{cwd}",
 			escalation: "需要批准:{toolName}",
@@ -70,6 +71,7 @@ window.__ModuleLoader__.load({
 			remembering: "Remembering…",
 			rememberFailed: "Not remembered: {message}",
 			cannotRemember: "This command cannot be remembered: {reason}",
+			partialHint: "Part of this line can never be remembered (inline code and the like) and keeps asking; this button only stores the rest.",
 			risk: "Risk: {risk}",
 			cwd: "Working directory: {cwd}",
 			escalation: "Approval required: {toolName}",
@@ -209,6 +211,9 @@ window.__ModuleLoader__.load({
 							React.createElement("span", null, t("risk", { risk: info.risk })),
 							React.createElement("span", null, t("cwd", { cwd: info.cwd })))),
 					error === null ? null : React.createElement("div", { className: "dsha_notice" }, t("rememberFailed", { message: error })),
+					info !== null && info.partial === true
+						? React.createElement("div", { className: "dsha_hint" }, t("partialHint"))
+						: null,
 					info !== null && info.rememberable !== true
 						? React.createElement("div", { className: "dsha_hint" }, t("cannotRemember", { reason: info.reason }))
 						: null,

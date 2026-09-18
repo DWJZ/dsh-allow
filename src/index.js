@@ -110,6 +110,7 @@ function remember(pendings, exec, decision, command, cwd) {
     label: decision.suggestion === null ? null : describeRule(decision.suggestion),
     labels: decision.suggestions.map(describeRule),
     suggestions: decision.suggestions,
+    partial: decision.partial === true,
     triggers: decision.triggers.map(trigger => trigger.command),
   })
   return true
@@ -302,6 +303,7 @@ export function createPendingHandler({ pendings }) {
       risk: record.risk,
       decision: record.decision,
       triggers: record.triggers,
+      partial: record.partial === true,
     })
   }
 }

@@ -71,6 +71,8 @@ Argument-aware, not a name blacklist. Destructive shapes are recognised from the
 | containers | `docker`, `podman` | prompt |
 | paths | `rm -rf .` at `/` or `$HOME`; `~`, `..`, and `/x/..` are normalized before comparison | forbidden / prompt by cwd |
 
+When one member of a line can never be remembered (inline code, a substituted program name), the other members still get their suggestions and the card says that part of the line keeps asking; a line containing a forbidden command suggests nothing at all.
+
 A command nothing matches defers to the sandbox (`defaultDecision: allow`); set `defaultDecision: prompt` to gate everything.
 
 ## Persistent rules are structured

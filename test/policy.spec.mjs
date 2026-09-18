@@ -165,6 +165,16 @@ check('one dangerous member defeats coverage', line.covered === false && line.de
 check('and a forbidden line suggests nothing', line.suggestions.length === 0)
 check('an unparsable line is never covered', evaluate('echo "$(cat l | while read x; do rm $x; done)"', lineRules).covered === false)
 
+console.log('a mixed line still offers what it can remember')
+const mixed = "cd /tmp && python3 - <<'PY'\nprint(1)\nPY\ngit add -A && git commit -m x"
+const mixedDecision = evaluate(mixed)
+check('a line with inline code still prompts', mixedDecision.decision === 'prompt', mixedDecision.decision)
+check('and it still suggests rules for the other commands', mixedDecision.suggestions.map(policy.describeRule).join(' + ') === 'cd + git add + git commit', JSON.stringify(mixedDecision.suggestions))
+check('while flagging that part of it can never be remembered', mixedDecision.partial === true)
+check('and it is not covered', mixedDecision.covered === false)
+const clean = evaluate('git add -A && git commit -m x')
+check('the same commands without inline code are fully rememberable', clean.partial === false && clean.suggestions.length === 2, JSON.stringify(clean.suggestions))
+
 console.log('here-documents: the body is data, the reader is still judged')
 check('a here-doc body is not parsed as commands', evaluate('cat > /tmp/x <<EOF\nrm -rf /\nEOF').decision === 'allow')
 check('the python heredoc reader prompts as code execution', evaluate("python3 - <<'PY'\nprint(1)\nPY").decision === 'prompt')
