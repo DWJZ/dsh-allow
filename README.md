@@ -297,6 +297,7 @@ CI sets `DSH_ALLOW_REQUIRE_SEATBELT=1` on its macOS job, which turns that skip i
 
 ## Limits
 
+- A Mac whose `xcode-select` points into an Xcode bundle keeps `git`, `python3` and `clang` behind shims that exec into `/Applications/Xcode*.app/Contents/Developer`, which the baseline does not reach: it grants the Command Line Tools under `/Library/Developer`, not an Xcode developer directory. Such a host opens it once — `/allow add read,execute /Applications/Xcode.app/Contents/Developer folder` — or the kernel refuses those commands while the policy allows them.
 - The Approvals tab reads at most the last 4 MiB of the audit log, 500 records per request, and it re-reads every three seconds while it is open: the older decisions of a very long session fall outside that window.
 - A chunk boundary that lands inside an audit line drops that line from an answer, rather than reporting a decision the reader could not parse.
 - Records written before this version carry no `sessionId`, so they never appear in a session's ledger.

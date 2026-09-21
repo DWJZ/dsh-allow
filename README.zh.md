@@ -313,6 +313,7 @@ CI 的 macOS 任务会设 `DSH_ALLOW_REQUIRE_SEATBELT=1`,把这个跳过变成�
 
 ## 限制
 
+- 如果一台 Mac 的 `xcode-select` 指向 Xcode bundle,`git`、`python3`、`clang` 都是 exec 进 `/Applications/Xcode*.app/Contents/Developer` 的 shim,而基线够不到那里:它给的是 `/Library/Developer` 下的 Command Line Tools,不是 Xcode 的 developer 目录。这样的宿主得自己开一次 —— `/allow add read,execute /Applications/Xcode.app/Contents/Developer folder` —— 否则策略层允许、内核却拒绝。
 - 「审批」标签页最多读审计日志最后 4 MiB、每次最多 500 条,打开期间每三秒重读一次:超长会话更早的判定会落在这个窗口之外。
 - 块边界正好落在一行审计记录中间时,那一行会被丢掉,而不是报出一条读不完整的判定。
 - 这个版本之前写下的记录没有 `sessionId`,所以永远不会出现在会话的审批记录里。

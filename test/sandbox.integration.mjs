@@ -77,11 +77,39 @@ const under = (profile, argv) => {
 /** Why the last confined run behaved the way it did, for a failing check. */
 const why = () => (last === null ? '' : `status=${String(last.status)} ${last.stderr || last.stdout}`)
 
+/**
+ * The developer directory the system's shims exec into.
+ *
+ * `/usr/bin/git`, `/usr/bin/python3` and `xcrun` are Mach-O shims rather than
+ * symlinks: they exec whichever directory `xcode-select` selected. The baseline
+ * reaches the Command Line Tools under `/Library/Developer`, so a host that
+ * selected an Xcode bundle keeps its toolchain outside every granted prefix —
+ * and then every case below that uses python fails with EPERM instead of
+ * testing the fence it names.
+ */
+function developerDirectory() {
+  const probe = spawnSync('/usr/bin/xcode-select', ['-p'], { encoding: 'utf8' })
+  const directory = probe.status === 0 ? String(probe.stdout ?? '').trim() : ''
+  return directory.startsWith('/') ? directory : null
+}
+const DEVELOPER = developerDirectory()
+const shippedBaseline = fspolicy.baselineRules({
+  workspaceRoot: WORKSPACE, harnessHome: join(root, '.dsh'), home: HOME, mode: 'workspace-write',
+})
+const developerCovered = DEVELOPER === null || fspolicy.resolveOperation({
+  path: DEVELOPER, operation: 'execute', rules: shippedBaseline,
+}).granted === true
+/** The rule this host needs so its own toolchain runs inside the fence. */
+const developerGrant = developerCovered ? [] : [fspolicy.makeRule({
+  path: DEVELOPER, recursive: true, source: 'user', access: { read: true, execute: true },
+})]
+if (!developerCovered) {
+  console.log(`  note this host's developer directory ${DEVELOPER} is outside the baseline; the cases below grant it,`)
+  console.log('       the way a deployment on such a host has to: /allow add read,execute <directory> folder')
+}
+
 /** The baseline the runtime uses, plus whatever a case adds. */
-const baseline = extra => [
-  ...fspolicy.baselineRules({ workspaceRoot: WORKSPACE, harnessHome: join(root, '.dsh'), home: HOME, mode: 'workspace-write' }),
-  ...extra,
-]
+const baseline = extra => [...shippedBaseline, ...developerGrant, ...extra]
 const compile = (rules, options = {}) => enforce.compileProfile({
   mode: options.mode ?? 'workspace-write',
   workspaceRoot: WORKSPACE,
