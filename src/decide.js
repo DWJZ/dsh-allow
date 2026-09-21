@@ -46,6 +46,9 @@ export function evaluateCommandLine(request) {
       unknown: [],
       suggestions: [],
       commands: [],
+      // The unparseable branch answers before any rule is consulted, so callers
+      // reading `usedRules` see the same empty list every other refusal carries.
+      usedRules: [],
       analyzable: false,
     }
   }

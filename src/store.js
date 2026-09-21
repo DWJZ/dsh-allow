@@ -7,7 +7,10 @@
  * folder they share on purpose. The audit log is NDJSON and never records
  * environment values or credential-shaped text.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync,
+  statSync, unlinkSync, writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { OPERATIONS, canonicalPath, describeRule, makeRule, normalizeStoredRule } from './fspolicy.js'
@@ -32,6 +35,18 @@ const PENDING_SEPARATOR = '\u0000'
 
 /** The rule-file format this version writes. */
 const RULES_VERSION = 3
+
+/** How much of the audit log one tail read consumes before it stops, in bytes. */
+const AUDIT_CHUNK_BYTES = 256 * 1024
+
+/** Largest window a tail read scans from the end of the audit log, in bytes. */
+const AUDIT_MAX_BYTES = 4 * 1024 * 1024
+
+/** How many tail answers are cached; an unchanged file is then read once. */
+const AUDIT_CACHE_LIMIT = 8
+
+/** How many unanswered human notes may wait before the oldest is dropped. */
+const DECISION_NOTE_LIMIT = 100
 
 /**
  * Resolve the harness home: `$DSH_HOME` when set, otherwise `~/.dsh`.
@@ -466,6 +481,120 @@ export function appendAudit(file, entry) {
   }
 }
 
+/**
+ * Parse one audit-log line.
+ * @param line - raw line text.
+ * @returns the record, or null for a blank, truncated, or non-object line.
+ */
+function parseAuditLine(line) {
+  const trimmed = line.trim()
+  if (trimmed === '' || trimmed[0] !== '{') return null
+  try {
+    const parsed = JSON.parse(trimmed)
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : null
+  }
+  catch {
+    // A line the reader caught mid-write, or one a chunk boundary split, carries
+    // nothing this reader can attribute to a decision.
+    return null
+  }
+}
+
+/**
+ * Whether one audit record belongs in the answer.
+ * @param entry - parsed audit record.
+ * @param sessionId - session to keep, or null for every session.
+ * @param includeBaseline - whether platform-baseline allows are included.
+ * @returns true when the record is kept.
+ */
+function auditMatches(entry, sessionId, includeBaseline) {
+  if (sessionId !== null && entry.sessionId !== sessionId) return false
+  if (!includeBaseline && entry.origin === 'baseline') return false
+  return true
+}
+
+/** Answers from the last reads, so a poll that follows no write reads no file. */
+const auditTailCache = new Map()
+
+/** Remember one tail answer under a bounded cache. */
+function cacheAuditTail(key, answer) {
+  auditTailCache.delete(key)
+  auditTailCache.set(key, answer)
+  while (auditTailCache.size > AUDIT_CACHE_LIMIT) {
+    const oldest = auditTailCache.keys().next().value
+    if (oldest === undefined) break
+    auditTailCache.delete(oldest)
+  }
+  return answer
+}
+
+/**
+ * Read the newest audit records from the end of the log, without loading it.
+ *
+ * The window grows backwards in fixed chunks until the answer is full or the
+ * byte cap is reached, so a busy session answers from the last chunk while a
+ * quiet one pays for the history it asked about. A file that did not change
+ * since the previous identical request is answered from cache.
+ *
+ * A line a chunk boundary split is dropped rather than repaired: the reader
+ * cannot tell a partial line from a malformed one, and a decision it cannot
+ * parse is a decision it must not report.
+ * @param file - absolute audit-file path.
+ * @param options - session filter, answer size, and baseline inclusion.
+ * @returns the newest matching records (oldest first), the bytes read, and
+ *   whether older matching records remain outside the window.
+ */
+export function readAuditTail(file, { sessionId = null, limit = 200, includeBaseline = false } = {}) {
+  const empty = { entries: [], scannedBytes: 0, truncated: false }
+  if (typeof file !== 'string' || file === '' || limit <= 0) return empty
+  let stat
+  try {
+    stat = statSync(file)
+  }
+  catch {
+    // No audit log yet: a session that decided nothing has nothing to show.
+    return empty
+  }
+  if (!stat.isFile() || stat.size === 0) return empty
+  const cacheKey = [file, stat.size, stat.mtimeMs, sessionId ?? '', limit, includeBaseline ? 1 : 0].join('\u0000')
+  const cached = auditTailCache.get(cacheKey)
+  if (cached !== undefined) return cached
+
+  let descriptor
+  try {
+    descriptor = openSync(file, 'r')
+  }
+  catch {
+    return empty
+  }
+  const entries = []
+  let position = stat.size
+  let scannedBytes = 0
+  let carry = ''
+  try {
+    while (position > 0 && entries.length < limit && scannedBytes < AUDIT_MAX_BYTES) {
+      const length = Math.min(AUDIT_CHUNK_BYTES, position, AUDIT_MAX_BYTES - scannedBytes)
+      const buffer = Buffer.allocUnsafe(length)
+      const read = readSync(descriptor, buffer, 0, length, position - length)
+      if (read <= 0) break
+      position -= read
+      scannedBytes += read
+      const lines = (buffer.subarray(0, read).toString('utf8') + carry).split('\n')
+      // The first line is only whole once the chunk before it has been read.
+      carry = position > 0 ? (lines.shift() ?? '') : ''
+      for (let index = lines.length - 1; index >= 0 && entries.length < limit; index -= 1) {
+        const entry = parseAuditLine(lines[index])
+        if (entry !== null && auditMatches(entry, sessionId, includeBaseline)) entries.push(entry)
+      }
+    }
+  }
+  finally {
+    closeSync(descriptor)
+  }
+  entries.reverse()
+  return cacheAuditTail(cacheKey, { entries, scannedBytes, truncated: position > 0 })
+}
+
 /** The key one pending approval is stored under. */
 export function pendingKey(sessionId, callId) {
   if (typeof sessionId !== 'string' || typeof callId !== 'string') return null
@@ -520,6 +649,72 @@ export function createPendingStore({ ttlMs = PENDING_TTL_MS, limit = PENDING_LIM
     forget(sessionId, callId) {
       const key = pendingKey(sessionId, callId)
       if (key !== null) entries.delete(key)
+    },
+  }
+}
+
+/**
+ * Create the human-decision scratch space: what the user clicked, before the
+ * approval service reports the outcome it produced.
+ *
+ * A card answers in two steps — it calls `/dsh-allow/remember` or
+ * `/dsh-allow/once`, then settles the pending approval — and the pending record
+ * is gone by the second. The note is keyed separately so both halves of one
+ * decision still produce exactly one audit record.
+ * @param options - how many unanswered notes may wait.
+ * @returns note/take/peek operations.
+ */
+export function createDecisionLog({ limit = DECISION_NOTE_LIMIT } = {}) {
+  const notes = new Map()
+  return {
+    /**
+     * Record what the user clicked for one call.
+     * @param sessionId - owning session id.
+     * @param callId - tool call id.
+     * @param entry - the action, and whatever the card was looking at.
+     * @returns whether a note was written.
+     */
+    note(sessionId, callId, entry) {
+      const key = pendingKey(sessionId, callId)
+      if (key === null) return false
+      notes.delete(key)
+      notes.set(key, entry)
+      while (notes.size > limit) {
+        const oldest = notes.keys().next().value
+        if (oldest === undefined) break
+        notes.delete(oldest)
+      }
+      return true
+    },
+    /**
+     * Read and clear one call's note.
+     * @param sessionId - owning session id.
+     * @param callId - tool call id.
+     * @returns the note, or null.
+     */
+    take(sessionId, callId) {
+      const key = pendingKey(sessionId, callId)
+      if (key === null) return null
+      const entry = notes.get(key) ?? null
+      notes.delete(key)
+      return entry
+    },
+    /**
+     * Read one call's note without clearing it.
+     * @param sessionId - owning session id.
+     * @param callId - tool call id.
+     * @returns the note, or null.
+     */
+    peek(sessionId, callId) {
+      const key = pendingKey(sessionId, callId)
+      return key === null ? null : notes.get(key) ?? null
+    },
+    /**
+     * How many notes are waiting.
+     * @returns the note count.
+     */
+    size() {
+      return notes.size
     },
   }
 }

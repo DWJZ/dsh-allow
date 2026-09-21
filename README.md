@@ -1,5 +1,5 @@
 ---
-description: "dsh-allow: filesystem permissions (read / write / create / delete / execute) per path for DSH shell calls, enforced in the process sandbox, with deny / allow once / always allow."
+description: "dsh-allow: filesystem permissions (read / write / create / delete / execute) per path for DSH shell calls, enforced in the process sandbox, with deny / allow once / always allow, and an Approvals tab that shows which layer decided each call."
 ---
 
 # dsh-allow
@@ -181,6 +181,30 @@ What it is told is only the analyzed request and the user's own words:
 
 Every review is logged and audited with the command, the requested capabilities, the verdict, the reason, the latency and the model route — never with file contents, secrets, or hidden reasoning.
 
+## The approval ledger
+
+Every decision this layer makes is audited, and the audit log is readable where the decisions happen: the Conversation area gains an **Approvals** tab beside **Chat** and **Trajectory**.
+
+```
+Conversation views:   Chat  │  Trajectory  │  Approvals
+```
+
+The tab reads the current session's decisions back from the audit log, newest last, three seconds behind it:
+
+| origin | what answered |
+| --- | --- |
+| `rule` | a stored rule or a deployment grant — the row names the rule's path and the capabilities it granted |
+| `baseline` | the platform baseline: the workspace, the temp areas, the harness home, the system paths |
+| `auto-review` | the optional reviewer answered `ALLOW`; the row carries its verdict, reason, latency and model route |
+| `human` | the user answered: allow once, always allow (with the rules the button wrote), deny, cancelled, or no answerer |
+| `policy` | this plugin refused on its own: a platform-protected path, or a line the shell grammar cannot parse |
+
+Default allows stay behind **Show default allows**, because inside a workspace they are the overwhelming majority and say the least. One row stands for one tool call: a prompt and the human decision that answered it collapse into that single human row, so the ledger answers "who decided this call" rather than replaying event traffic.
+
+The tab is read-only. It reads `GET /dsh-allow/audit?sessionId=…&limit=…&baseline=1` on the Web host, which walks the audit log backwards in fixed chunks — a busy session answers from the last chunk, and a request that follows no write reads no file at all. The route is loopback-only, grants nothing, writes no rule, and answers no approval.
+
+Records written before this version carry no `sessionId`, so a session's ledger cannot attribute them and starts from the first decision made after the upgrade.
+
 ## The macOS backend
 
 `src/macos.js` compiles a rule set into a Seatbelt (`sandbox-exec`) profile, and the mapping was measured against the kernel, not assumed:
@@ -249,12 +273,14 @@ A `rules.json` written by dsh-allow 0.1 (the command-prefix model) reads as empt
 ## Test
 
 ```sh
-npm test              # units, host wiring, card render, and the real-sandbox suite
-npm run test:unit     # policy, effects, enforcement, reviewer, decisions
+npm test              # units, host wiring, card render, the audit ledger, and the real-sandbox suite
+npm run test:unit     # policy, effects, enforcement, reviewer, decisions, audit ledger
 npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start sandbox-exec)
 ```
 
 `test/reviewer.spec.mjs` injects the model and covers what the reviewer is told (only real user messages, the analyzed permissions, the fixed prompt), every answer shape (`ALLOW`, `ASK`, fenced JSON, prose, an unknown verdict, an empty answer), and every failure path (no route, no LLM service, a provider throw, a terminal error chunk, a timeout, an invalid answer). `test/smoke.mjs` covers the gate integration: an `ALLOW` runs the call through the existing call-scoped one-shot grant and leaves the rules file untouched, while an `ASK`, a failing reviewer and a disabled reviewer all leave the card in charge.
+
+`test/audit.spec.mjs` covers the ledger end to end without a host: which layer a decision records as its origin and which rules it names, the single record one human decision produces whichever half of the card answered, the records a half-written line, a foreign approval or an unrecognized outcome must not produce, the backwards reader's chunk boundaries, session filter and byte cap, and the audit route's method, loopback, limit and baseline rules. `test/client.smoke.mjs` additionally renders the tab through React and asserts one row per call, with no copy outside the dictionary.
 
 `test/sandbox.integration.mjs` runs the real kernel and covers:
 
@@ -270,11 +296,15 @@ It skips with a notice when `sandbox-exec` cannot apply a profile — including 
 
 ## Limits
 
+- The Approvals tab reads at most the last 4 MiB of the audit log, 500 records per request, and it re-reads every three seconds while it is open: the older decisions of a very long session fall outside that window.
+- A chunk boundary that lands inside an audit line drops that line from an answer, rather than reporting a decision the reader could not parse.
+- Records written before this version carry no `sessionId`, so they never appear in a session's ledger.
 - Path resolution still works inside the fenced areas: `stat` and directory listing leak metadata, only file contents are withheld.
 - A tool that keeps its configuration and its token together under the home needs one read grant for that directory: `gh`, `aws`, `docker` and friends report their own error until `~/.config/<tool>` is granted. Denying `hosts.yml`, `credentials` and `id_ed25519` by default is the point; granting them is a deliberate act.
 - The strongest read fence (`enforce: full`) is expressible but not survivable on this host: macOS reads more than the policy baseline names, so `/bin/sh` aborts under it. `auto` settles on `guarded`.
 - Other Seatbelt findings: a wildcard denial loses to a specific allowance, so refusals name their operations; an unreadable path still resolves, so metadata is not hidden.
-- Renaming needs `delete` for the source plus `create` for the target, and `create` alone lets a process fill the file it creates.
+- `create` alone creates and fills a new file; changing a file that already exists needs `write`.
+- Renaming needs `delete` for the source plus `create` for the target.
 - Read effects are derived for a fixed table of programs; the fence, not the table, is the boundary.
 - Effects the command line does not show are judged by the sandbox, not by the parser: an effect the program table does not know is left to the fence rather than guessed.
 - `allow once` is serialized per session rather than per call: while the grant is live, another call in that session waits for the approved call to settle. A call id carried into the sandbox policy would remove the wait, and the core does not pass one today.

@@ -1,0 +1,32 @@
+# Deterministic install from the committed lockfile, the whole suite with no
+# host and no network, and a production-dependency audit.
+#
+# Two suites need a real host and report their own skip instead of failing: the
+# macOS Seatbelt integration suite says so where sandbox-exec cannot apply a
+# profile, and the browser suite's render assertions need DSH_CHECKOUT pointing
+# at a checkout with React installed — its registration assertions always run.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Dependency audit (production dependencies)
+        if: matrix.node == 22
+        run: npm audit --omit=dev

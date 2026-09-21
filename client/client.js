@@ -44,7 +44,27 @@ window.__ModuleLoader__.load({
 				".dsha_ellipsis{display:inline-block;max-width:32ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}",
 				".dsha_notice{padding:0 16px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-state-error-primary)}",
 				".dsha_hint{padding:0 16px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
-				".dsha_meta{display:flex;flex-wrap:wrap;gap:4px 16px;padding:6px 16px 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}"
+				".dsha_meta{display:flex;flex-wrap:wrap;gap:4px 16px;padding:6px 16px 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
+				".dsha_log{display:flex;flex-direction:column;height:100%;min-height:0;width:100%;box-sizing:border-box;overflow:hidden;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}",
+				".dsha_logBar{display:flex;align-items:center;gap:12px;flex:0 0 auto;padding:10px 16px;border-bottom:1px solid var(--dsw-alias-border-l1)}",
+				".dsha_logTitle{font-size:14px;font-weight:500;line-height:22px}",
+				".dsha_logCount{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}",
+				".dsha_logSpacer{flex:1}",
+				".dsha_logList{flex:1;min-height:0;overflow-y:auto;padding:12px 16px calc(var(--dsh-composer-height,152px) + 16px)}",
+				".dsha_logNote{padding:24px 4px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}",
+				".dsha_logRow{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-2)}",
+				".dsha_logRow+.dsha_logRow{margin-top:8px}",
+				".dsha_logTop{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}",
+				".dsha_logTime{font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}",
+				".dsha_logBadge{font-size:12px;line-height:16px;padding:1px 8px;border:1px solid currentColor;border-radius:999px;white-space:nowrap}",
+				".dsha_logBadge[data-origin=human]{color:var(--dsw-alias-brand-primary)}",
+				".dsha_logBadge[data-origin=rule]{color:var(--dsw-alias-state-success-primary)}",
+				".dsha_logBadge[data-origin=auto-review]{color:var(--dsw-alias-state-success-primary)}",
+				".dsha_logBadge[data-origin=policy]{color:var(--dsw-alias-state-error-primary)}",
+				".dsha_logBadge[data-origin=baseline],.dsha_logBadge[data-origin=legacy]{color:var(--dsw-alias-label-secondary)}",
+				".dsha_logCommand{font-family:var(--ds-font-family-code);font-size:13px;line-height:20px;word-break:break-all}",
+				".dsha_logDetail{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);word-break:break-all}",
+				".dsha_logReason{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}"
 			].join("");
 			document.head.appendChild(tag);
 		}
@@ -68,7 +88,30 @@ window.__ModuleLoader__.load({
 			cwd: "工作目录:{cwd}",
 			escalation: "需要批准:{toolName}",
 			unknownHint: "这行里有看不清的部分(内联代码、变量等)，系统层沙箱照样拦得住越界操作。",
-			detailAria: "权限请求详情"
+			detailAria: "权限请求详情",
+			viewAllowLog: "审批",
+			logTitle: "审批记录",
+			logScope: "只看当前会话",
+			logShowBaseline: "显示默认放行",
+			logHideBaseline: "隐藏默认放行",
+			logLoading: "正在读取…",
+			logEmpty: "这个会话还没有需要审批的记录。",
+			logError: "读取审批记录失败:{message}",
+			logTruncated: "只显示最近 {count} 条。",
+			logOriginRule: "规则放行",
+			logOriginBaseline: "默认放行",
+			logOriginAutoReview: "自动审核放行",
+			logOriginHuman: "人工",
+			logOriginPolicy: "策略拒绝",
+			logOriginLegacy: "早期记录",
+			logAllowOnce: "允许一次",
+			logAlwaysAllow: "总是允许",
+			logDeny: "拒绝",
+			logCancelled: "已取消",
+			logUnavailable: "无人应答",
+			logStoredRules: "写入规则:{rules}",
+			logReviewer: "自动审核:{verdict}({latency} ms，{route})",
+			logPaths: "路径:{paths}"
 		};
 		const en = {
 			waiting: "Filesystem permission required",
@@ -86,7 +129,30 @@ window.__ModuleLoader__.load({
 			cwd: "Working directory: {cwd}",
 			escalation: "Approval required: {toolName}",
 			unknownHint: "Part of this line cannot be read (inline code, variables); the OS sandbox still fences what it touches.",
-			detailAria: "Approval request detail"
+			detailAria: "Approval request detail",
+			viewAllowLog: "Approvals",
+			logTitle: "Approval ledger",
+			logScope: "This session only",
+			logShowBaseline: "Show default allows",
+			logHideBaseline: "Hide default allows",
+			logLoading: "Reading…",
+			logEmpty: "No approval decisions in this session yet.",
+			logError: "Could not read the approval ledger: {message}",
+			logTruncated: "Showing the {count} most recent records.",
+			logOriginRule: "Rule",
+			logOriginBaseline: "Default",
+			logOriginAutoReview: "Auto-reviewed",
+			logOriginHuman: "Human",
+			logOriginPolicy: "Policy refusal",
+			logOriginLegacy: "Earlier record",
+			logAllowOnce: "allowed once",
+			logAlwaysAllow: "always allowed",
+			logDeny: "denied",
+			logCancelled: "cancelled",
+			logUnavailable: "no answerer",
+			logStoredRules: "Rules stored: {rules}",
+			logReviewer: "Auto review: {verdict} ({latency} ms, {route})",
+			logPaths: "Paths: {paths}"
 		};
 		//#endregion
 
@@ -270,10 +336,208 @@ window.__ModuleLoader__.load({
 					React.createElement("div", { className: "dsha_actions" }, buttons)));
 		}
 
+		//#region approval ledger
+		/** 审批记录标签页的轮询间隔(毫秒)。 */
+		const LOG_POLL_MS = 3000;
+		/** 一次向宿主拉取的记录条数。 */
+		const LOG_PAGE_LIMIT = 200;
+		/** 来源分类的权重:同一个 callId 上更权威的记录会取代较弱的。 */
+		const ORIGIN_RANK = { human: 4, "auto-review": 3, policy: 2, rule: 1, baseline: 0, legacy: 0 };
+		const ORIGIN_LABEL = {
+			rule: "logOriginRule",
+			baseline: "logOriginBaseline",
+			"auto-review": "logOriginAutoReview",
+			human: "logOriginHuman",
+			policy: "logOriginPolicy",
+			legacy: "logOriginLegacy"
+		};
+		const ACTION_LABEL = {
+			"allow-once": "logAllowOnce",
+			"always-allow": "logAlwaysAllow",
+			deny: "logDeny",
+			cancelled: "logCancelled",
+			unavailable: "logUnavailable"
+		};
+
+		/**
+		 * 读当前会话最近的审批记录。
+		 * @param sessionId - 当前会话 id。
+		 * @param showBaseline - 是否连默认放行一起要。
+		 * @returns 宿主返回的记录与截断标记。
+		 */
+		async function readLedger(sessionId, showBaseline) {
+			const query = "?sessionId=" + encodeURIComponent(sessionId)
+				+ "&limit=" + String(LOG_PAGE_LIMIT)
+				+ (showBaseline ? "&baseline=1" : "");
+			const response = await fetch("/dsh-allow/audit" + query, {
+				cache: "no-store",
+				headers: { accept: "application/json" }
+			});
+			if (!response.ok) throw new Error("HTTP " + String(response.status));
+			const data = await response.json();
+			if (data === null || data.ok !== true) throw new Error("bad answer");
+			return {
+				entries: Array.isArray(data.entries) ? data.entries : [],
+				truncated: data.truncated === true
+			};
+		}
+
+		/** 一条记录的来源权重。 */
+		function rankOf(entry) {
+			return ORIGIN_RANK[entry.origin] ?? 0;
+		}
+
+		/**
+		 * 每个工具调用只留一行:同一 callId 上更权威的记录取代较弱的,行位置保持
+		 * 该调用第一次出现的位置,所以轮询到新决策时已有行不会跳动。
+		 * @param entries - 宿主返回的记录,由旧到新。
+		 * @returns 每行一条的记录。
+		 */
+		function collapse(entries) {
+			const rows = new Map();
+			for (const [index, entry] of entries.entries()) {
+				const key = typeof entry.callId === "string" && entry.callId !== ""
+					? entry.callId
+					: "record-" + String(index);
+				const previous = rows.get(key);
+				if (previous === undefined || rankOf(entry) >= rankOf(previous)) rows.set(key, entry);
+			}
+			return Array.from(rows.values());
+		}
+
+		/** 一行里的时间,读不出来时为空。 */
+		function timeOf(entry) {
+			const at = typeof entry.at === "string" ? new Date(entry.at) : null;
+			return at === null || Number.isNaN(at.getTime()) ? "" : at.toLocaleTimeString();
+		}
+
+		/** 一行里点名的路径:优先说缺什么,其次说哪条规则放行的。 */
+		function detailOf(entry) {
+			const labels = [];
+			for (const item of entry.missing ?? []) labels.push(item.operation + " " + (item.path ?? entry.command ?? ""));
+			if (labels.length > 0) return labels.join(", ");
+			if (entry.origin !== "rule") return "";
+			for (const rule of entry.matchedRules ?? []) {
+				const access = Object.keys(rule.access ?? {}).join("+");
+				labels.push((access === "" ? "" : access + " ") + rule.path);
+			}
+			return labels.join(", ");
+		}
+
+		/** 一行里自动审核那次的结论。 */
+		function reviewOf(t, entry) {
+			if (entry.review === null || typeof entry.review !== "object") return null;
+			return t("logReviewer", {
+				verdict: entry.review.verdict ?? "?",
+				latency: entry.review.latencyMs === undefined ? "?" : String(entry.review.latencyMs),
+				route: entry.review.route ?? "inherit"
+			});
+		}
+
+		/** 一行里「总是允许」写下的规则。 */
+		function storedRulesOf(t, entry) {
+			if (entry.action !== "always-allow" || !Array.isArray(entry.rules) || entry.rules.length === 0) return null;
+			return t("logStoredRules", { rules: entry.rules.map((rule) => rule.label ?? rule.path).join(" + ") });
+		}
+
+		/**
+		 * 一行审批记录。
+		 * @param props.entry - 一条审计记录。
+		 * @param props.t - 本命名空间的翻译函数。
+		 */
+		function LedgerRow(props) {
+			const entry = props.entry;
+			const t = props.t;
+			const action = ACTION_LABEL[entry.action];
+			const detail = detailOf(entry);
+			const review = reviewOf(t, entry);
+			const stored = storedRulesOf(t, entry);
+			const time = timeOf(entry);
+			return React.createElement("div", { className: "dsha_logRow" },
+				React.createElement("div", { className: "dsha_logTop" },
+					time === "" ? null : React.createElement("span", { className: "dsha_logTime" }, time),
+					React.createElement("span", { className: "dsha_logBadge", "data-origin": entry.origin },
+						ORIGIN_LABEL[entry.origin] === undefined ? entry.origin : t(ORIGIN_LABEL[entry.origin])),
+					action === undefined ? null : React.createElement("span", { className: "dsha_logTime" }, t(action))),
+				entry.command === null || entry.command === undefined
+					? null
+					: React.createElement("div", { className: "dsha_logCommand" }, entry.command),
+				detail === "" ? null : React.createElement("div", { className: "dsha_logDetail" }, t("logPaths", { paths: detail })),
+				stored === null ? null : React.createElement("div", { className: "dsha_logDetail" }, stored),
+				review === null ? null : React.createElement("div", { className: "dsha_logDetail" }, review),
+				entry.reason === null || entry.reason === undefined
+					? null
+					: React.createElement("div", { className: "dsha_logReason" }, entry.reason));
+		}
+
+		/**
+		 * 审批记录标签页:当前会话里每一次决策是谁拍的板。
+		 *
+		 * 只读,只走宿主那条 loopback 读路由;它不写规则、不回答任何审批。
+		 * @param props.sessionId - 当前会话 id。
+		 * @param props.t - 由 `locale: NS` 注入的翻译函数。
+		 */
+		function AllowLogView(props) {
+			const t = props.t;
+			const sessionId = typeof props.sessionId === "string" ? props.sessionId : null;
+			const [state, setState] = React.useState({ status: "loading", entries: [], truncated: false, error: null });
+			const [showBaseline, setShowBaseline] = React.useState(false);
+
+			React.useEffect(() => {
+				if (sessionId === null) return undefined;
+				let cancelled = false;
+				const load = () => {
+					void readLedger(sessionId, showBaseline).then((answer) => {
+						if (!cancelled) {
+							setState({ status: "ready", entries: answer.entries, truncated: answer.truncated, error: null });
+						}
+					}, (cause) => {
+						if (!cancelled) {
+							setState({
+								status: "error",
+								entries: [],
+								truncated: false,
+								error: cause && cause.message ? cause.message : String(cause)
+							});
+						}
+					});
+				};
+				load();
+				const timer = setInterval(load, LOG_POLL_MS);
+				return () => {
+					cancelled = true;
+					clearInterval(timer);
+				};
+			}, [sessionId, showBaseline]);
+
+			const rows = collapse(state.entries);
+			const body = [];
+			if (sessionId === null) body.push(React.createElement("div", { className: "dsha_logNote", key: "nosession" }, t("logEmpty")));
+			else if (state.status === "loading") body.push(React.createElement("div", { className: "dsha_logNote", key: "loading" }, t("logLoading")));
+			else if (state.status === "error") body.push(React.createElement("div", { className: "dsha_logNote", key: "error" }, t("logError", { message: String(state.error) })));
+			else if (rows.length === 0) body.push(React.createElement("div", { className: "dsha_logNote", key: "empty" }, t("logEmpty")));
+			else {
+				for (const [index, entry] of rows.entries()) body.push(React.createElement(LedgerRow, { key: "row-" + String(index), entry, t }));
+				if (state.truncated) body.push(React.createElement("div", { className: "dsha_logNote", key: "truncated" }, t("logTruncated", { count: String(rows.length) })));
+			}
+
+			return React.createElement("div", { className: "dsha_log" },
+				React.createElement("div", { className: "dsha_logBar" },
+					React.createElement("span", { className: "dsha_logTitle" }, t("logTitle")),
+					React.createElement("span", { className: "dsha_logCount" }, t("logScope")),
+					React.createElement("span", { className: "dsha_logSpacer" }),
+					React.createElement(primitives.Button, {
+						variant: showBaseline ? "primary" : "outline",
+						onClick: () => { setShowBaseline(!showBaseline); }
+					}, showBaseline ? t("logHideBaseline") : t("logShowBaseline"))),
+				React.createElement("div", { className: "dsha_logList" }, body));
+		}
+		//#endregion
+
 		//#region plugin
 		const inject = ["slots", "locale"];
 
-		/** 注册字典与同款审批卡片。 */
+		/** 注册字典、同款审批卡片,以及轨迹旁边的审批记录标签页。 */
 		function apply(ctx) {
 			ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-allow: dictionaries");
 			// priority 0 排在内置审批卡片(priority 1)之前:本插件接管的审批由本卡片渲染,
@@ -287,6 +551,18 @@ window.__ModuleLoader__.load({
 				}, AllowPanel);
 				return () => { dispose(); };
 			});
+			// 「对话 / 轨迹」旁边的第三个标签页。label 走 thunk,所以跟着当前语言走。
+			ctx.slots.inject("conversation.view", () => {
+				const t = ctx.locale.bind(NS);
+				const dispose = ctx.slots.register({
+					name: "conversation.view",
+					id: "allow-log",
+					order: 20,
+					locale: NS,
+					label: () => t("viewAllowLog")
+				}, AllowLogView);
+				return () => { dispose(); };
+			});
 		}
 
 		exports.apply = apply;
@@ -296,6 +572,9 @@ window.__ModuleLoader__.load({
 		exports.shorten = shorten;
 		exports.alwaysText = alwaysText;
 		exports.AllowPanel = AllowPanel;
+		exports.collapse = collapse;
+		exports.detailOf = detailOf;
+		exports.AllowLogView = AllowLogView;
 		//#endregion
 
 		return module.exports;

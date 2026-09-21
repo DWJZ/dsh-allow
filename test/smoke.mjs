@@ -448,8 +448,8 @@ check('every listener is prepended', registered.listeners.every(entry => entry.o
 check('the gate listens on tools/pre-execute', registered.listeners.some(entry => entry.name === 'tools/pre-execute'))
 check('the card listens on approval/request', registered.listeners.some(entry => entry.name === 'approval/request'))
 check('the one-shot grants settle on tools/post-execute', registered.listeners.some(entry => entry.name === 'tools/post-execute'))
-check('all three routes are registered',
-  registered.routes.map(route => route.path).join(',') === '/dsh-allow/pending,/dsh-allow/remember,/dsh-allow/once',
+check('all four routes are registered',
+  registered.routes.map(route => route.path).join(',') === '/dsh-allow/pending,/dsh-allow/remember,/dsh-allow/once,/dsh-allow/audit',
   JSON.stringify(registered.routes.map(route => route.path)))
 check('/allow is registered', registered.commands[0]?.name === 'allow')
 check('the process fence is installed as an effect', registered.effects.length >= 1)

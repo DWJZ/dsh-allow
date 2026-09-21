@@ -49,14 +49,20 @@ const pendingInfo = {
 }
 
 let hooks = 0
+/** Hook values one render consumes in order; anything past the plan keeps its initial value. */
+let plan = []
 const stubRequire = (specifier) => {
   if (specifier === 'react') {
     if (found === null) return { createElement: () => null, useState: () => [null, () => {}], useEffect: () => {} }
     return {
       ...found.react,
-      // The first hook of the panel is the fetched record; rendering it
-      // directly is what a browser shows once `/dsh-allow/pending` answered.
-      useState: (initial) => { hooks += 1; return [hooks === 1 ? pendingInfo : initial, () => {}] },
+      // Rendering a component directly is what a browser shows once its host
+      // route answered, so the plan supplies the state it would have loaded.
+      useState: (initial) => {
+        const index = hooks
+        hooks += 1
+        return [index < plan.length ? plan[index] : initial, () => {}]
+      },
       useEffect: () => {},
     }
   }
@@ -99,25 +105,66 @@ const many = labels(Array.from({ length: 5 }, (_value, index) => ({ label: `r${S
 check('a long list is capped with a count', many.includes('+2'), many)
 
 console.log('apply')
-let registration = null
+const registrations = []
+const dictionaries = []
 const ctx = {
   effect: (factory) => factory(),
-  locale: { register: () => () => {} },
-  slots: { inject: (_name, factory) => factory(), register: (options, component) => { registration = { options, component }; return () => {} } },
+  locale: {
+    register: (ns, dicts) => { dictionaries.push({ ns, dicts }); return () => {} },
+    bind: (ns) => (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`),
+  },
+  slots: {
+    inject: (_name, factory) => factory(),
+    register: (options, component) => { registrations.push({ options, component }); return () => {} },
+  },
 }
 client.apply(ctx)
-check('a composer chain entry is registered', registration?.options?.name === 'conversation.composer', JSON.stringify(registration?.options?.name))
-check('it runs before the built-in approval card (priority 1)', (registration?.options?.priority ?? 99) < 1, String(registration?.options?.priority))
-check('it declares its dictionary namespace', registration?.options?.locale === 'dshAllow', String(registration?.options?.locale))
-check('select matches an escalation', registration?.options?.select({ pendingInteraction: pending }) === pending)
-check('select passes other interactions through', registration?.options?.select({ pendingInteraction: { kind: 'question' } }) === null)
+const card = registrations.find(entry => entry.options.name === 'conversation.composer')
+const ledger = registrations.find(entry => entry.options.name === 'conversation.view')
+check('a composer chain entry is registered', card?.options?.name === 'conversation.composer', JSON.stringify(registrations.map(entry => entry.options.name)))
+check('it runs before the built-in approval card (priority 1)', (card?.options?.priority ?? 99) < 1, String(card?.options?.priority))
+check('it declares its dictionary namespace', card?.options?.locale === 'dshAllow', String(card?.options?.locale))
+check('select matches an escalation', card?.options?.select({ pendingInteraction: pending }) === pending)
+check('select passes other interactions through', card?.options?.select({ pendingInteraction: { kind: 'question' } }) === null)
+
+console.log('the approval ledger tab')
+check('a conversation view is registered beside the shipped ones',
+  ledger?.options?.name === 'conversation.view' && ledger?.options?.id === 'allow-log', JSON.stringify(ledger?.options))
+check('it renders after the trajectory view (order 10)', (ledger?.options?.order ?? 0) > 10, String(ledger?.options?.order))
+check('and its tab label is a thunk, so it follows the active locale',
+  typeof ledger?.options?.label === 'function' && ledger.options.label() === 'viewAllowLog', String(ledger?.options?.label?.()))
+check('it declares the same dictionary namespace', ledger?.options?.locale === 'dshAllow', String(ledger?.options?.locale))
+check('the dictionary is registered for both locales and balanced',
+  dictionaries.length === 1 && dictionaries[0].ns === 'dshAllow'
+  && Object.keys(dictionaries[0].dicts.zh).length === Object.keys(dictionaries[0].dicts.en).length,
+  JSON.stringify(dictionaries.map(entry => entry.ns)))
+
+/** One prompt, the human decision that answered it, and an auto-reviewed call. */
+const ledgerEntries = [
+  { at: '2026-01-01T00:00:00.000Z', origin: 'baseline', decision: 'prompt', callId: 'c1', command: 'rm -rf build', reason: 'filesystem permission required: delete(/w/build)', missing: [{ operation: 'delete', path: '/w/build' }], effects: [], matchedRules: [] },
+  { at: '2026-01-01T00:00:01.000Z', origin: 'human', action: 'allow-once', decision: 'allow', callId: 'c1', command: 'rm -rf build', reason: 'the user allowed this call once', missing: [], effects: [], matchedRules: [] },
+  { at: '2026-01-01T00:00:02.000Z', origin: 'auto-review', decision: 'allow', callId: 'c2', command: 'gh pr list', reason: 'auto review allowed this call once: the user asked', review: { verdict: 'ALLOW', reason: 'the user asked', latencyMs: 12, route: 'deepseek/test' }, missing: [], effects: [], matchedRules: [] },
+]
+check('one call collapses to its strongest record', client.collapse(ledgerEntries).length === 2,
+  JSON.stringify(client.collapse(ledgerEntries).map(entry => entry.origin)))
+check('and the survivor is the human decision', client.collapse(ledgerEntries)[0].action === 'allow-once')
+check('a call with no id keeps its own row',
+  client.collapse([{ origin: 'rule' }, { origin: 'rule' }]).length === 2)
+check('a prompt names what was missing',
+  client.detailOf({ origin: 'baseline', missing: [{ operation: 'delete', path: '/w/build' }], matchedRules: [] }) === 'delete /w/build')
+check('a rule allow names the rule that answered',
+  client.detailOf({ origin: 'rule', missing: [], matchedRules: [{ path: '/w/build', access: { delete: true } }] }) === 'delete /w/build')
+check('a baseline allow names nothing',
+  client.detailOf({ origin: 'baseline', missing: [], matchedRules: [{ path: '/w', access: { read: true } }] }) === '')
 
 if (found === null) {
   console.log('  skip render assertion (set DSH_CHECKOUT to a checkout with React installed)')
 } else {
   const react = found.react
   const t = (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`)
-  const html = found.server.renderToStaticMarkup(react.createElement(registration.component, { matched: pending, t }))
+  hooks = 0
+  plan = [pendingInfo]
+  const html = found.server.renderToStaticMarkup(react.createElement(card.component, { matched: pending, t }))
   check('the card renders the approval chrome', html.includes('dsha_card') && html.includes('dsha_strip'), html.slice(0, 200))
   check('the card renders 拒绝 and 允许一次', html.includes('reject') && html.includes('allowOnce'), html)
   check('the card shows the reason', html.includes('escalate sandbox to danger-full-access'), html)
@@ -127,6 +174,18 @@ if (found === null) {
   check('the card shows the sandbox mode', html.includes('workspace-write'), html)
   check('exactly one always-allow button is offered', html.split('alwaysOne').length - 1 === 1, html)
   check('and no folder button exists', !html.includes('alwaysFolder') && !html.includes('alwaysFile'), html)
+
+  hooks = 0
+  plan = [{ status: 'ready', entries: ledgerEntries, truncated: true, error: null }]
+  const logHtml = found.server.renderToStaticMarkup(react.createElement(ledger.component, { sessionId: 's1', t }))
+  check('the ledger renders one row per call', (logHtml.match(/class="dsha_logRow"/gu) ?? []).length === 2, logHtml.slice(0, 400))
+  check('the surviving row is the human decision', logHtml.includes('logOriginHuman') && logHtml.includes('logAllowOnce'), logHtml)
+  check('and the prompt it replaced is gone', !logHtml.includes('logOriginBaseline'), logHtml)
+  check('the ledger shows the command', logHtml.includes('rm -rf build'), logHtml)
+  check('an auto-reviewed row names the verdict, the latency, and the route', logHtml.includes('logReviewer'), logHtml)
+  check('the ledger offers the baseline toggle', logHtml.includes('logShowBaseline'), logHtml)
+  check('and says when older records were cut', logHtml.includes('logTruncated'), logHtml)
+  check('the ledger writes no copy of its own', !/[\u4e00-\u9fff]/u.test(logHtml), logHtml)
 }
 
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)

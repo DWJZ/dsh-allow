@@ -20,8 +20,8 @@
   ],
   "main": "src/index.js",
   "scripts": {
-    "test": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/enforce.spec.mjs && node test/reviewer.spec.mjs && node test/decide.spec.mjs && node test/smoke.mjs && node test/client.smoke.mjs && node test/sandbox.integration.mjs",
-    "test:unit": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/enforce.spec.mjs && node test/reviewer.spec.mjs && node test/decide.spec.mjs",
+    "test": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/enforce.spec.mjs && node test/reviewer.spec.mjs && node test/decide.spec.mjs && node test/audit.spec.mjs && node test/smoke.mjs && node test/client.smoke.mjs && node test/sandbox.integration.mjs",
+    "test:unit": "node test/fspolicy.spec.mjs && node test/effects.spec.mjs && node test/enforce.spec.mjs && node test/reviewer.spec.mjs && node test/decide.spec.mjs && node test/audit.spec.mjs",
     "test:sandbox": "node test/sandbox.integration.mjs"
   },
   "exports": {

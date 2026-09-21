@@ -1,5 +1,5 @@
 ---
-description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / create / delete / execute 文件权限,并在进程沙箱里真正强制;卡片上给「拒绝 / 允许一次 / 总是允许」。"
+description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / create / delete / execute 文件权限,并在进程沙箱里真正强制;卡片上给「拒绝 / 允许一次 / 总是允许」,另有「审批」标签页显示每次判定是谁拍的板。"
 ---
 
 # dsh-allow
@@ -9,33 +9,37 @@ description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / creat
 给 DSH 加一层**文件系统权限**。判断依据是这条命令需要哪些文件能力,而不是命令名听起来多危险;同一份策略还会被编译成进程真正运行其下的 profile —— 所以它启动的子进程、以及命令行里根本没露出来的代码,同样受这份策略约束。
 
 ```
-cat README.md                  →  允许    (workspace 内 read)
-cat ~/.ssh/id_ed25519          →  拒绝    (用户数据区被围住,谁读都一样)
+cat README.md                  →  allow    (read inside the workspace)
+cat ~/.ssh/id_ed25519          →  refused  (user data is fenced, whoever reads it)
 python3 -c 'open("~/.ssh/id_ed25519").read()'
-                               →  被内核拒绝,而不是被解析器发现
-echo x > out.md                →  允许    (workspace 内 create)
-rm -rf build                   →  询问    (workspace 默认不授予 delete)
-python3 -c 'os.remove(…)'      →  delete 未授权时由内核拒绝
-gh pr list                     →  询问    (这个二进制没被授予 execute)
-echo x > /Users/me/other/o     →  询问    (workspace 外 create)
-echo x > ~/.dsh/dsh-allow.json →  拒绝    (权限库永远不可写)
+                               →  refused by the kernel, not found by the parser
+echo x > out.md                →  allow    (create inside the workspace)
+rm -rf build                   →  prompt   (delete is not granted in the workspace)
+python3 -c 'os.remove(…)'      →  refused by the kernel while delete is ungranted
+gh pr list                     →  prompt   (execute is not granted for that binary)
+echo x > /Users/me/other/o     →  prompt   (create outside the workspace)
+echo x > ~/.dsh/dsh-allow.json →  refused  (the permission store is never writable)
 ```
+
+上例逐条读作:工作区内的 `cat` 允许;`~/.ssh/id_ed25519` 一律拒绝, 谁读都一样;`python3 -c` 里的读取由内核拒绝, 而不是被解析器发现;工作区内写入允许;工作区默认不授予 delete, 所以 `rm -rf build` 询问;delete 未授权时 `os.remove` 由内核拒绝;`gh pr list` 因为那个二进制没有 execute 而询问;工作区外的写入询问;权限库永远不可写, 所以写它一律拒绝。
 
 ## 挂在哪一层
 
 ```
-模型写出一条命令
+model writes a command
       ↓
-bash / pwsh 工具调用
+bash / pwsh tool call
       ↓
-tools/pre-execute  ← 本插件:解析 → 推导文件效果 → 逐条解析 (路径, 能力)
-      ↓ 允许                     ↓ 询问                        ↓ 拒绝
-  ctx.sandbox.confine        审批卡片:拒绝 / 总是允许 /      不能提权
-      ↓                      允许一次
-  用同一套规则编译出来的 Seatbelt profile
+tools/pre-execute  ← this plugin: parse → derive effects → resolve (path, capability)
+      ↓ allow                    ↓ prompt                     ↓ refuse
+  ctx.sandbox.confine        approval card: deny / always    no escalation
+      ↓                      allow / allow once
+  Seatbelt profile compiled from the SAME rules
       ↓
-整棵进程树(子进程、孙进程、内联代码)
+the process tree (children, grandchildren, inline code)
 ```
+
+这张图读作:模型写出命令 → bash / pwsh 工具调用 → 本插件在 `tools/pre-execute` 上解析、推导文件效果、逐条解析 (路径, 能力);允许就交给 `ctx.sandbox.confine`, 询问就出审批卡片(拒绝 / 总是允许 / 允许一次), 拒绝则不能提权;进程跑在同一套规则编译出的 Seatbelt profile 下, 整棵进程树(子进程、孙进程、内联代码)都受它约束。
 
 `tools/pre-execute` 是文档化的策略接缝,也是 shell 命令唯一的路径。插件**不替换** sandbox provider:它包住已注册 provider 的 `confine`,把由当前有效策略编译出的 profile 交给它,自己处理不了的平台原样委托回去。`tools/post-execute` 负责把「允许一次」用掉,另有一道针对写文件工具的小闸门拦下权限库。
 
@@ -120,12 +124,14 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 `拒绝`、**唯一一个**`总是允许`按钮,以及`允许一次`,并显示真正缺的那一项:
 
 ```
-需要文件权限
-操作: delete
-路径: /Users/me/project/build
-命令: rm -rf build
-沙箱: workspace-write
+Filesystem permission required
+Operation: delete
+Path:      /Users/me/project/build
+Command:   rm -rf build
+Sandbox:   workspace-write
 ```
+
+卡片上的字段读作:需要文件权限 / 操作 delete / 路径 /Users/me/project/build / 命令 rm -rf build / 沙箱 workspace-write。
 
 「总是允许」只写卡片上念出来的那几条最窄规则 —— 命令行里每个路径一条,只有路径本身是已存在的目录时才带 `/**`,绝不顺手把路径所在的文件夹打开;想主动打开文件夹就明确写 `/allow add delete . folder`。
 
@@ -138,12 +144,14 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 策略定不下来的权限请求,正常要等人点一下。打开 `autoReview.enabled` 后,它先交给本会话自己的模型:
 
 ```
-缺少的 (路径, 能力)
+missing (path, capability)
         ↓
-   自动复核  ── ALLOW → 与卡片「允许一次」完全相同的那条一次性授权 → 执行
-        ↓ ASK / 超时 / 报错 / 其它任何情况
-   卡片:拒绝 / 总是允许 / 允许一次
+   auto reviewer  ── ALLOW → the same one-shot grant the card writes → run
+        ↓ ASK / timeout / error / anything else
+   the card: deny / always allow / allow once
 ```
+
+这张图读作:缺少的 (路径, 能力) 先交给自动复核, `ALLOW` 就写入与卡片「允许一次」完全相同的那条一次性授权并执行;`ASK`、超时、报错或其它任何情况都落回卡片 —— 拒绝 / 总是允许 / 允许一次。
 
 复核不是安全边界,它只有两个答案:
 
@@ -173,13 +181,39 @@ Homebrew 的前缀**不是**默认可执行的:`/opt/homebrew` 可读,但 `/opt/
 
 ```yaml
     autoReview:
-      enabled: false        # 默认关闭;关着时一切照旧由卡片决定
-      timeoutMs: 10000      # 超时按 ASK 处理
-      # provider: inherit   # 默认继承会话最近一次 model/selection 路由
+      enabled: false        # off by default; the card stays in charge
+      timeoutMs: 10000      # a timeout is an ASK
+      # provider: inherit   # default: the session's latest model/selection route
       # model: inherit
 ```
 
+三个字段读作:`enabled` 默认关闭, 关着时一切照旧由卡片决定;`timeoutMs` 是按 `ASK` 处理的超时;`provider` / `model` 默认继承会话最近一次 model/selection 路由。
+
 每次复核都会写日志与审计:命令、请求的能力、判定、理由、耗时、模型路由 —— 不写文件内容、凭据、或隐藏推理。
+
+## 审批记录
+
+这一层做出的每一个判定都会写进审计日志,而这个日志就摆在判定发生的地方:「对话 / 轨迹」旁边多了一个**审批**标签页。
+
+```
+Conversation views:   Chat  │  Trajectory  │  Approvals
+```
+
+标签页从审计日志里读回**当前会话**的判定,新的在下,比日志晚三秒:
+
+| 来源 | 谁拍的板 |
+| --- | --- |
+| `rule` | 命中已存的规则或部署 grants —— 这一行会点名规则的路径和它授予的能力 |
+| `baseline` | 平台基线:工作区、临时目录、harness home、系统路径 |
+| `auto-review` | 可选的自动复核给了 `ALLOW`;这一行带判定、理由、耗时和模型路由 |
+| `human` | 用户拍的板:允许一次、总是允许(连带按钮写入的规则)、拒绝、已取消、无人应答 |
+| `policy` | 本插件自己拒绝的:平台保护路径,或 shell 语法解析不了的一行 |
+
+默认放行藏在**显示默认放行**后面:工作区里它们是绝大多数,说明的信息也最少。一行代表一次工具调用 —— 询问和解答它的那次人工决定会合并成那唯一一行,所以这张表回答的是「这次是谁拍的板」,而不是回放事件流水。
+
+标签页是只读的。它读 Web 宿主的 `GET /dsh-allow/audit?sessionId=…&limit=…&baseline=1`,宿主按固定块大小从审计日志**尾部**往回读 —— 繁忙的会话从最后一块就答完了,而在没有新写入的情况下再问一次一个字节都不会读。这条路由只走 loopback,不授予任何权限、不写规则、也不回答任何审批。
+
+这个版本之前写下的记录没有 `sessionId`,会话读不回来,所以这张表从这个版本之后的第一个判定开始。
 
 ## macOS 后端
 
@@ -215,13 +249,15 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
 ## `/allow`
 
 ```
-/allow                          列出已记住的规则
-/allow status                   默认权限、当前围栏层级,以及逐能力的强制情况
+/allow                           list the stored rules
+/allow status                    the defaults, the fence level, and per-capability flags
 /allow add delete,write build folder
 /allow add execute /opt/homebrew/bin/gh file
 /allow remove 2
 /allow clear
 ```
+
+前两条是查询:列出已记住的规则, 以及报告默认权限、当前围栏层级与逐能力的强制情况;后四条是改动:按最窄的规则添加、按编号删除、清空全部。
 
 `add` 的相对路径按会话 workspace 解析;`folder`(默认)覆盖整棵子树,`file` 只覆盖那一个路径。这里写的都是持久用户规则,与卡片上「总是允许」写入的形状一致。
 
@@ -230,31 +266,37 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
 ```yaml
 - id: dsh-allow
   config:
-    rulesFile: /path/to/rules.json          # 默认 $DSH_HOME/dsh-allow.json
-    auditFile: /path/to/audit.ndjson        # 默认 $DSH_HOME/dsh-allow-audit.ndjson
-    audit: true                             # false 关闭审计
-    sessionGrantTtlMs: 600000               # 「允许一次」的兜底有效期
+    rulesFile: /path/to/rules.json          # default $DSH_HOME/dsh-allow.json
+    auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
+    audit: true                             # false turns the audit log off
+    sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
     enforce: auto                           # auto | full | guarded | process | writes | off
-    autoReview:                             # 可选:让模型替你回答「允许一次」
-      enabled: false                        # 关着时卡片说了算
+    autoReview:                             # optional: let the model answer "allow once"
+      enabled: false                        # the card stays in charge when off
       timeoutMs: 10000
-    grants:                                 # 部署级授权,字段与持久规则一致
+    grants:                                 # deployment grants, same shape as a stored rule
       - path: /opt/homebrew
         recursive: true
         access: { read: true, execute: true }
 ```
+
+每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算。
 
 dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,并在第一次写入时留成 `<rulesFile>.v2.bak`:那些规则描述的是命令,不是文件能力,无法翻译。
 
 ## 测试
 
 ```sh
-npm test              # 单元 + 宿主接线 + 卡片渲染 + 真实沙箱
-npm run test:unit     # 策略、效果推导、强制层、复核、决策
-npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的宿主)
+npm test              # units, host wiring, card render, the audit ledger, and the real-sandbox suite
+npm run test:unit     # policy, effects, enforcement, reviewer, decisions, audit ledger
+npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start sandbox-exec)
 ```
 
+三条命令分别是:全部测试(单元 + 宿主接线 + 卡片渲染 + 审批记录 + 真实沙箱)、只跑单元、以及 macOS Seatbelt 集成(需要能启动 `sandbox-exec` 的宿主)。
+
 `test/reviewer.spec.mjs` 注入模型,覆盖「告诉复核什么」(只有真实用户消息、分析过的权限、固定的 prompt)、各种答案形态(`ALLOW`、`ASK`、带围栏的 JSON、自然语言、未知判定、空答案),以及所有失败路径(没有路由、没有 LLM 服务、provider 抛错、终止错误块、超时、答案不合法)。`test/smoke.mjs` 覆盖闸门接线:`ALLOW` 走既有的按调用一次性授权、规则文件一个字节不改;`ASK`、复核失败、以及复核关闭时,都由卡片接管。
+
+`test/audit.spec.mjs` 不依赖宿主,把审批记录端到端跑一遍:一次判定记成哪个来源、点名了哪些规则;不管卡片是从哪一半回答的,一次人工决定只产出一行;半行、别人的审批、认不出的 outcome 都不能产出记录;尾部读取的块边界、会话过滤与字节上限;以及审计路由的方法、loopback、条数与 baseline 规则。`test/client.smoke.mjs` 另外用 React 渲染这个标签页,断言一次调用一行,且字典之外没有任何文案。
 
 `test/sandbox.integration.mjs` 跑的是真内核,覆盖:权限库对任何写入者都拒绝;`rm` / `rmdir` / `rename` / `python -c 'os.remove'` / `node -e 'fs.rmSync'` 全部被拒而写和建正常;再授予 delete 后又能删;单独关闭 write 与 create;读围栏让 `cat` 和 `open().read()` 失败;execute 围栏拒绝未授权二进制;`python → sh` 与 `node → sh` 的孙进程继承全部限制;内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。覆盖的内容包括:
 
@@ -270,6 +312,9 @@ npm run test:sandbox  # macOS Seatbelt 集成(需要能启动 sandbox-exec 的�
 
 ## 限制
 
+- 「审批」标签页最多读审计日志最后 4 MiB、每次最多 500 条,打开期间每三秒重读一次:超长会话更早的判定会落在这个窗口之外。
+- 块边界正好落在一行审计记录中间时,那一行会被丢掉,而不是报出一条读不完整的判定。
+- 这个版本之前写下的记录没有 `sessionId`,所以永远不会出现在会话的审批记录里。
 - 被围住的区域仍然可以解析路径:`stat`、列目录会泄漏 metadata,被扣掉的只是文件内容。
 - 把配置和令牌放在同一个目录下的工具需要一条针对该目录的读授权:`gh`、`aws`、`docker` 之类在授予 `~/.config/<tool>` 之前会报自己的错。默认拒掉 `hosts.yml`、`credentials`、`id_ed25519` 正是目的,想打开是明确的动作。
 - 命令行看不出效果的部分由沙箱判定,而不是由解析器猜:程序表里没有的效果一律交给围栏。
