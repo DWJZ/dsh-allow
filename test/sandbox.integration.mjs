@@ -43,9 +43,13 @@ function sandboxUsable() {
 }
 
 if (!sandboxUsable()) {
-  console.log('  SKIP the macOS sandbox integration suite: sandbox-exec cannot apply a profile here.')
+  // An environment that must exercise the kernel sets this: a skipped kernel
+  // suite there is a missing signal, and reporting it as a pass would claim
+  // coverage the run does not have.
+  const required = process.env.DSH_ALLOW_REQUIRE_SEATBELT === '1'
+  console.log(`  ${required ? 'FAIL' : 'SKIP'} the macOS sandbox integration suite: sandbox-exec cannot apply a profile here.`)
   console.log('       (nested Seatbelt: run this test outside the DSH sandbox to exercise the kernel.)')
-  process.exit(0)
+  process.exit(required ? 1 : 0)
 }
 
 const root = mkdtempSync(join(tmpdir(), 'dsh-allow-sandbox-'))

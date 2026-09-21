@@ -309,6 +309,7 @@ npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start 
 - 内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。
 
 当 `sandbox-exec` 无法应用 profile 时(包括测试本身跑在另一层 Seatbelt 沙箱里),它会打印明显的 SKIP —— 要在真内核上验证,请从普通终端运行。
+CI 的 macOS 任务会设 `DSH_ALLOW_REQUIRE_SEATBELT=1`,把这个跳过变成失败:那边变绿意味着内核真的被跑过,而不是被跳过。
 
 ## 限制
 

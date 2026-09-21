@@ -1,10 +1,13 @@
-# Deterministic install from the committed lockfile, the whole suite with no
-# host and no network, and a production-dependency audit.
+# Two runners, because the plugin has two layers.
 #
-# Two suites need a real host and report their own skip instead of failing: the
-# macOS Seatbelt integration suite says so where sandbox-exec cannot apply a
-# profile, and the browser suite's render assertions need DSH_CHECKOUT pointing
-# at a checkout with React installed — its registration assertions always run.
+# The policy layer — parsing, effects, decisions, the audit ledger, the browser
+# half — is host-independent, so Linux covers it across the supported Node
+# majors. That is the fast signal for ordinary changes.
+#
+# The kernel layer can only be exercised where Seatbelt exists, so a macOS job
+# runs the same suite with the kernel suite required to run rather than skip.
+# That job is the only place the fence this plugin relies on is actually
+# measured.
 name: CI
 
 on:
@@ -14,14 +17,15 @@ on:
 
 jobs:
   test:
+    name: test (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -30,3 +34,22 @@ jobs:
       - name: Dependency audit (production dependencies)
         if: matrix.node == 22
         run: npm audit --omit=dev
+
+  seatbelt:
+    name: seatbelt (macOS, node 24)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # DSH_ALLOW_REQUIRE_SEATBELT turns the kernel suite's skip into a failure,
+      # so this job cannot pass by not testing the kernel. The whole suite runs
+      # here too, which also covers the macOS side of path canonicalization the
+      # unit suites fake with paths that do not exist.
+      - name: Full suite, kernel suite required
+        run: npm test
+        env:
+          DSH_ALLOW_REQUIRE_SEATBELT: '1'

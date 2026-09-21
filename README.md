@@ -293,6 +293,7 @@ npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start 
 - a malformed profile running nothing, and writes outside the workspace refused unless granted.
 
 It skips with a notice when `sandbox-exec` cannot apply a profile — including when the test itself runs inside another Seatbelt sandbox — so run it from a plain terminal.
+CI sets `DSH_ALLOW_REQUIRE_SEATBELT=1` on its macOS job, which turns that skip into a failure: a green run there means the kernel was exercised, not skipped.
 
 ## Limits
 
