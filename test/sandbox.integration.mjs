@@ -349,8 +349,7 @@ check('the backend states its own limits', macos.backendLimitations().some(line 
 console.log('L: the toolchain this host selected')
 if (developerCovered) {
   console.log(`  note ${DEVELOPER ?? 'this host'} is already inside the baseline, so the limitation below cannot apply here`)
-}
-else {
+} else {
   // The documented limitation, pinned: the system shims exec into a developer
   // directory the baseline does not reach, and the kernel refuses them until a
   // rule opens it. A baseline change that silently widens this fails here.
@@ -359,7 +358,7 @@ else {
   check('L1: the shipped baseline refuses a shim into an Xcode developer directory', result.status !== 0, why())
   result = under(shipped, ['/usr/bin/python3', '-c', 'print("ok")'])
   check('L2: and refuses python the same way', result.status !== 0, why())
-  result = under(baseline([]), ['/usr/bin/git', '--version'])
+  result = under(guarded, ['/usr/bin/git', '--version'])
   check('L3: granting that directory, the way /allow does, lets it run', result.status === 0, why())
 }
 
