@@ -117,12 +117,17 @@ export function compileProfile({ mode, workspaceRoot, rules, protectedFiles = []
  * Whether a profile can be applied and still start a shell that reads the
  * workspace. Probes run from this (unsandboxed) process, so they answer for
  * the kernel rather than for the caller's own confinement.
+ *
+ * The runner's presence is read through the injected `exists` rather than the
+ * host, so a test on a platform without Seatbelt can still drive every probe
+ * outcome.
  * @param profile - the compiled profile to try.
- * @param options - the workspace root and the process spawner.
+ * @param options - the workspace root, the process spawner, and the runner's
+ *   presence check.
  * @returns true when the profile applies and the probe command succeeds under it.
  */
-export function probeProfile(profile, { workspaceRoot, spawn = spawnSync }) {
-  if (!existsSync(SANDBOX_EXEC)) return false
+export function probeProfile(profile, { workspaceRoot, spawn = spawnSync, exists = existsSync }) {
+  if (!exists(SANDBOX_EXEC)) return false
   const probes = [
     ['/bin/sh', '-c', 'exit 0'],
     ['/usr/bin/env'],
@@ -146,11 +151,14 @@ export function probeProfile(profile, { workspaceRoot, spawn = spawnSync }) {
  * Build the enforcer for one deployment.
  *
  * @param options - configuration, the session-grant store, the logger, the
- *   platform and spawner (injectable for tests), and the pass-through reader
- *   that supplies the caller's own `next()`-style spawn for probes.
+ *   platform, spawner and runner-presence check (injectable for tests), and the
+ *   pass-through reader that supplies the caller's own `next()`-style spawn for
+ *   probes.
  * @returns install/uninstall, the per-policy profile, and the reported status.
  */
-export function createEnforcer({ config, grants, logger, platform = process.platform, spawn = spawnSync }) {
+export function createEnforcer({
+  config, grants, logger, platform = process.platform, spawn = spawnSync, exists = existsSync,
+}) {
   const verdicts = new Map()
   let installed = false
   let original = null
@@ -164,7 +172,7 @@ export function createEnforcer({ config, grants, logger, platform = process.plat
   const fenceFor = (policy, rules) => {
     if (config.enforce === 'off') return { capabilities: 'off', reason: 'disabled by configuration' }
     if (platform !== 'darwin') return { capabilities: 'off', reason: `no Seatbelt backend on ${platform}` }
-    if (!existsSync(SANDBOX_EXEC)) return { capabilities: 'off', reason: `${SANDBOX_EXEC} is not installed` }
+    if (!exists(SANDBOX_EXEC)) return { capabilities: 'off', reason: `${SANDBOX_EXEC} is not installed` }
     // `enforce: all` is the one setting that does not accept a weaker fence: it
     // is how a deployment says "the read fence or nothing".
     const requested = config.enforce === 'auto'
@@ -182,7 +190,7 @@ export function createEnforcer({ config, grants, logger, platform = process.plat
         protectedFiles: config.protectedFiles,
         capabilities,
       })
-      if (probeProfile(profile, { workspaceRoot: policy.workspaceRoot, spawn })) {
+      if (probeProfile(profile, { workspaceRoot: policy.workspaceRoot, spawn, exists })) {
         const fence = CAPABILITY_SETS[capabilities]
         verdict = {
           capabilities,

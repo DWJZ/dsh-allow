@@ -97,14 +97,18 @@ check('every write operation is named, not a wildcard',
 
 console.log('probing')
 const okSpawn = () => ({ status: 0 })
+/** This suite drives the runner through injected seams, so it runs anywhere. */
+const runnerPresent = { exists: () => true }
 /** A kernel that can fence writes but refuses a profile that fences reads. */
 const readRefusing = (_program, args) => ({ status: String(args?.[1] ?? '').includes('(deny file-read-data) (allow file-read-metadata)') ? 1 : 0 })
 check('an applying profile passes the probe',
-  enforce.probeProfile(profile, { workspaceRoot: WORKSPACE, spawn: okSpawn }) === true)
+  enforce.probeProfile(profile, { workspaceRoot: WORKSPACE, spawn: okSpawn, ...runnerPresent }) === true)
 check('a refusing profile fails the probe',
-  enforce.probeProfile(profile, { workspaceRoot: WORKSPACE, spawn: () => ({ status: 1 }) }) === false)
+  enforce.probeProfile(profile, { workspaceRoot: WORKSPACE, spawn: () => ({ status: 1 }), ...runnerPresent }) === false)
+check('a host without the runner cannot probe',
+  enforce.probeProfile(profile, { workspaceRoot: WORKSPACE, spawn: okSpawn, exists: () => false }) === false)
 check('a spawner that throws fails closed',
-  enforce.probeProfile(profile, { workspaceRoot: WORKSPACE, spawn: () => { throw new Error('nope') } }) === false)
+  enforce.probeProfile(profile, { workspaceRoot: WORKSPACE, spawn: () => { throw new Error('nope') }, ...runnerPresent }) === false)
 
 console.log('installing on the registered provider')
 /** A stand-in for the harness's sandbox provider. */
@@ -120,7 +124,7 @@ function fakeProvider() {
 const provider = fakeProvider()
 const grants = store.createGrantStore()
 const ctx = { get: name => (name === 'sandbox' ? provider : undefined) }
-const enforcer = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: okSpawn })
+const enforcer = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: okSpawn, ...runnerPresent })
 check('install wraps the provider', enforcer.install(ctx) === true)
 const policy = { mode: 'workspace-write', workspaceRoot: WORKSPACE }
 const confined = provider.confine(['bash', '-c', 'rm -rf build'], policy)
@@ -156,21 +160,21 @@ const other = fakeProvider()
 enforcer.uninstall()
 check('uninstall restores the provider method',
   provider.confine(['x'], policy).argv[0] === 'original', JSON.stringify(provider.confine(['x'], policy).argv))
-const nonDarwin = enforce.createEnforcer({ config, grants, logger, platform: 'linux', spawn: okSpawn })
+const nonDarwin = enforce.createEnforcer({ config, grants, logger, platform: 'linux', spawn: okSpawn, ...runnerPresent })
 nonDarwin.install({ get: () => other })
 check('a non-darwin host delegates to the original',
   other.confine(['bash', '-c', 'ls'], policy).argv[0] === 'original')
 check('and reports that nothing is enforced', nonDarwin.status().state === 'off', JSON.stringify(nonDarwin.status()))
 
 const offProvider = fakeProvider()
-const offEnforcer = enforce.createEnforcer({ config: { ...config, enforce: 'off' }, grants, logger, platform: 'darwin', spawn: okSpawn })
+const offEnforcer = enforce.createEnforcer({ config: { ...config, enforce: 'off' }, grants, logger, platform: 'darwin', spawn: okSpawn, ...runnerPresent })
 offEnforcer.install({ get: () => offProvider })
 check('enforce: off delegates too', offProvider.confine(['bash', '-c', 'ls'], policy).argv[0] === 'original')
 check('and says why', offEnforcer.status().reason.includes('disabled'), offEnforcer.status().reason)
 
 console.log('a kernel that refuses the full read fence')
 const partialProvider = fakeProvider()
-const partial = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: readRefusing })
+const partial = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: readRefusing, ...runnerPresent })
 partial.install({ get: () => partialProvider })
 const partialConfined = partialProvider.confine(['bash', '-c', 'echo hi'], policy)
 check('the call still runs under a profile', partialConfined.argv[0] === '/usr/bin/sandbox-exec')
@@ -187,10 +191,20 @@ check('and user-data reads still fenced while execute is fenced too',
 check('enforcement is partial for the shell tool', partialConfined.enforcement === 'partial')
 
 console.log('a provider that cannot be refined')
-const bare = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: okSpawn })
+const bare = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: okSpawn, ...runnerPresent })
 check('a provider without confine is reported, not patched',
   bare.install({ get: () => ({}) }) === false && bare.status().state === 'off')
 check('and no provider at all fails closed', bare.install({ get: () => undefined }) === false)
+
+console.log('a host without the Seatbelt runner')
+const unbacked = fakeProvider()
+const noRunner = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: okSpawn, exists: () => false })
+check('the enforcer still installs', noRunner.install({ get: () => unbacked }) === true)
+check('but delegates every confinement to the provider',
+  unbacked.confine(['bash', '-c', 'ls'], policy).argv[0] === 'original')
+check('and reports why nothing is enforced',
+  noRunner.status().state === 'off' && noRunner.status().reason.includes('is not installed'),
+  JSON.stringify(noRunner.status()))
 
 rmSync(root, { recursive: true, force: true })
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)
