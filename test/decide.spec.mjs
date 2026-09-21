@@ -88,12 +88,14 @@ check('reading outside the workspace asks', decision.decision === 'prompt', JSON
 decision = decide('cat /opt/homebrew/bin/gh')
 check('reading a homebrew path is allowed', decision.decision === 'allow', JSON.stringify(decision.reason))
 
-decision = decide('gh pr list')
+// Spelled by path, so the answer comes from the policy rather than from whether
+// this machine happens to have Homebrew installed.
+decision = decide('/opt/homebrew/bin/gh pr list')
 check('running a homebrew binary asks for execute', decision.decision === 'prompt'
   && decision.missing.some(entry => entry.operation === 'execute'), JSON.stringify(decision.missing))
 
 const brew = fspolicy.canonicalPath('/opt/homebrew/bin/gh', { cwd: '/', home: HOME })
-decision = decide('gh pr list', { rules: [rule(brew, { execute: true }, false)] })
+decision = decide('/opt/homebrew/bin/gh pr list', { rules: [rule(brew, { execute: true }, false)] })
 check('and a grant for the resolved binary allows it', decision.decision === 'allow', JSON.stringify(decision.reason))
 
 console.log('platform refusals')
