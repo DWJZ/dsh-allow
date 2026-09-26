@@ -100,6 +100,13 @@ check('an over-long display string is ellipsised', client.shorten('x'.repeat(80)
 check('a short string is untouched', client.shorten('short', 20) === 'short')
 check('a policy ask is the one a rule can be stored for', client.isPolicyAsk(policyPrompt) === true)
 check('a sandbox escalation is not', client.isPolicyAsk(pending) === false)
+const toolAsk = { ...pending, toolName: 'plugin_manager' }
+check('a management tool\'s escalation is a tool operation a rule can be stored for',
+  client.isToolAsk(toolAsk) === true)
+check('a shell escalation is not', client.isToolAsk(pending) === false)
+check('another tool\'s escalation is not', client.isToolAsk({ ...pending, toolName: 'write' }) === false)
+check('and a policy prompt is not', client.isToolAsk(policyPrompt) === false)
+check('an absent interaction is not', client.isToolAsk(undefined) === false)
 
 console.log('apply')
 const registrations = []
@@ -246,6 +253,14 @@ if (found === null) {
   check('an escalation offers no always-allow button: a wider fence is not a stored rule',
     !html.includes('alwaysAllow'), html)
 
+  const toolHtml = found.server.renderToStaticMarkup(react.createElement(card.component, { matched: toolAsk, t }))
+  check('a management tool\'s escalation offers exactly one always-allow button',
+    toolHtml.split('alwaysAllow').length - 1 === 1, toolHtml)
+  check('beside 拒绝 and 允许一次',
+    toolHtml.includes('reject') && toolHtml.includes('allowOnce'), toolHtml)
+  check('and shows the reason the host sent',
+    toolHtml.includes('escalate sandbox to danger-full-access'), toolHtml)
+
   const policyAsk = { ...pending, reason: 'dsh-allow: delete is not granted in the workspace' }
   const policyHtml = found.server.renderToStaticMarkup(react.createElement(card.component, { matched: policyAsk, t }))
   check('a policy ask offers exactly one always-allow button',
@@ -293,6 +308,21 @@ if (found === null) {
   }))
   check('a rule allow names the rule path that answered',
     ruleHtml.includes('logPaths') && ruleHtml.includes('/w'), ruleHtml)
+  const toolRuleHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
+    node: {
+      kind: 'allow-decision',
+      data: {
+        origin: 'rule', action: 'allow-once', command: null,
+        subject: 'plugin_manager list_plugins',
+        reason: 'the stored tool rule answers this operation, so this call does not need the user',
+        matchedRules: [{ id: 't1', tool: 'plugin_manager', action: 'list_plugins', source: 'user', label: 'plugin_manager list_plugins' }],
+        missing: [],
+      },
+    },
+    t,
+  }))
+  check('a tool-rule allow names the tool rule that answered',
+    toolRuleHtml.includes('logToolRules') && toolRuleHtml.includes('plugin_manager list_plugins'), toolRuleHtml)
   const storedHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
     node: {
       kind: 'allow-decision',
@@ -305,6 +335,32 @@ if (found === null) {
   }))
   check('an always-allow names the rules the button stored',
     storedHtml.includes('logStoredRules') && storedHtml.includes('/w/build'), storedHtml)
+  const storedToolHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
+    node: {
+      kind: 'allow-decision',
+      data: {
+        origin: 'human', action: 'always-allow', command: null,
+        rules: [{ id: 't1', tool: 'plugin_manager', action: 'set_plugin', target: 'dsh-balance', label: 'plugin_manager set_plugin dsh-balance' }],
+        missing: [],
+      },
+    },
+    t,
+  }))
+  check('and an always-allow for a tool operation names the tool rule instead of a path',
+    storedToolHtml.includes('logToolRules') && storedToolHtml.includes('plugin_manager set_plugin dsh-balance')
+    && !storedToolHtml.includes('logStoredRules'), storedToolHtml)
+  const fallbackHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
+    node: {
+      kind: 'allow-decision',
+      data: {
+        origin: 'rule', action: null, command: 'ls',
+        matchedRules: [{ tool: 'plugin_manager', action: 'list_bundles' }], missing: [],
+      },
+    },
+    t,
+  }))
+  check('a tool rule without a label still renders as tool + action',
+    fallbackHtml.includes('logToolRules') && fallbackHtml.includes('plugin_manager list_bundles'), fallbackHtml)
   const reviewHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
     node: {
       kind: 'allow-decision',

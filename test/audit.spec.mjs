@@ -317,6 +317,75 @@ console.log('reading the log from its end')
   check('a file of blank lines answers nothing', store.readAuditTail(partial, { sessionId: 's4' }).entries.length === 0)
 }
 
+console.log('a tool operation the rules answer')
+{
+  const file = join(root, 'tool.ndjson')
+  const where = { ...config, rulesFile: join(root, 'tool-rules.json'), auditFile: file }
+  const pendings = store.createPendingStore()
+  const decisions = store.createDecisionLog()
+  const grants = store.createGrantStore()
+  const engine = host.createEngine({ config: where, home: HOME, grants, pendings, ctx })
+  const approval = host.createApprovalListener({ engine, pendings, grants, logger, config: where, decisions })
+  const rememberCall = host.createRememberCall({ pendings, config: where, logger, decisions })
+  const toolCall = (args, callId, session = sessionOf('s1')) => ({
+    agent: {
+      session: {
+        ...session,
+        seq: 1,
+        eventAt: () => ({ type: 'tool/call', data: { callId, name: 'plugin_manager', arguments: JSON.stringify(args) } }),
+      },
+    },
+    toolName: 'plugin_manager',
+    callId,
+  })
+
+  store.addToolRule(where.rulesFile, { tool: 'plugin_manager', action: 'list_plugins' })
+  let cardAsked = 0
+  const answered = await approval(toolCall({ action: 'list_plugins' }, 'a1'), () => {
+    cardAsked += 1
+    return Promise.resolve('allowed-once')
+  })
+  check('a stored tool rule answers the call without reaching the card',
+    answered === 'allowed-once' && cardAsked === 0, `asked=${String(cardAsked)}`)
+  const ruleRecord = recordsOf(file, 'a1')[0]
+  check('the ledger keeps the rule as its origin, with the operation it allowed',
+    ruleRecord?.origin === 'rule' && ruleRecord?.decision === 'allow'
+    && ruleRecord?.subject === 'plugin_manager list_plugins', JSON.stringify(ruleRecord))
+  check('and names the rule itself, with no path it could have granted',
+    ruleRecord?.matchedRules?.[0]?.label === 'plugin_manager list_plugins'
+    && ruleRecord?.matchedRules?.[0]?.path === undefined, JSON.stringify(ruleRecord?.matchedRules))
+  check('a rule-answered tool call is never recorded as a human answer',
+    humanRecordOf(file, 'a1') === undefined, JSON.stringify(recordsOf(file, 'a1')))
+
+  await approval(toolCall({ action: 'set_plugin', target: 'other-plugin', enabled: true }, 'a2'), () => Promise.resolve('allowed-once'))
+  const onceRecord = humanRecordOf(file, 'a2')
+  check('a card-answered tool call is recorded as the human decision it was',
+    onceRecord?.action === 'allow-once' && onceRecord?.tool === 'plugin_manager', JSON.stringify(recordsOf(file, 'a2')))
+  check('and the tool call mints no filesystem capability',
+    grants.rulesFor('s1', 'a2').length === 0 && grants.holder('s1', 'a9') === null)
+
+  let remembered = null
+  await approval(toolCall({ action: 'install_bundle', target: 'pkg@1.0.0' }, 'a3'), () => {
+    remembered = rememberCall('s1', 'a3')
+    return Promise.resolve('allowed-once')
+  })
+  check('the card\'s always-allow stores the tool rule it named',
+    remembered?.ok === true && store.readToolRules(where.rulesFile).some(rule => rule.target === 'pkg@1.0.0'),
+    JSON.stringify(remembered))
+  const alwaysRecord = humanRecordOf(file, 'a3')
+  check('and records one always-allow naming that rule',
+    alwaysRecord?.action === 'always-allow'
+    && alwaysRecord?.rules?.[0]?.label === 'plugin_manager install_bundle pkg@1.0.0', JSON.stringify(recordsOf(file, 'a3')))
+
+  // A call the plugin refuses to answer at all still reaches the card, and the
+  // record says so instead of inventing a rule.
+  const blocked = await approval(toolCall({ action: 'set_version_exemption', target: 'pkg@1.0.0', acceptRisk: true }, 'a4'), () => Promise.resolve('allowed-once'))
+  check('a blocked tool call reaches the card and records the human answer',
+    blocked === 'allowed-once' && humanRecordOf(file, 'a4')?.action === 'allow-once'
+    && !store.readToolRules(where.rulesFile).some(rule => rule.action === 'set_version_exemption'),
+    JSON.stringify(recordsOf(file, 'a4')))
+}
+
 console.log('the /allow log view')
 {
   const file = join(root, 'route.ndjson')

@@ -3,23 +3,26 @@
 # After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write plugins/dsh-allow/README.md
 /:
-  en: 277336ac933965c9
-  zh: 183bcf01b97d53f0
+  en: f5f4860115ce8f6a
+  zh: 5dd362261f4b5528
 /dsh-allow:
   en: 83483f39b57d39f8
   zh: 9a016549bf8cb1cc
 /dsh-allow/where-it-hooks-in:
-  en: f360d3913ba72d02
-  zh: 1144a7881e375085
+  en: 519f49b097ddd940
+  zh: b259f7719fc80189
 /dsh-allow/capabilities-and-rules:
   en: 09e7336d85def424
   zh: 85d5fe2fcc1e6907
+/dsh-allow/tool-operation-rules:
+  en: 277b8b4a0475ebb0
+  zh: b64ebc5a88207b79
 /dsh-allow/the-permission-store-is-not-the-agent-s-to-change:
   en: 950e6826fe791105
   zh: debc36b4a85c0d8b
 /dsh-allow/precedence:
-  en: 768c465ad7bf95d0
-  zh: 2465ac650c5c4a3d
+  en: 938efeae830a01b9
+  zh: 4e062959efaeeb18
 /dsh-allow/defaults-and-the-platform-baseline:
   en: efdadd6bcbf5c57a
   zh: ed35e83766a3ee5d
@@ -33,8 +36,8 @@
   en: d77d97f3a7627fc3
   zh: 6a761b9094769d9c
 /dsh-allow/the-card:
-  en: 00b3aaad60bd1438
-  zh: 746ae0700d37cc7c
+  en: f90e460e02c6f9db
+  zh: 1f26199f725fad6b
 /dsh-allow/auto-review-optional:
   en: 9bc06a57bba58ab5
   zh: a3268b0bdb03c929
@@ -45,17 +48,17 @@
   en: 7ecfed39169c12cf
   zh: f589cefe4fbbeecb
 /dsh-allow/allow:
-  en: 614ec6d840586f4e
-  zh: 85c4b007556cdc61
+  en: 3050b19ec10c9c87
+  zh: a52da03b6a5c5611
 /dsh-allow/configuration:
   en: 1a4bacf426ad9548
-  zh: 2618f59f400e5f57
+  zh: ff9dd2c9cde2068a
 /dsh-allow/test:
-  en: 1d295d1b3c8168eb
-  zh: e567453b981f1c3c
+  en: 7108cb028743b6eb
+  zh: 2361180a6ab48aa2
 /dsh-allow/limits:
-  en: 8cf6fd7d98bcba69
-  zh: a74505bb85f39124
+  en: 77e77876699248ee
+  zh: bf8ac9bb056b0cd9
 /dsh-allow/license:
   en: aad9b93c8b488fac
   zh: 0a553bf347728a12

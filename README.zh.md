@@ -1,5 +1,5 @@
 ---
-description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / create / delete / execute 文件权限,并在进程沙箱里真正强制;卡片上给「拒绝 / 允许一次 / 总是允许」,每条判定另在对话里留一行,写明是规则、默认、自动复核、人工还是插件自己拒绝了它。"
+description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / create / delete / execute 文件权限,并对「要更宽进程围栏」的管理类调用判定工具操作规则,在进程沙箱里真正强制;卡片上给「拒绝 / 允许一次 / 总是允许」,每条判定另在对话里留一行,写明是规则、默认、自动复核、人工还是插件自己拒绝了它。"
 ---
 
 # dsh-allow
@@ -43,6 +43,8 @@ the process tree (children, grandchildren, inline code)
 
 `tools/pre-execute` 是文档化的策略接缝,也是 shell 命令唯一的路径。插件**不替换** sandbox provider:它包住已注册 provider 的 `confine`,把由当前有效策略编译出的 profile 交给它,自己处理不了的平台原样委托回去。`tools/post-execute` 负责把「允许一次」用掉,另有一道针对写文件工具的小闸门拦下权限库。
 
+管理类工具走不到这道闸门:它的调用不授予任何文件能力,而是在审批 waterfall 上要一个更宽的进程围栏,所以在那里判定,依据的是它自己那一类「工具操作规则」。
+
 ## 能力与规则
 
 模型里有五种文件能力,一条规则只为某个路径授予其中若干种:
@@ -72,6 +74,42 @@ the process tree (children, grandchildren, inline code)
 
 `recursive: true` 覆盖整棵子树;`recursive: false` 只覆盖这一个路径 —— 卡片上的「总是允许」对单个文件、单个二进制写的就是后者。
 
+## 工具操作规则
+
+第二类规则回答的是「要更宽的进程围栏、而不是要某个路径」的那些调用。`plugin_manager` 就是这样的工具:它的每个动作都提权到 `danger-full-access`,因为一次 profile 变更会安装并运行 workspace 围栏之外的 Host 代码 —— 文件策略对它无可置评;而没有规则可问时,连看一眼插件列表都会每次都弹卡片。
+
+工具规则写的是「某个工具的一个操作」,从来不是命令行:
+
+```json
+{
+  "version": 3,
+  "rules": [
+    { "id": "f1", "path": "/Users/me/project/build", "recursive": true,
+      "access": { "delete": true }, "hits": 2, "createdAt": "2026-01-01T00:00:00.000Z" }
+  ],
+  "tools": [
+    { "id": "t1", "tool": "plugin_manager", "action": "list_plugins",
+      "hits": 4, "createdAt": "2026-01-01T00:00:00.000Z" },
+    { "id": "t2", "tool": "plugin_manager", "action": "set_plugin", "target": "dsh-balance",
+      "hits": 1, "createdAt": "2026-01-01T00:00:00.000Z" }
+  ]
+}
+```
+
+`tools` 与路径规则在同一个文件里,所以它继承同一道保护 —— shell 命令、文件工具、任何规则都改不了它;只读 `rules` 的旧版本会忽略这一段,而不是拒绝整个文件。
+
+| 动作 | 规则能写什么 |
+| --- | --- |
+| `list_plugins`、`list_bundles`、`list_version_exemptions` | 只写动作本身,因为它只读、什么都不改 |
+| `set_plugin`、`set_bundle`、`install_bundle`、`remove_bundle` | 动作加上确切目标,所以放行一个插件绝不等于放行下一个 |
+| `set_version_exemption` | 什么都不写:工具自己的契约要求用户对那个确切的 plugin@version 每次明确同意 |
+
+还有两种调用无论规则怎么读都不会被规则放行:带 `acceptRisk: true` 的(那是用户自己承担的风险),带 `approvedBuilds` 的(那是在授予安装脚本权限)。两者决定的都是直接问用户的问题。
+
+这套词表没有写到的动作,是任何规则都不能回答的调用,所以本插件不判定的工具、以及参数读不出来的调用,都照常走卡片。
+
+工具规则在任何 `escalation` 策略下都会生效,因为「某个工具的一次操作」这条规则本身就是用户对它的授权;而 shell 命令上的 `sandbox_permissions` 提权是另一回事,仍然需要 `escalation: rule`。
+
 ## 权限库不是 agent 能改的
 
 规则文件与审计日志属于**硬保护路径**:`write`/`create`/`delete` 对任何人(包括用户规则)都拒绝,编译出的 profile 还会在所有授权之后再次拒绝。覆盖 `$DSH_HOME/dsh-allow.json` 与 `$DSH_HOME/dsh-allow-audit.ndjson`,配置指到哪就保护到哪。
@@ -92,6 +130,8 @@ clone 进 workspace 的仓库也无法给自己扩权:dsh-allow **不会**读取
 4. **全局默认** —— 未授予。
 
 路径按规范化后的绝对路径逐段比较:`~`、相对路径、`.`、`..`、以及符号链接祖先都会先解析,所以 `/tmp/x` 与 `/private/tmp/x` 是同一条路径,也无法用 `../` 绕过规则。每次判定会同时拿「写法路径」和「真实路径」去匹配,因此 `/opt/homebrew/bin/gh` 的授权和它指向的 Cellar 二进制的授权各自有效,又都不会打开 `/opt/homebrew` 其余部分。workspace 根自身也只是普通路径;一条规则绝不会覆盖只是前缀相同的兄弟目录(`/w/build` 不覆盖 `/w/build-2`)。
+
+工具操作规则不在这套优先级里:它回答的调用根本不授予任何文件能力,所以路径规则回答不了那类调用,工具规则也回答不了 shell 命令。
 
 ## 默认权限与平台基线
 
@@ -133,7 +173,7 @@ Sandbox:   workspace-write
 
 卡片上的字段读作:需要文件权限 / 操作 delete / 路径 /Users/me/project/build / 命令 rm -rf build / 沙箱 workspace-write。
 
-「总是允许」只写卡片上念出来的那几条最窄规则 —— 命令行里每个路径一条,只有路径本身是已存在的目录时才带 `/**`,绝不顺手把路径所在的文件夹打开;想主动打开文件夹就明确写 `/allow add delete . folder`。
+「总是允许」只写卡片上念出来的那几条最窄规则 —— 命令行里每个路径一条,只有路径本身是已存在的目录时才带 `/**`,绝不顺手把路径所在的文件夹打开;想主动打开文件夹就明确写 `/allow add delete . folder`。管理工具的询问没有路径,所以同一个按钮写的是那次调用指名的工具规则:只读动作写动作本身,其余动作写动作加确切目标。
 
 「允许一次」是真的只允许一次,而且有两道机制防止它横向泄漏:授权绑定到你批准的那一次调用,判定层只在那次调用看得见它;profile 构建时则靠「那次调用正在跑的命令行」再认一次 —— 因为一次 confinement 只知道会话、不知道调用。此外,只要有一条一次性授权还活着,同会话的其它调用都会先等它结算再被判定,所以两次重叠的调用不可能共用一条授权。调用结束时 `tools/post-execute` 立刻丢掉它(十分钟过期只是兜底);它绝不写规则文件,下一次调用仍然会问。
 
@@ -254,11 +294,17 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
 /allow add execute /opt/homebrew/bin/gh file
 /allow remove 2
 /allow clear
+
+/allow tool                      list the stored tool-operation rules
+/allow tool add plugin_manager list_plugins
+/allow tool add plugin_manager set_plugin dsh-balance
+/allow tool remove 1
+/allow tool clear
 ```
 
 前两条是查询:列出已记住的规则, 以及报告默认权限、当前围栏层级与逐能力的强制情况;后四条是改动:按最窄的规则添加、按编号删除、清空全部。
 
-`add` 的相对路径按会话 workspace 解析;`folder`(默认)覆盖整棵子树,`file` 只覆盖那一个路径。这里写的都是持久用户规则,与卡片上「总是允许」写入的形状一致。
+`add` 的相对路径按会话 workspace 解析;`folder`(默认)覆盖整棵子树,`file` 只覆盖那一个路径。这里写的都是持久用户规则,与卡片上「总是允许」写入的形状一致。`clear` 只清文件规则、不动工具规则;`/allow tool clear` 正好相反。`tool add` 会拒绝词表不允许的规则 —— 未知的工具或动作、没写确切目标的可变动作,以及那条必须每次由用户重新同意的动作。
 
 ## 配置
 
@@ -279,9 +325,12 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
       - path: /opt/homebrew
         recursive: true
         access: { read: true, execute: true }
+    toolGrants:                             # deployment grants, same shape as a stored tool rule
+      - tool: plugin_manager
+        action: list_plugins
 ```
 
-每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`appendSessionEvents` 默认关闭,打开后每个判定除审计文件外还写一条带 `ignorable` 标记的会话事件(需要能识别该标记的 harness),界面据此在对话与轨迹里显示这些行;`escalation` 取 ask 或 rule —— 取 rule 时,若规则已经放行这条命令,它请求的沙箱升级也直接沿用该规则,不再弹卡片;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算。
+每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`appendSessionEvents` 默认关闭,打开后每个判定除审计文件外还写一条带 `ignorable` 标记的会话事件(需要能识别该标记的 harness),界面据此在对话与轨迹里显示这些行;`escalation` 取 ask 或 rule —— 取 rule 时,若规则已经放行这条命令,它请求的沙箱升级也直接沿用该规则,不再弹卡片;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算;`grants` 与 `toolGrants` 是部署级授权,形状分别与持久规则、持久工具规则一致。
 
 dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,并在第一次写入时留成 `<rulesFile>.v2.bak`:那些规则描述的是命令,不是文件能力,无法翻译。
 
@@ -298,6 +347,8 @@ npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start 
 `test/reviewer.spec.mjs` 注入模型,覆盖「告诉复核什么」(只有真实用户消息、分析过的权限、固定的 prompt)、各种答案形态(`ALLOW`、`ASK`、带围栏的 JSON、自然语言、未知判定、空答案),以及所有失败路径(没有路由、没有 LLM 服务、provider 抛错、终止错误块、超时、答案不合法)。`test/smoke.mjs` 覆盖闸门接线:`ALLOW` 走既有的按调用一次性授权、规则文件一个字节不改;`ASK`、复核失败、以及复核关闭时,都由卡片接管。
 
 `test/audit.spec.mjs` 不依赖宿主,把审批记录端到端跑一遍:一次判定记成哪个来源、点名了哪些规则;不管卡片是从哪一半回答的,一次人工决定只产出一行;半行、别人的审批、认不出的 outcome 都不能产出记录;以及 `/allow log` 的渲染。`test/smoke.mjs` 断言每条判定同时以可忽略事件落进会话日志。`test/client.smoke.mjs` 另外用 React 渲染那一行,断言来源徽章、命令和缺失的能力。
+
+`test/toolrules.spec.mjs` 单独覆盖工具操作的词表:规则能写哪些动作、每个动作需要什么、一次调用读出来是什么、哪次调用永远不由规则回答(`acceptRisk`、`approvedBuilds`、那条豁免动作、读不出动作的调用),以及手改过的规则不会把自己放宽。`test/smoke.mjs` 把同样的问题走一遍审批 waterfall:没有规则时出现的卡片、下一条相同调用被规则直接放行、没被覆盖的另一个目标,以及两种回答在台账里各自记下的那一行。
 
 `test/sandbox.integration.mjs` 跑的是真内核,覆盖:权限库对任何写入者都拒绝;`rm` / `rmdir` / `rename` / `python -c 'os.remove'` / `node -e 'fs.rmSync'` 全部被拒而写和建正常;再授予 delete 后又能删;单独关闭 write 与 create;读围栏让 `cat` 和 `open().read()` 失败;execute 围栏拒绝未授权二进制;`python → sh` 与 `node → sh` 的孙进程继承全部限制;内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。覆盖的内容包括:
 
@@ -326,6 +377,10 @@ CI 的 macOS 任务会设 `DSH_ALLOW_REQUIRE_SEATBELT=1`,把这个跳过变成�
 - 两个较弱的 Seatbelt 结论:不可读的路径仍然可被解析(metadata 始终放行);通配拒绝必须逐操作写出来。
 - 改名需要源的 `delete` 加目标的 `create`。
 - 读效果只为固定的一张程序表推导;真正的边界是围栏,不是这张表。
+- 工具规则比对的是会话日志里那次调用的参数:所以本插件不判定的工具、词表里没有的动作、以及参数读不出来的调用,无论规则库怎么读都会走到卡片。
+- `install_bundle` 规则认的是调用里那个确切的 spec:为 `pkg@1.0.0` 写的规则不覆盖 `pkg@1.1.0`。
+- 工具规则放行的是「这一次操作」,不是它跑起来的文件效果:插件管理器启动的进程,和会话里其它调用一样受进程围栏约束。
+- 卡片会对每一次管理工具的询问都给出「总是允许」,因为浏览器那一半读不到调用的参数。宿主拒绝记住的调用 —— 那条豁免动作、带风险确认的、带安装脚本授权的 —— 会用原因回应这次点击,而不是写入规则。
 - 「允许一次」是按会话串行、而不是按调用并行的:授权存活期间,同会话的其它调用会等被批准的那次结算。若核心把 callId 传进 sandbox policy,这个等待就能去掉 —— 目前核心不传。
 - profile runner 固定为 `/usr/bin/sandbox-exec`;Seatbelt 不在这个位置的宿主会退回到 harness 自己的 profile 并报告 `off`。
 - 自动复核是便利,不是边界:一个错误或被诱导的模型可能放行用户本会拒绝的请求。限制它的是「它能放行什么」—— 一次调用、只针对该请求的最窄规则 —— 以及底下仍有内核在强制策略。

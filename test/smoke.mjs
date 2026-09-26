@@ -98,6 +98,45 @@ check('its file is kept as a backup', existsSync(`${rulesFile}.v2.bak`), `${rule
 check('and the new rules are readable', store.readRules(rulesFile).length === 1)
 rmSync(rulesFile, { force: true })
 
+console.log('tool rule store')
+check('a missing file reads as no tool rules', store.readToolRules(rulesFile).length === 0)
+const storedTool = store.addToolRule(rulesFile, { tool: 'plugin_manager', action: 'set_plugin', target: 'dsh-balance' })
+check('a tool rule is stored with its target and its own id',
+  storedTool.target === 'dsh-balance' && storedTool.id.startsWith('t'), JSON.stringify(storedTool))
+store.addToolRule(rulesFile, { tool: 'plugin_manager', action: 'set_plugin', target: 'dsh-balance' })
+check('an identical tool rule is not duplicated', store.readToolRules(rulesFile).length === 1)
+store.addRule(rulesFile, { path: `${WORKSPACE}/build`, access: { delete: true } })
+check('a path rule and a tool rule share one file',
+  store.readRules(rulesFile).length === 1 && store.readToolRules(rulesFile).length === 1)
+check('clearing the path rules keeps the tool rules',
+  store.clearRules(rulesFile) === 1 && store.readRules(rulesFile).length === 0
+  && store.readToolRules(rulesFile).length === 1, JSON.stringify(store.readToolRules(rulesFile)))
+check('a tool rule that widens to a whole action is refused', (() => {
+  try {
+    store.addToolRule(rulesFile, { tool: 'plugin_manager', action: 'set_plugin' })
+    return false
+  }
+  catch {
+    return true
+  }
+})())
+check('an action that owes the user a fresh answer is refused too', (() => {
+  try {
+    store.addToolRule(rulesFile, { tool: 'plugin_manager', action: 'set_version_exemption', target: 'pkg@1.0.0' })
+    return false
+  }
+  catch {
+    return true
+  }
+})())
+store.countToolHit(rulesFile, storedTool.id)
+check('counting a tool hit is bookkeeping only', store.readToolRules(rulesFile)[0].hits === 1)
+check('removing by position works',
+  store.removeToolRule(rulesFile, 1)?.target === 'dsh-balance' && store.readToolRules(rulesFile).length === 0)
+check('an out-of-range tool removal is refused', store.removeToolRule(rulesFile, 5) === null)
+check('clearing the tool rules leaves nothing behind', store.clearToolRules(rulesFile) === 0)
+rmSync(rulesFile, { force: true })
+
 console.log('pre-execute gate')
 let decision = await gate(exec('ls -la'), next)
 check('a granted command continues to the sandbox', decision.kind === 'allow' && nextCalls === 1, JSON.stringify(decision))
@@ -230,6 +269,158 @@ check('an escalation for an ungranted command reaches the card', outcome?.kind =
 check('and has a pending record of its own', pendings.get('s3', 'e3') !== null)
 outcome = await approval(escalation('rm -rf unopened', 'e4', 's4'), next)
 check('a session grant belongs to one session only', outcome?.kind === 'allow', JSON.stringify(outcome))
+
+console.log('tool-operation approvals')
+{
+  const toolConfig = {
+    ...store.resolveConfig({ rulesFile: join(root, 'tool-rules.json'), auditFile: join(root, 'tool.ndjson'), audit: true }, root),
+    harnessHome: root,
+  }
+  const toolPendings = store.createPendingStore()
+  const toolDecisions = store.createDecisionLog()
+  const toolGrants = store.createGrantStore()
+  const toolEngine = host.createEngine({ config: toolConfig, home: HOME, grants: toolGrants, pendings: toolPendings, ctx })
+  const toolApproval = host.createApprovalListener({
+    engine: toolEngine, pendings: toolPendings, grants: toolGrants, logger, config: toolConfig, decisions: toolDecisions,
+  })
+  const toolAsk = (args, callId, name = 'plugin_manager', sessionId = 'st1') => ({
+    agent: {
+      session: {
+        id: sessionId,
+        seq: 1,
+        header: { cwd: CWD },
+        eventAt: () => ({ type: 'tool/call', data: { callId, name, arguments: JSON.stringify(args) } }),
+      },
+    },
+    toolName: name,
+    callId,
+    reason: `escalate sandbox to danger-full-access: ${name} ${JSON.stringify(args)}. Profile changes persist across sessions.`,
+  })
+  let asked = 0
+  // The card is a suspended ask: the client's "always allow" runs its command
+  // while the ask is still open, and only then does it send the answer.
+  const ask = (args, callId, onCard = null, name = 'plugin_manager') => toolApproval(
+    toolAsk(args, callId, name),
+    async () => {
+      asked += 1
+      if (onCard !== null) onCard()
+      return 'allowed-once'
+    },
+  )
+  const runAllowTool = rawInput => host.runAllowCommand({
+    file: toolConfig.rulesFile,
+    auditFile: toolConfig.auditFile,
+    remember: callId => host.createRememberCall({
+      pendings: toolPendings, config: toolConfig, logger, decisions: toolDecisions,
+    })('st1', callId),
+  }, rawInput)
+  const seenOnCard = new Map()
+  const watch = callId => () => seenOnCard.set(callId, toolPendings.get('st1', callId))
+
+  const first = await ask({ action: 'list_plugins' }, 'k1', watch('k1'))
+  check('without a rule a management operation still reaches the card',
+    asked === 1 && first === 'allowed-once', `asked=${String(asked)} outcome=${String(first)}`)
+  check('and the card carries the rule it would write, while it is on screen',
+    seenOnCard.get('k1')?.kind === 'tool' && seenOnCard.get('k1')?.action === 'list_plugins',
+    JSON.stringify(seenOnCard.get('k1')))
+  check('that record is spent when the call settles', toolPendings.get('st1', 'k1') === null)
+  check('reading a listing mints no filesystem capability', toolGrants.rulesFor('st1', 'k1').length === 0)
+
+  check('/allow tool add stores a read-only rule',
+    runAllowTool('tool add plugin_manager list_plugins').kind === 'success')
+  const second = await ask({ action: 'list_plugins' }, 'k2')
+  check('and the next identical call never reaches the card',
+    asked === 1 && second === 'allowed-once', `asked=${String(asked)}`)
+  check('a read-only rule names no filesystem path',
+    store.readRules(toolConfig.rulesFile).length === 0 && store.readToolRules(toolConfig.rulesFile).length === 1)
+  await ask({ action: 'list_bundles' }, 'k3')
+  check('a sibling action is not covered by it', asked === 2, String(asked))
+  const askedForOther = asked
+  const otherTool = await ask({ action: 'list_plugins' }, 'k4', null, 'other_tool')
+  check('and a tool this plugin does not judge is left alone',
+    otherTool === 'allowed-once' && asked === askedForOther + 1, `asked=${String(asked)}`)
+
+  check('a mutating rule without its target is refused',
+    runAllowTool('tool add plugin_manager set_plugin').kind === 'error')
+  check('the exemption action can never be written as a rule',
+    runAllowTool('tool add plugin_manager set_version_exemption pkg@1.0.0').kind === 'error')
+  check('a mutating rule is stored with its exact target',
+    runAllowTool('tool add plugin_manager set_plugin dsh-balance').kind === 'success')
+  const askedBefore = asked
+  const targeted = await ask({ action: 'set_plugin', target: 'dsh-balance', enabled: true }, 'k5')
+  check('it answers exactly that target',
+    asked === askedBefore && targeted === 'allowed-once', `asked=${String(asked)}`)
+  await ask({ action: 'set_plugin', target: 'another-plugin', enabled: true }, 'k6')
+  check('and never another one', asked === askedBefore + 1, String(asked))
+
+  // "Always allow" on the card: the command runs before the answer is sent.
+  let remembered = null
+  const risky = await ask(
+    { action: 'install_bundle', target: 'some-pkg@1.2.3' }, 'k7',
+    () => { remembered = runAllowTool('remember k7') },
+  )
+  check('an unruled installation reaches the card', risky === 'allowed-once' && asked === askedBefore + 2)
+  check('the card can remember exactly that installation',
+    remembered?.kind === 'success'
+    && store.readToolRules(toolConfig.rulesFile).some(rule => rule.action === 'install_bundle' && rule.target === 'some-pkg@1.2.3'),
+    JSON.stringify(store.readToolRules(toolConfig.rulesFile)))
+  const askedForBuilds = asked
+  const builds = await ask({ action: 'install_bundle', target: 'some-pkg@1.2.3', approvedBuilds: ['esbuild'] }, 'k8', watch('k8'))
+  check('but a build-script approval is never answered by that rule',
+    builds === 'allowed-once' && asked === askedForBuilds + 1, `asked=${String(asked)}`)
+  check('and the card holds no rule to remember for it', seenOnCard.get('k8') === null, JSON.stringify(seenOnCard.get('k8')))
+  const askedForRisk = asked
+  await ask({ action: 'set_version_exemption', target: 'pkg@1.0.0', acceptRisk: true }, 'k9', watch('k9'))
+  check('a risk acknowledgement reaches the card as well',
+    asked === askedForRisk + 1 && seenOnCard.get('k9') === null, String(asked))
+
+  const toolAudit = readFileSync(toolConfig.auditFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  const ruleHit = toolAudit.find(entry => entry.callId === 'k5')
+  check('a rule-answered call is audited as the rule, ledgered with its label',
+    ruleHit?.origin === 'rule' && ruleHit?.subject === 'plugin_manager set_plugin dsh-balance'
+    && ruleHit?.matchedRules?.[0]?.target === 'dsh-balance', JSON.stringify(ruleHit))
+  check('never as a human answer',
+    toolAudit.every(entry => !(entry.callId === 'k5' && entry.origin === 'human')), JSON.stringify(toolAudit))
+  const humanAnswer = toolAudit.find(entry => entry.callId === 'k7' && entry.origin === 'human')
+  check('the card\'s always-allow records the tool rule the button wrote',
+    humanAnswer?.action === 'always-allow'
+    && humanAnswer?.rules?.[0]?.label === 'plugin_manager install_bundle some-pkg@1.2.3', JSON.stringify(humanAnswer))
+  check('one human answer leaves one record, and the pending record is gone',
+    toolAudit.filter(entry => entry.callId === 'k7' && entry.origin === 'human').length === 1
+    && toolPendings.get('st1', 'k7') === null, JSON.stringify(toolAudit.filter(entry => entry.callId === 'k7')))
+  const listing = runAllowTool('tool')
+  check('/allow tool lists the stored rules',
+    listing.kind === 'success' && listing.text.includes('plugin_manager list_plugins')
+    && listing.text.includes('plugin_manager set_plugin dsh-balance'), listing.text)
+  check('/allow lists both kinds',
+    runAllowTool('').text.includes('工具操作权限') && runAllowTool('').text.includes('文件权限'))
+  check('/allow tool remove drops one by position',
+    runAllowTool('tool remove 1').kind === 'success' && !runAllowTool('tool').text.includes('plugin_manager list_plugins'))
+  check('/allow tool remove refuses an out-of-range position',
+    runAllowTool('tool remove 99').kind === 'error')
+  check('/allow tool add refuses an unknown tool', runAllowTool('tool add rm list_plugins').kind === 'error')
+  check('/allow tool add without an action is a usage error', runAllowTool('tool add plugin_manager').kind === 'error')
+  check('/allow tool clear empties the tool rules',
+    runAllowTool('tool clear').kind === 'success' && store.readToolRules(toolConfig.rulesFile).length === 0)
+  check('an unknown /allow tool verb is an error', runAllowTool('tool nonsense').kind === 'error')
+
+  // A deployment grants the same authority from the profile composition.
+  const grantedConfig = {
+    ...store.resolveConfig({
+      rulesFile: join(root, 'granted-rules.json'),
+      toolGrants: [{ tool: 'plugin_manager', action: 'list_plugins' }],
+    }, root),
+    harnessHome: root,
+  }
+  const grantedEngine = host.createEngine({
+    config: grantedConfig, home: HOME, grants: toolGrants, pendings: toolPendings, ctx,
+  })
+  const granted = await host.createApprovalListener({
+    engine: grantedEngine, pendings: toolPendings, grants: toolGrants, logger, config: grantedConfig,
+  })(toolAsk({ action: 'list_plugins' }, 'g1'), async () => { asked += 1; return 'allowed-once' })
+  check('a deployment grant answers its action without a card',
+    granted === 'allowed-once' && asked === askedForRisk + 1, `asked=${String(asked)}`)
+}
 
 console.log('a checked-in workspace rule grants nothing')
 {
@@ -416,6 +607,12 @@ check('a grant without a path is refused',
   (() => { try { store.resolveConfig({ grants: [{}] }, root); return false } catch { return true } })())
 check('a grant with no operation is refused',
   (() => { try { store.resolveConfig({ grants: [{ path: '/w', access: {} }] }, root); return false } catch { return true } })())
+check('tool grants are accepted from configuration',
+  store.resolveConfig({ toolGrants: [{ tool: 'plugin_manager', action: 'list_plugins' }] }, root).toolGrants[0].action === 'list_plugins')
+check('a configured tool grant that widens to a whole action is refused',
+  (() => { try { store.resolveConfig({ toolGrants: [{ tool: 'plugin_manager', action: 'set_plugin' }] }, root); return false } catch { return true } })())
+check('a toolGrants value that is not a list is refused',
+  (() => { try { store.resolveConfig({ toolGrants: {} }, root); return false } catch { return true } })())
 check('an invalid ttl is refused',
   (() => { try { store.resolveConfig({ sessionGrantTtlMs: 0 }, root); return false } catch { return true } })())
 check('configured paths are canonical',

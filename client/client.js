@@ -10,7 +10,7 @@
  * 卡片回答的是「缺哪个文件权限」,三个出口 —— 拒绝 / 总是允许 / 允许一次。
  * 两个出口都不经宿主接口:「允许一次」就是 approval waterfall 的返回值本身,
  * 「总是允许」走会话命令通道 `/allow remember <callId>`,由宿主写入它自己从待
- * 审批记录推导出的最窄规则。
+ * 审批记录推导出的最窄规则 —— 文件规则,或受管工具的一次工具操作规则。
  *
  * 样式逐条照抄 `ui-approval` 的 ApprovalPanel.module.css(用内联 <style> 注入),
  * 所以外观与内置卡片一致。
@@ -117,7 +117,8 @@ window.__ModuleLoader__.load({
 			logUnavailable: "无人应答",
 			logStoredRules: "写入规则:{rules}",
 			logReviewer: "自动审核:{verdict}({latency} ms，{route})",
-			logPaths: "路径:{paths}"
+			logPaths: "路径:{paths}",
+			logToolRules: "工具规则:{rules}"
 		};
 		const en = {
 			waiting: "Filesystem permission required",
@@ -157,13 +158,19 @@ window.__ModuleLoader__.load({
 			logUnavailable: "no answerer",
 			logStoredRules: "Rules stored: {rules}",
 			logReviewer: "Auto review: {verdict} ({latency} ms, {route})",
-			logPaths: "Paths: {paths}"
+			logPaths: "Paths: {paths}",
+			logToolRules: "Tool rules: {rules}"
 		};
 		//#endregion
 
 		/** 宿主在提权请求的 reason 上打的标记。 */
 		const ESCALATION = /^escalate sandbox to [a-z-]+:/u;
 		const POLICY_REASON = "dsh-allow: ";
+		/**
+		 * 这些工具的提权请求本身就是一次「工具操作」,所以宿主能把它记成
+		 * 工具操作规则(而不是进程围栏),卡片可以给「总是允许」。
+		 */
+		const REMEMBERABLE_TOOLS = new Set(["plugin_manager"]);
 
 		/**
 		 * 这条待审批是不是由本插件接管(提权请求,或权限策略的询问)。
@@ -187,6 +194,21 @@ window.__ModuleLoader__.load({
 			return pending !== null && pending !== undefined
 				&& typeof pending.reason === "string"
 				&& pending.reason.startsWith(POLICY_REASON);
+		}
+
+		/**
+		 * 这条待审批是不是一次「工具操作」的提权(某个受管工具要求更宽的进程围栏)。
+		 * 它的参数由宿主从会话日志读回,所以记住的是「工具 + 动作 [+ 目标]」,
+		 * 而不是任何文件路径。
+		 * @param pending - composer 上的待处理交互。
+		 * @returns 是则为 true。
+		 */
+		function isToolAsk(pending) {
+			return pending !== null && pending !== undefined
+				&& typeof pending.toolName === "string"
+				&& REMEMBERABLE_TOOLS.has(pending.toolName)
+				&& typeof pending.reason === "string"
+				&& ESCALATION.test(pending.reason);
 		}
 
 		/**
@@ -250,9 +272,10 @@ window.__ModuleLoader__.load({
 					onClick: () => { answer("rejected"); }
 				}, t("reject"))
 			];
-			// 「总是允许」只对策略询问开放:提权请求要的是更宽的进程围栏,那不是文件
-			// 权限库能记住的东西,所以提权只有拒绝 / 允许一次。
-			if (isPolicyAsk(pending)) {
+			// 「总是允许」对两类询问开放:权限策略的询问(记住文件规则),以及受管工具
+			// 的提权请求(记住「工具 + 动作 [+ 目标]」)。单纯的沙箱提权要的是更宽的
+			// 进程围栏,那不是权限库能记住的东西,所以只有拒绝 / 允许一次。
+			if (isPolicyAsk(pending) || isToolAsk(pending)) {
 				buttons.push(React.createElement(primitives.Button, {
 					key: "always",
 					variant: "outline",
@@ -486,11 +509,27 @@ window.__ModuleLoader__.load({
 				}
 				return seen.join(", ");
 			};
+			// 工具操作规则没有路径,标签是「工具 + 动作 [+ 目标]」,所以单独渲染。
+			const toolRules = (entries) => {
+				if (!Array.isArray(entries)) return "";
+				const seen = [];
+				for (const entry of entries) {
+					if (typeof entry?.tool !== "string") continue;
+					const label = String(entry.label
+						?? [entry.tool, entry.action, entry.target].filter((part) => typeof part === "string" && part !== "").join(" "));
+					if (label !== "" && !seen.includes(label)) seen.push(label);
+				}
+				return seen.join(", ");
+			};
 			if (record.origin === "rule") {
+				const toolNamed = toolRules(record.matchedRules);
+				if (toolNamed !== "") return t("logToolRules", { rules: toolNamed });
 				const named = paths(record.matchedRules);
 				if (named !== "") return t("logPaths", { paths: named });
 			}
 			if (record.action === "always-allow") {
+				const toolStored = toolRules(record.rules);
+				if (toolStored !== "") return t("logToolRules", { rules: toolStored });
 				const stored = paths(record.rules);
 				if (stored !== "") return t("logStoredRules", { rules: stored });
 			}
@@ -596,6 +635,7 @@ window.__ModuleLoader__.load({
 		// 供离线冒烟测试使用。
 		exports.escalationOf = escalationOf;
 		exports.isPolicyAsk = isPolicyAsk;
+		exports.isToolAsk = isToolAsk;
 		exports.shorten = shorten;
 		exports.AllowPanel = AllowPanel;
 		exports.AllowDecisionRow = AllowDecisionRow;

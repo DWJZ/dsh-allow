@@ -1,5 +1,5 @@
 ---
-description: "dsh-allow: filesystem permissions (read / write / create / delete / execute) per path for DSH shell calls, enforced in the process sandbox, with deny / allow once / always allow, and one row per decision in the conversation naming the rule, the baseline, the auto reviewer, the user, or the plugin itself as the layer that answered."
+description: "dsh-allow: filesystem permissions (read / write / create / delete / execute) per path for DSH shell calls, plus tool-operation rules for management calls that ask for a wider process fence, enforced in the process sandbox, with deny / allow once / always allow, and one row per decision in the conversation naming the rule, the baseline, the auto reviewer, the user, or the plugin itself as the layer that answered."
 ---
 
 # dsh-allow
@@ -39,6 +39,8 @@ the process tree (children, grandchildren, inline code)
 
 `tools/pre-execute` is the documented policy seam and the only path a shell command takes. The sandbox provider is not replaced: the plugin wraps the registered provider's `confine` and hands it the profile compiled from the effective policy, delegating to the provider's own implementation on every platform it does not handle. `tools/post-execute` spends the one-shot grants, and a small guard on the file-changing tools refuses the permission store.
 
+A management tool never reaches that gate: its call grants no filesystem capability and asks the approval waterfall for a wider process fence instead, so it is judged there, by a tool-operation rule of its own kind.
+
 ## Capabilities and rules
 
 Five capabilities are modelled, and a rule grants some of them for one path:
@@ -68,6 +70,42 @@ A stored rule is a path plus an access map, never a command line:
 
 `recursive: true` covers the whole subtree; `recursive: false` covers exactly that path, which is what the card's "always allow" writes for a single file or binary.
 
+## Tool-operation rules
+
+A second kind of rule answers the calls that ask for a wider process fence instead of a path. `plugin_manager` is the tool built that way: every action escalates to `danger-full-access`, because a profile change installs and runs Host code outside the workspace fence, so the filesystem policy has nothing to say about it — and with no rule to consult, reading the plugin list asks again on every single call.
+
+A tool rule names an operation of one tool, never a command line:
+
+```json
+{
+  "version": 3,
+  "rules": [
+    { "id": "f1", "path": "/Users/me/project/build", "recursive": true,
+      "access": { "delete": true }, "hits": 2, "createdAt": "2026-01-01T00:00:00.000Z" }
+  ],
+  "tools": [
+    { "id": "t1", "tool": "plugin_manager", "action": "list_plugins",
+      "hits": 4, "createdAt": "2026-01-01T00:00:00.000Z" },
+    { "id": "t2", "tool": "plugin_manager", "action": "set_plugin", "target": "dsh-balance",
+      "hits": 1, "createdAt": "2026-01-01T00:00:00.000Z" }
+  ]
+}
+```
+
+`tools` is a section of the same file the path rules live in, so it inherits the same protection — no shell command, no file tool and no rule can write it — and a build that only reads `rules` ignores it rather than refusing the file.
+
+| action | what a rule may name |
+| --- | --- |
+| `list_plugins`, `list_bundles`, `list_version_exemptions` | the action alone, because it reads and changes nothing |
+| `set_plugin`, `set_bundle`, `install_bundle`, `remove_bundle` | the action plus its exact target, so allowing one plugin never allows the next |
+| `set_version_exemption` | nothing: the tool's own contract requires the user to answer that exact plugin/runtime pair every time |
+
+Two calls are never answered by a rule, however the store reads: one carrying `acceptRisk: true`, which is a risk the user has to accept, and one carrying `approvedBuilds`, which grants install scripts. Both decide a question the user is asked directly.
+
+An action this vocabulary does not name is a call no rule may answer, so a tool this plugin does not judge — and a call whose arguments cannot be read — takes the ordinary path to the card.
+
+Tool rules answer under every `escalation` policy, because a rule for one tool operation IS the user's own authorization for that operation. A `sandbox_permissions` escalation on a shell command is the other case and still needs `escalation: rule`.
+
 ## The permission store is not the agent's to change
 
 The rules file and the audit log are **hard-protected**: `write`, `create` and `delete` are refused for every writer, user rules included, and the compiled profile refuses them again after every grant. That covers `$DSH_HOME/dsh-allow.json` and `$DSH_HOME/dsh-allow-audit.ndjson`, wherever the configuration points them.
@@ -88,6 +126,8 @@ Highest first; the lowest level that states the capability answers, and inside o
 4. **Global default** — not granted.
 
 Paths are compared as canonical absolute paths, component by component: `~`, relative spellings, `.`, `..` and symlinked ancestors are resolved before matching, so `/tmp/x` and `/private/tmp/x` are one path and no rule can be escaped with `../`. Every operation is resolved against both the spelling used and the path behind its symlinks, which is how a grant for `/opt/homebrew/bin/gh` and a grant for the Cellar binary it points at each work without opening the rest of the prefix. The workspace root itself is matched as a path like any other, and a rule for a path never covers a sibling that merely shares a prefix (`/w/build` does not cover `/w/build-2`).
+
+A tool-operation rule sits outside this ladder: it answers a call that grants no filesystem capability at all, so no path rule can answer one of those calls and no tool rule can answer a shell command.
 
 ## Defaults and the platform baseline
 
@@ -127,7 +167,7 @@ Command:   rm -rf build
 Sandbox:   workspace-write
 ```
 
-`always allow` writes the narrowest rules for exactly what the card names — one per path in the line, recursive only when that path is a directory that already exists — and never widens a grant to the folder around it. Opening a folder on purpose is a deliberate act: `/allow add delete . folder`.
+`always allow` writes the narrowest rules for exactly what the card names — one per path in the line, recursive only when that path is a directory that already exists — and never widens a grant to the folder around it. Opening a folder on purpose is a deliberate act: `/allow add delete . folder`. A management tool's ask carries no path, so the same button writes the one tool rule that call names: the action alone for a read-only action, the action plus its exact target otherwise.
 
 `allow once` is genuinely once, and it is kept from leaking sideways by two mechanisms. The grant is bound to the call the user approved, so the decision layer only ever sees it for that call; the profile builder recognises it again by the command line that call is running, because a confinement is told its session but not its call. And while a grant is live, every other call in the same session waits for the holder to settle before it is judged — so two overlapping calls can never share one grant. `tools/post-execute` drops the grant the moment that call settles, with a ten-minute expiry as a backstop; it is never written to the rules file, and the next call asks again.
 
@@ -244,9 +284,15 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
 /allow add execute /opt/homebrew/bin/gh file
 /allow remove 2
 /allow clear
+
+/allow tool                      list the stored tool-operation rules
+/allow tool add plugin_manager list_plugins
+/allow tool add plugin_manager set_plugin dsh-balance
+/allow tool remove 1
+/allow tool clear
 ```
 
-`add` resolves a relative path against the session workspace; `folder` (the default) covers the subtree and `file` covers exactly that path. Every rule written here is a persistent user rule, the same shape the card's `always allow` stores.
+`add` resolves a relative path against the session workspace; `folder` (the default) covers the subtree and `file` covers exactly that path. Every rule written here is a persistent user rule, the same shape the card's `always allow` stores. `clear` empties the path rules and leaves the tool rules alone; `/allow tool clear` does the reverse. `tool add` refuses a rule the vocabulary does not allow — an unknown tool or action, a mutating action without its exact target, and the one action that owes the user a fresh answer.
 
 ## Configuration
 
@@ -267,6 +313,9 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
       - path: /opt/homebrew
         recursive: true
         access: { read: true, execute: true }
+    toolGrants:                             # deployment grants, same shape as a stored tool rule
+      - tool: plugin_manager
+        action: list_plugins
 ```
 
 A `rules.json` written by dsh-allow 0.1 (the command-prefix model) reads as empty and is kept as `<rulesFile>.v2.bak` on the first write; those rules said nothing about filesystem capabilities and cannot be translated.
@@ -282,6 +331,8 @@ npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start 
 `test/reviewer.spec.mjs` injects the model and covers what the reviewer is told (only real user messages, the analyzed permissions, the fixed prompt), every answer shape (`ALLOW`, `ASK`, fenced JSON, prose, an unknown verdict, an empty answer), and every failure path (no route, no LLM service, a provider throw, a terminal error chunk, a timeout, an invalid answer). `test/smoke.mjs` covers the gate integration: an `ALLOW` runs the call through the existing call-scoped one-shot grant and leaves the rules file untouched, while an `ASK`, a failing reviewer and a disabled reviewer all leave the card in charge.
 
 `test/audit.spec.mjs` covers the ledger end to end without a host: which layer a decision records as its origin and which rules it names, the single record one human decision produces whichever half of the card answered, the records a half-written line, a foreign approval or an unrecognized outcome must not produce, and the `/allow log` rendering. `test/smoke.mjs` asserts every decision also lands in the session log as an ignorable event. `test/client.smoke.mjs` renders the decision row through React and asserts its origin badge, its command and the capability it was missing.
+
+`test/toolrules.spec.mjs` covers the tool-operation vocabulary on its own: which actions a rule may name and what each one needs, what a call reads as, which call is never answered by a rule (`acceptRisk`, `approvedBuilds`, the exemption action, an unreadable action), and that a hand-edited rule never widens itself. `test/smoke.mjs` runs the same questions through the approval waterfall — the card that appears without a rule, the rule that answers the next identical call without one, the target that is not covered, and the human answer the ledger records either way.
 
 `test/sandbox.integration.mjs` runs the real kernel and covers:
 
@@ -309,6 +360,10 @@ CI sets `DSH_ALLOW_REQUIRE_SEATBELT=1` on its macOS job, which turns that skip i
 - `create` alone creates and fills a new file; changing a file that already exists needs `write`.
 - Renaming needs `delete` for the source plus `create` for the target.
 - Read effects are derived for a fixed table of programs; the fence, not the table, is the boundary.
+- A tool rule is matched against the arguments of the call the session logged, so a tool this plugin does not judge, an action its vocabulary does not name, and a call whose arguments cannot be read all reach the card however the store reads.
+- An `install_bundle` rule names the exact specification the call carried: a rule for `pkg@1.0.0` does not cover `pkg@1.1.0`.
+- A tool rule answers one operation, not the filesystem effects of running it: the process the plugin manager starts is as confined as any other call the session makes.
+- The card offers `always allow` on every management tool's ask, because the browser half cannot read the call's arguments. A call the host refuses to remember — the exemption action, a risk acknowledgement, a build-script approval — answers that click with the reason instead of storing a rule.
 - Effects the command line does not show are judged by the sandbox, not by the parser: an effect the program table does not know is left to the fence rather than guessed.
 - `allow once` is serialized per session rather than per call: while the grant is live, another call in that session waits for the approved call to settle. A call id carried into the sandbox policy would remove the wait, and the core does not pass one today.
 - The macOS profile runner path is `/usr/bin/sandbox-exec`; a host where Seatbelt lives elsewhere falls back to the harness's own profile and reports `off`.

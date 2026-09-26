@@ -15,15 +15,21 @@
  * route: "allow once" is the approval waterfall's return value, which this half
  * observes and turns into a session grant, and "always allow" arrives as the
  * `/allow remember <callId>` command. Nothing here is remembered as command text.
+ *
+ * A management tool is judged the same way at the approval waterfall, by a rule
+ * of its own kind: it asks for a wider process fence rather than for a path, so
+ * what answers it is one operation of one tool — see `src/toolrules.js`.
  */
 import { homedir } from 'node:os'
 import { canonicalPath, describeRule, protectedRefusal } from './fspolicy.js'
+import { describeToolRule, isJudgedTool, matchToolRule, matchedToolRuleOf, toolRequestOf } from './toolrules.js'
 import { evaluateCommandLine } from './decide.js'
 import { createEnforcer } from './enforce.js'
 import { createReviewer } from './reviewer.js'
 import {
-  addRule, appendAudit, clearRules, countHit, createDecisionLog, createGrantStore, createPendingStore,
-  readAuditTail, readRules, redact, removeRule, resolveConfig, resolveHome,
+  addRule, addToolRule, appendAudit, clearRules, clearToolRules, countHit, countToolHit, createDecisionLog,
+  createGrantStore, createPendingStore, readAuditTail, readRules, readToolRules, redact, removeRule,
+  removeToolRule, resolveConfig, resolveHome,
 } from './store.js'
 
 /** Stable Cordis plugin name. */
@@ -561,6 +567,51 @@ export function createSettleListener({ grants, logger, pendings = null, decision
 }
 
 /**
+ * The tool-operation request one approval belongs to, together with the rules
+ * that may answer it, or null when this plugin does not judge that tool.
+ *
+ * A management tool asks for a wider process fence instead of a path, so its
+ * approval carries no command line: the arguments come back from the session's
+ * own log, and only the fields the vocabulary names are read. A call this
+ * plugin cannot read needs no rule — it is never answered from one.
+ * @param request - the pending approval.
+ * @param config - resolved plugin configuration.
+ * @returns the request and its rules, or null.
+ */
+export function toolAskOf(request, config) {
+  if (config === null || config === undefined || !isJudgedTool(request?.toolName)) return null
+  const args = toolCallArguments(request?.agent?.session, request?.callId)
+  const ask = toolRequestOf(request.toolName, args)
+  if (ask === null) return null
+  return { ...ask, rules: [...(config.toolGrants ?? []), ...readToolRules(config.rulesFile)] }
+}
+
+/**
+ * Record one tool-operation approval on the card, so that "always allow" can
+ * store exactly the rule the card names.
+ * @param pendings - the pending store.
+ * @param request - the pending approval.
+ * @param ask - the request as the tool vocabulary read it.
+ * @returns whether a record was written.
+ */
+function rememberToolAsk(pendings, request, ask) {
+  const sessionId = request?.agent?.session?.id
+  const callId = request?.callId
+  if (typeof callId !== 'string') return false
+  pendings.remember(sessionId, callId, {
+    kind: 'tool',
+    tool: ask.tool,
+    action: ask.action,
+    target: ask.target,
+    decision: 'prompt',
+    reason: `tool permission required: ${describeToolRule(ask)}`,
+    sessionId,
+    missing: [],
+  })
+  return true
+}
+
+/**
  * The approval listener: an escalation that skipped the gate gets a pending
  * record of its own and reaches the card.
  *
@@ -572,6 +623,12 @@ export function createSettleListener({ grants, logger, pendings = null, decision
  * call that a rule, a directory baseline, or an auto review already settled is
  * answered from that same decision, because the user has granted every
  * capability the line needs and re-asking decides nothing new.
+ *
+ * A management tool is the other shape of the same question: its call grants no
+ * filesystem capability at all, it IS one operation of one tool. A tool rule
+ * answers it directly, under every escalation policy — the user wrote down that
+ * this operation may run — and a call no rule answers still reaches the card,
+ * with the rule the card's "always allow" would write already derived.
  *
  * Every outcome this listener sees is also the moment one human decision
  * becomes knowable — the waterfall's return value is the answer the card sent,
@@ -586,10 +643,12 @@ export function createApprovalListener({ engine, pendings, grants = null, logger
   // needs is minted here — from the record the gate wrote, and before the settle
   // forgets it. Nothing else in this process observes the waterfall's return
   // value, and the command cannot be confined from a rule that was never stored.
+  // A tool-operation record names no command, so it mints nothing: nothing about
+  // its call is fenced by a filesystem capability.
   const settle = (sessionId, callId, outcome, session = null) => {
     if (outcome === 'allowed-once' && grants !== null) {
       const record = pendings.get(sessionId, callId)
-      if (record !== null) {
+      if (record !== null && record.kind !== 'tool') {
         const granted = grants.grant(record.sessionId ?? sessionId, callId, record.command, record.suggestions ?? [])
         if (granted.length > 0) {
           logger.info(`dsh-allow: granted ${String(granted.length)} capability rule(s) to call ${String(callId)}`)
@@ -644,6 +703,43 @@ export function createApprovalListener({ engine, pendings, grants = null, logger
       const outcome = await next()
       settle(sessionId, callId, outcome, request?.agent?.session ?? null)
       return outcome
+    }
+    // A management tool's call is one operation of one tool, so a tool rule
+    // answers the whole ask instead of granting a capability: the call runs under
+    // the wider fence the rule names, and the ledger keeps the rule as its origin.
+    const ask = toolAskOf(request, config)
+    if (ask !== null) {
+      const matched = matchToolRule(ask.rules, ask)
+      if (matched !== null) {
+        if (matched.source === 'user') countToolHit(config.rulesFile, matched.id)
+        recordDecision(config, {
+          tool: ask.tool,
+          cwd: null,
+          command: null,
+          subject: describeToolRule(matched),
+          decision: 'allow',
+          origin: 'rule',
+          action: 'allow-once',
+          reason: 'the stored tool rule answers this operation, so this call does not need the user',
+          mode: null,
+          sessionId: sessionId ?? null,
+          callId,
+          matchedRules: [matchedToolRuleOf(matched)],
+        }, request?.agent?.session ?? null)
+        logger.info(`dsh-allow: the tool rule "${describeToolRule(matched)}" allowed call ${String(callId)} without a card`)
+        return 'allowed-once'
+      }
+      // No rule answered it. The card's "always allow" still needs to know the
+      // rule it would write, and the answer to that is this listener's to derive.
+      if (ask.rememberable) rememberToolAsk(pendings, request, ask)
+      logger.info(ask.blocked === null
+        ? `dsh-allow: asking about ${describeToolRule(ask)} — no rule answers it yet`
+        : `dsh-allow: sending the ${describeToolRule(ask)} approval to the card — ${ask.blocked}`)
+      // This listener judged the call, so the outcome the card returns is its to
+      // account for — the same one record every other answered ask produces.
+      const toolOutcome = await next()
+      settle(sessionId, callId, toolOutcome, request?.agent?.session ?? null)
+      return toolOutcome
     }
     const args = toolCallArguments(request?.agent?.session, callId)
     const command = typeof args?.command === 'string' && args.command.trim() !== '' ? args.command : null
@@ -709,6 +805,7 @@ function auditPayload(record) {
     at: record.at ?? null,
     tool: record.tool ?? 'unknown',
     command: record.command ?? null,
+    subject: record.subject ?? null,
     cwd: record.cwd ?? null,
     decision: record.decision ?? null,
     origin: record.origin ?? 'legacy',
@@ -747,6 +844,27 @@ export function renderRules(file) {
   return lines.join('\n')
 }
 
+/**
+ * Render the stored tool-operation rules.
+ * @param file - rules-file path.
+ * @returns the command's answer text.
+ */
+export function renderToolRules(file) {
+  const rules = readToolRules(file)
+  const lines = []
+  if (rules.length === 0) lines.push('还没有记住任何工具操作权限。')
+  else {
+    lines.push(`已记住 ${String(rules.length)} 条工具操作权限：`)
+    for (const [index, rule] of rules.entries()) {
+      const hits = Number(rule.hits) || 0
+      const scope = rule.target === undefined ? '（整个动作）' : ''
+      lines.push(`${String(index + 1)}. ${describeToolRule(rule)}${scope}${hits > 0 ? `（已用 ${String(hits)} 次）` : ''}`)
+    }
+  }
+  lines.push('用 /allow tool remove <编号> 删除，/allow tool clear 清空，/allow tool add <工具> <动作> [目标] 新增。')
+  return lines.join('\n')
+}
+
 /** Human label for one recorded action. */
 const AUDIT_ACTION_LABELS = {
   'allow-once': '允许一次',
@@ -769,7 +887,7 @@ export function renderAuditLog(file, limit) {
   for (const record of answer.entries.map(auditPayload)) {
     const at = typeof record.at === 'string' ? new Date(record.at).toLocaleTimeString() : ''
     const action = AUDIT_ACTION_LABELS[record.action] ?? record.decision ?? record.action ?? '记录'
-    const what = record.command ?? record.reason ?? ''
+    const what = record.subject ?? record.command ?? record.reason ?? ''
     lines.push(`${at}  ${action}  ${what}`.trim())
   }
   return lines.join('\n')
@@ -805,9 +923,45 @@ export function renderStatus({ workspaceRoot, mode, enforcement = null }) {
 }
 
 /**
+ * Store the one tool-operation rule a card's "always allow" names, and note the
+ * decision so the human answer stays attributable once the approval settles.
+ * @param options - the pending store, the configuration, the decision log, the
+ *   logger, and the record the listener wrote for this call.
+ * @returns the outcome the command renders.
+ */
+function rememberToolCall({ pendings, config, logger, decisions, record, sessionId, callId }) {
+  let stored
+  try {
+    stored = addToolRule(config.rulesFile, { tool: record.tool, action: record.action, target: record.target })
+  }
+  catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+  const label = describeToolRule(stored)
+  if (decisions !== null) {
+    decisions.note(sessionId, callId, {
+      action: 'always-allow',
+      tool: record.tool,
+      command: null,
+      cwd: null,
+      mode: null,
+      missing: [],
+      rules: [{ ...stored, label }],
+    })
+  }
+  pendings.forget(sessionId, callId)
+  logger.info(`dsh-allow: remembered the tool rule "${label}"`)
+  return { ok: true, labels: [label] }
+}
+
+/**
  * The host-side operation behind `/allow remember <callId>` and the card's
  * "always allow" button: store exactly the narrowest rules the gate derived for
  * that call, note the decision, and forget the pending record.
+ *
+ * A tool-operation approval carries no filesystem capability, so it stores the
+ * one tool rule the call names — action only for a read-only action, action plus
+ * its exact target otherwise — and never a path.
  * @param options - the pending store, the configuration, the decision log, and the logger.
  * @returns the operation, taking a session id and a call id.
  */
@@ -815,6 +969,9 @@ export function createRememberCall({ pendings, config, logger, decisions = null 
   return (sessionId, callId) => {
     const record = pendings.get(sessionId, callId)
     if (record === null) return { ok: false, error: '这次审批已经结束，无法记住' }
+    if (record.kind === 'tool') {
+      return rememberToolCall({ pendings, config, logger, decisions, record, sessionId, callId })
+    }
     const suggestions = record.suggestions ?? []
     if (suggestions.length === 0 || record.decision === 'forbidden') {
       return { ok: false, error: '这条命令无法被记住' }
@@ -853,10 +1010,36 @@ export function createRememberCall({ pendings, config, logger, decisions = null 
  */
 export function runAllowCommand({ file, auditFile = null, workspaceRoot, mode, enforcement = null, remember = null }, rawInput) {
   const input = rawInput.trim()
-  if (input === '' || input === 'list') return { kind: 'success', text: renderRules(file) }
+  if (input === '' || input === 'list') {
+    return { kind: 'success', text: `${renderRules(file)}\n\n${renderToolRules(file)}` }
+  }
   const [verb, ...rest] = input.split(/\s+/u)
   if (verb === 'status') return { kind: 'success', text: renderStatus({ workspaceRoot, mode, enforcement }) }
   if (verb === 'clear') return { kind: 'success', text: `已清空 ${String(clearRules(file))} 条文件权限。` }
+  if (verb === 'tool') {
+    const [sub, ...fields] = rest
+    if (sub === undefined || sub === 'list') return { kind: 'success', text: renderToolRules(file) }
+    if (sub === 'clear') return { kind: 'success', text: `已清空 ${String(clearToolRules(file))} 条工具操作权限。` }
+    if (sub === 'remove') {
+      const removed = removeToolRule(file, Number(fields[0]))
+      return removed === null
+        ? { kind: 'error', text: `用法：/allow tool remove <编号>（1-${String(readToolRules(file).length)}）` }
+        : { kind: 'success', text: `已删除：${describeToolRule(removed)}` }
+    }
+    if (sub === 'add') {
+      const [tool, action, target] = fields
+      if (tool === undefined || action === undefined) {
+        return { kind: 'error', text: '用法：/allow tool add <工具> <动作> [目标]，例如 /allow tool add plugin_manager set_plugin dsh-balance' }
+      }
+      try {
+        return { kind: 'success', text: `已记住：${describeToolRule(addToolRule(file, { tool, action, target }))}` }
+      }
+      catch (error) {
+        return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+      }
+    }
+    return { kind: 'error', text: '用法：/allow tool [list|add <工具> <动作> [目标]|remove <编号>|clear]' }
+  }
   if (verb === 'remember') {
     const callId = rest[0]
     if (callId === undefined) {
@@ -954,8 +1137,8 @@ export function apply(ctx, pluginConfig) {
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.effect(() => commandCtx.commands.register({
       name: 'allow',
-      description: 'List or change the filesystem permissions that no longer ask for approval',
-      input: { hint: '[list|status|log [n]|add <operations> <path> [file|folder]|remember <callId>|remove <number>|clear]' },
+      description: 'List or change the permissions that no longer ask for approval',
+      input: { hint: '[list|status|log [n]|add <operations> <path> [file|folder]|tool [list|add <tool> <action> [target]|remove <number>|clear]|remember <callId>|remove <number>|clear]' },
       handler: invocation => runAllowCommand({
         file: config.rulesFile,
         auditFile: config.auditFile,

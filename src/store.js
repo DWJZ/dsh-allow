@@ -1,11 +1,13 @@
 /**
- * Persistent filesystem rules, per-session grants, the pending-approval
- * scratch space, and the decision audit log.
+ * Persistent filesystem rules, tool-operation rules, per-session grants, the
+ * pending-approval scratch space, and the decision audit log.
  *
  * A stored rule is a path plus the capabilities granted there — never a command
  * line — so `rm build` and `rm src` cannot share one unless the user opened the
- * folder they share on purpose. The audit log is NDJSON and never records
- * environment values or credential-shaped text.
+ * folder they share on purpose. The tool-operation rules live in the same file,
+ * in their own section: they name an operation of one tool instead of a path,
+ * and neither kind can be written by the agent that they judge. The audit log is
+ * NDJSON and never records environment values or credential-shaped text.
  */
 import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync,
@@ -14,6 +16,7 @@ import {
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { OPERATIONS, canonicalPath, describeRule, makeRule, normalizeStoredRule } from './fspolicy.js'
+import { makeToolRule, normalizeStoredToolRule, validateToolRule } from './toolrules.js'
 
 /** Default file name for stored rules below the harness home. */
 const RULES_FILE_NAME = 'dsh-allow.json'
@@ -84,6 +87,20 @@ function configGrantRule(entry, home) {
 }
 
 /**
+ * Resolve one configured tool grant into a rule.
+ * @param entry - `{tool, action, target}` from the plugin configuration.
+ * @returns the rule.
+ */
+function configToolRule(entry) {
+  if (entry === null || typeof entry !== 'object') {
+    throw new TypeError(`dsh-allow: config toolGrants entries need a tool and an action, got ${JSON.stringify(entry)}`)
+  }
+  const check = validateToolRule(entry)
+  if (!check.ok) throw new TypeError(`dsh-allow: ${check.reason}`)
+  return makeToolRule({ ...entry, source: 'user', note: 'configured grant' })
+}
+
+/**
  * Resolve the rules and audit paths for one harness home.
  * @param config - raw plugin configuration.
  * @param home - resolved harness home.
@@ -104,6 +121,10 @@ export function resolveConfig(config, home) {
   const grants = config?.grants === undefined ? [] : config.grants
   if (!Array.isArray(grants)) {
     throw new TypeError('dsh-allow: config grants must be a list of {path, access, recursive} entries')
+  }
+  const toolGrants = config?.toolGrants === undefined ? [] : config.toolGrants
+  if (!Array.isArray(toolGrants)) {
+    throw new TypeError('dsh-allow: config toolGrants must be a list of {tool, action, target} entries')
   }
   const enforce = config?.enforce ?? 'auto'
   if (!['auto', 'full', 'guarded', 'process', 'writes', 'off'].includes(enforce)) {
@@ -152,6 +173,9 @@ export function resolveConfig(config, home) {
     escalation,
     sessionGrantTtlMs,
     grants: grants.map(entry => configGrantRule(entry, home)),
+    // Deployment-level tool-operation grants: the same authority a stored tool
+    // rule carries, written where the deployment composes it.
+    toolGrants: toolGrants.map(entry => configToolRule(entry)),
     // How much of the filesystem policy is compiled into the process sandbox.
     // `auto` takes the strongest fence a probe proves this host can hold:
     // writes and execution always, user-data reads when macOS survives it.
@@ -188,17 +212,57 @@ function readJson(file) {
 }
 
 /**
- * Read the stored rules. A file from an older rule model reads as empty: its
- * command-shaped rules say nothing about filesystem capabilities, and the
- * writer keeps a backup of it rather than rewriting it in place.
+ * Read both sections of the rule file. A file from an older rule model reads as
+ * empty in both: its command-shaped rules say nothing about filesystem
+ * capabilities, and the writer keeps a backup of it rather than rewriting it in
+ * place.
+ * @param file - absolute rules-file path.
+ * @returns the raw path rules and tool rules.
+ */
+function readSections(file) {
+  const parsed = readJson(file)
+  if (parsed === null || typeof parsed !== 'object') return { rules: [], tools: [] }
+  if (parsed.version !== undefined && parsed.version !== RULES_VERSION) return { rules: [], tools: [] }
+  return {
+    rules: Array.isArray(parsed.rules) ? parsed.rules : [],
+    tools: Array.isArray(parsed.tools) ? parsed.tools : [],
+  }
+}
+
+/**
+ * Read the stored rules.
  * @param file - absolute rules-file path.
  * @returns the rules.
  */
 export function readRules(file) {
-  const parsed = readJson(file)
-  if (!Array.isArray(parsed?.rules)) return []
-  if (parsed.version !== undefined && parsed.version !== RULES_VERSION) return []
-  return parsed.rules.map(rule => normalizeStoredRule(rule, 'user')).filter(rule => rule !== null)
+  return readSections(file).rules.map(rule => normalizeStoredRule(rule, 'user')).filter(rule => rule !== null)
+}
+
+/**
+ * Read the stored tool-operation rules.
+ * @param file - absolute rules-file path.
+ * @returns the rules.
+ */
+export function readToolRules(file) {
+  return readSections(file).tools.map(rule => normalizeStoredToolRule(rule, 'user')).filter(rule => rule !== null)
+}
+
+/**
+ * Replace both sections of the rule file atomically, keeping one backup of a
+ * file written by an earlier rule model.
+ * @param file - absolute rules-file path.
+ * @param sections - the complete path rules and tool rules.
+ */
+function writeSections(file, sections) {
+  mkdirSync(dirname(file), { recursive: true })
+  const previous = readJson(file)
+  if (previous !== null && previous.version !== undefined && previous.version !== RULES_VERSION
+    && !existsSync(`${file}.v${String(previous.version)}.bak`)) {
+    renameSync(file, `${file}.v${String(previous.version)}.bak`)
+  }
+  const temporary = `${file}.tmp`
+  writeFileSync(temporary, `${JSON.stringify({ version: RULES_VERSION, rules: sections.rules, tools: sections.tools }, null, 2)}\n`, 'utf8')
+  renameSync(temporary, file)
 }
 
 /**
@@ -208,15 +272,7 @@ export function readRules(file) {
  * @param rules - the complete list.
  */
 export function writeRules(file, rules) {
-  mkdirSync(dirname(file), { recursive: true })
-  const previous = readJson(file)
-  if (previous !== null && previous.version !== undefined && previous.version !== RULES_VERSION
-    && !existsSync(`${file}.v${String(previous.version)}.bak`)) {
-    renameSync(file, `${file}.v${String(previous.version)}.bak`)
-  }
-  const temporary = `${file}.tmp`
-  writeFileSync(temporary, `${JSON.stringify({ version: RULES_VERSION, rules }, null, 2)}\n`, 'utf8')
-  renameSync(temporary, file)
+  writeSections(file, { rules, tools: readSections(file).tools })
 }
 
 /**
@@ -268,10 +324,7 @@ export function addRule(file, fields) {
  * @returns the raw records.
  */
 function readRulesRaw(file) {
-  const parsed = readJson(file)
-  if (!Array.isArray(parsed?.rules)) return []
-  if (parsed.version !== undefined && parsed.version !== RULES_VERSION) return []
-  return parsed.rules
+  return readSections(file).rules
 }
 
 /**
@@ -289,12 +342,18 @@ export function removeRule(file, position) {
 }
 
 /**
- * Clear every stored rule.
+ * Clear every stored rule. The tool-operation rules are a section of the same
+ * file and are never dropped as a side effect of clearing the path rules.
  * @param file - absolute rules-file path.
  * @returns how many rules were removed.
  */
 export function clearRules(file) {
-  const count = readRulesRaw(file).length
+  const current = readSections(file)
+  const count = current.rules.length
+  if (current.tools.length > 0) {
+    writeSections(file, { rules: [], tools: current.tools })
+    return count
+  }
   try {
     unlinkSync(file)
   }
@@ -302,6 +361,87 @@ export function clearRules(file) {
     // An absent file already means "no rules".
   }
   return count
+}
+
+/**
+ * Store one tool-operation rule, replacing an identical one.
+ * @param file - absolute rules-file path.
+ * @param fields - tool, action, and the target a mutating action needs.
+ * @returns the stored rule.
+ */
+export function addToolRule(file, fields) {
+  const check = validateToolRule(fields)
+  if (!check.ok) throw new TypeError(`dsh-allow: ${check.reason}`)
+  const rule = makeToolRule(fields)
+  const current = readSections(file)
+  const same = current.tools.find(existing => existing.tool === rule.tool
+    && existing.action === rule.action
+    && existing.target === rule.target)
+  if (same !== undefined) return normalizeStoredToolRule(same, 'user')
+  const stored = {
+    id: `t${String(Date.now())}${String(current.tools.length)}`,
+    tool: rule.tool,
+    action: rule.action,
+    ...(rule.target === undefined ? {} : { target: rule.target }),
+    hits: 0,
+    createdAt: new Date().toISOString(),
+  }
+  writeSections(file, { rules: current.rules, tools: [...current.tools, stored] })
+  return normalizeStoredToolRule(stored, 'user')
+}
+
+/**
+ * Remove one tool-operation rule by 1-based position.
+ * @param file - absolute rules-file path.
+ * @param position - 1-based index.
+ * @returns the removed rule, or null when the position is out of range.
+ */
+export function removeToolRule(file, position) {
+  const current = readSections(file)
+  if (!Number.isSafeInteger(position) || position < 1 || position > current.tools.length) return null
+  const tools = [...current.tools]
+  const [removed] = tools.splice(position - 1, 1)
+  writeSections(file, { rules: current.rules, tools })
+  return removed === undefined ? null : normalizeStoredToolRule(removed, 'user')
+}
+
+/**
+ * Clear every stored tool-operation rule, leaving the path rules in place.
+ * @param file - absolute rules-file path.
+ * @returns how many rules were removed.
+ */
+export function clearToolRules(file) {
+  const current = readSections(file)
+  const count = current.tools.length
+  if (current.rules.length > 0) {
+    writeSections(file, { rules: current.rules, tools: [] })
+    return count
+  }
+  try {
+    unlinkSync(file)
+  }
+  catch {
+    // An absent file already means "no rules".
+  }
+  return count
+}
+
+/**
+ * Count one tool rule's use; bookkeeping failures never change a decision.
+ * @param file - absolute rules-file path.
+ * @param id - rule id.
+ */
+export function countToolHit(file, id) {
+  try {
+    const current = readSections(file)
+    writeSections(file, {
+      rules: current.rules,
+      tools: current.tools.map(rule => (rule.id === id ? { ...rule, hits: (Number(rule.hits) || 0) + 1 } : rule)),
+    })
+  }
+  catch {
+    // Bookkeeping only.
+  }
 }
 
 /**
