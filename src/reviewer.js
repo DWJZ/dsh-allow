@@ -63,6 +63,26 @@ const MAX_USER_MESSAGES = 3
 const MAX_ANSWER_CHARS = 4000
 
 /**
+ * Answer budget for one review call. The reply is a small JSON object, but a
+ * reasoning model spends part of this budget before it writes anything, so the
+ * cap has to clear that preamble instead of ending the call on `max-tokens`.
+ */
+export const REVIEW_MAX_TOKENS = 1024
+
+/**
+ * One terminal finish reason as a short diagnosis.
+ * @param reason - the finish reason carried by the terminal chunk.
+ * @returns a readable summary of why the call ended.
+ */
+function describeFinish(reason) {
+  if (reason === undefined || reason === null) return 'the call ended without a reason'
+  const failure = reason.failure
+  const code = typeof failure?.code === 'string' && failure.code !== '' ? ` (${failure.code})` : ''
+  const message = typeof failure?.message === 'string' && failure.message !== '' ? `: ${failure.message}` : ''
+  return `${String(reason.kind)}${code}${message}`
+}
+
+/**
  * The text of one message's blocks.
  * @param message - a message record from the session log.
  * @returns the concatenated text blocks.
@@ -101,23 +121,39 @@ export function latestUserMessages(session, limit = MAX_USER_MESSAGES) {
 }
 
 /**
- * The model route the session last selected.
+ * The model route in force for the calling session.
+ *
+ * Whichever the log states nearest the tail wins: an explicit `model/selection`
+ * the user made, or the `request/header` the harness actually sent. A session
+ * whose model comes from profile configuration never records a selection, so
+ * its requests are the only route there is to inherit.
  * @param session - the calling session.
- * @returns the provider and model, or null when the session never selected one.
+ * @returns the provider and model, or null when the log names neither.
  */
 export function sessionRoute(session) {
   const end = Number(session?.seq)
   if (!Number.isFinite(end) || end <= 0) return null
   for (let seq = end - 1; seq >= 0; seq -= 1) {
     const event = session.eventAt?.(seq)
-    if (event?.type !== 'model/selection') continue
-    const provider = event.data?.provider
-    const model = event.data?.model
-    if (typeof provider === 'string' && provider !== '' && typeof model === 'string' && model !== '') {
-      return { provider, model }
-    }
+    const route = event?.type === 'model/selection'
+      ? routeOf(event.data)
+      : event?.type === 'request/header' ? routeOf(event.data?.header?.config) : null
+    if (route !== null) return route
   }
   return null
+}
+
+/**
+ * The provider and model one record names.
+ * @param value - a selection payload or a request config.
+ * @returns both names, or null when either is missing.
+ */
+function routeOf(value) {
+  const provider = value?.provider
+  const model = value?.model
+  return typeof provider === 'string' && provider !== '' && typeof model === 'string' && model !== ''
+    ? { provider, model }
+    : null
 }
 
 /**
@@ -198,26 +234,34 @@ export function createReviewer({ config, logger, llmOf = () => undefined, now = 
    */
   const ask = async (prompt, route, signal) => {
     const llm = llmOf()
-    if (llm === undefined || llm === null || typeof llm.stream !== 'function') return null
+    if (llm === undefined || llm === null || typeof llm.stream !== 'function') {
+      return { text: null, failure: 'this deployment mounted no llm service' }
+    }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(new Error('auto review timed out')), settings.timeoutMs)
     const abort = () => controller.abort(new Error('the call was cancelled'))
     signal?.addEventListener?.('abort', abort, { once: true })
     try {
       let text = ''
-      let failed = false
+      let failure = null
       for await (const chunk of llm.stream({
         provider: route.provider,
         model: route.model,
         system: REVIEW_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
-        maxTokens: 200,
+        maxTokens: REVIEW_MAX_TOKENS,
         signal: controller.signal,
       })) {
         if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
-        if (chunk?.type === 'finish' && chunk.reason?.kind !== 'stop') failed = true
+        if (chunk?.type !== 'finish') continue
+        // A dispatch or adapter failure arrives as a terminal finish chunk rather
+        // than a throw, so its detail is the only description of it there is.
+        // `max-tokens` still delivered what the model wrote, and the parser
+        // rejects a truncated answer on its own.
+        if (chunk.reason?.kind === 'stop' || chunk.reason?.kind === 'max-tokens') continue
+        failure = describeFinish(chunk.reason)
       }
-      return failed ? null : text
+      return { text: failure === null ? text : null, failure }
     }
     finally {
       clearTimeout(timer)
@@ -263,20 +307,27 @@ export function createReviewer({ config, logger, llmOf = () => undefined, now = 
         JSON.stringify(payload, null, 2),
       ].join('\n')
       logger.info(`dsh-allow: auto review for ${JSON.stringify(String(command).slice(0, 120))} via ${route.provider}/${route.model}`)
-      let text = null
+      let asked = null
       try {
-        text = await ask(prompt, route, exec?.signal)
+        asked = await ask(prompt, route, exec?.signal)
       }
       catch (error) {
         // A reviewer that fails is a reviewer that asks: never an allow.
-        text = null
-        logger.warn(`dsh-allow: auto review failed (${error instanceof Error ? error.message : String(error)}); asking the user`)
+        asked = { text: null, failure: error instanceof Error ? error.message : String(error) }
+        logger.warn(`dsh-allow: auto review failed (${String(asked.failure)}); asking the user`)
       }
       const latencyMs = now() - started
-      if (text === null) {
-        return { verdict: 'ASK', reason: 'the reviewer could not be reached', latencyMs, route }
+      if (asked.text === null) {
+        // The diagnosis travels with the record: an operator reads it here rather
+        // than guessing why their reviewer never answers.
+        return {
+          verdict: 'ASK',
+          reason: `the reviewer could not be reached — ${String(asked.failure)}`,
+          latencyMs,
+          route,
+        }
       }
-      const parsed = parseReview(text)
+      const parsed = parseReview(asked.text)
       logger.info(`dsh-allow: auto review verdict ${parsed.verdict} (${String(latencyMs)}ms) — ${parsed.reason}`)
       return { ...parsed, latencyMs, route }
     },

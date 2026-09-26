@@ -13,7 +13,8 @@
 #       autoReview:                           # 可选:让模型替用户回答「允许一次」
 #         enabled: true                       # 默认 false;关掉就完全回到人工卡片
 #         timeoutMs: 10000                    # 超时按 ASK 处理
-#         # provider: inherit                 # 默认继承会话最近一次 model/selection
+#         # provider: inherit                 # 默认继承会话最近一次 model/selection,
+#         #                                    # 或(没有选择时)最近一次请求实际使用的路由
 #         # model: inherit
 # 这里默认打开 autoReview:它只能在「用户刚说的话里明确要求」时产生一次性的
 # allow once,其余(不确定/超时/报错/格式不对/没有模型路由)全部落回人工卡片。

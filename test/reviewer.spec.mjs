@@ -85,6 +85,30 @@ console.log('what the reviewer is told')
   check('the route comes from the session selection',
     JSON.stringify(reviewerModule.sessionRoute(session)) === '{"provider":"deepseek","model":"deepseek-chat"}')
   check('a session without a selection has no route', reviewerModule.sessionRoute(fakeSession([])) === null)
+  const headerEvent = (provider, model) => ({
+    type: 'request/header',
+    data: { header: { config: { provider, model } } },
+  })
+  check('a session whose model comes from profile configuration still has a route',
+    JSON.stringify(reviewerModule.sessionRoute(fakeSession([
+      headerEvent('deepseek-official', 'deepseek-flash'),
+    ]))) === '{"provider":"deepseek-official","model":"deepseek-flash"}',
+    JSON.stringify(reviewerModule.sessionRoute(fakeSession([headerEvent('deepseek-official', 'deepseek-flash')]))))
+  check('the statement nearest the tail wins',
+    JSON.stringify(reviewerModule.sessionRoute(fakeSession([
+      routeEvent(),
+      headerEvent('deepseek-official', 'deepseek-flash'),
+    ]))) === '{"provider":"deepseek-official","model":"deepseek-flash"}')
+  check('a selection made after the last request still wins',
+    JSON.stringify(reviewerModule.sessionRoute(fakeSession([
+      headerEvent('deepseek-official', 'deepseek-flash'),
+      routeEvent(),
+    ]))) === '{"provider":"deepseek","model":"deepseek-chat"}')
+  check('a request header naming no route is skipped',
+    JSON.stringify(reviewerModule.sessionRoute(fakeSession([
+      { type: 'request/header', data: { header: { config: {} } } },
+      routeEvent(),
+    ]))) === '{"provider":"deepseek","model":"deepseek-chat"}')
   const payload = reviewerModule.buildReviewRequest({
     command: 'cp report.pdf ~/Downloads/report.pdf',
     cwd: '/Users/me/project',
@@ -135,7 +159,9 @@ console.log('review outcomes')
     llm.calls[0].messages[0].content[0].text.includes('把报告保存到 Downloads')
     && llm.calls[0].messages[0].content[0].text.includes('/Users/me/Downloads/report.pdf'), llm.calls[0].messages[0].content[0].text.slice(0, 200))
   check('and the stable system prompt', llm.calls[0].system === reviewerModule.REVIEW_SYSTEM_PROMPT)
-  check('and a bounded answer', llm.calls[0].maxTokens === 200)
+  check('and a bounded answer that still clears a reasoning preamble',
+    llm.calls[0].maxTokens === reviewerModule.REVIEW_MAX_TOKENS && reviewerModule.REVIEW_MAX_TOKENS > 200,
+    String(llm.calls[0].maxTokens))
 }
 {
   const llm = fakeLlm('{"verdict":"ASK","reason":"the path is wider than the request"}')
@@ -158,9 +184,31 @@ console.log('review outcomes')
   check('I: a provider failure asks', (await reviewer.review(request({}))).verdict === 'ASK')
 }
 {
-  const failing = { async *stream() { yield { type: 'finish', reason: { kind: 'error', failure: { message: 'boom' } } } } }
+  const failing = {
+    async *stream() {
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'rate_limit' } } }
+    },
+  }
   const reviewer = reviewerModule.createReviewer({ config: config(), logger, llmOf: () => failing })
-  check('I: a terminal error finish asks', (await reviewer.review(request({}))).verdict === 'ASK')
+  const outcome = await reviewer.review(request({}))
+  check('I: a terminal error finish asks', outcome.verdict === 'ASK')
+  check('and its record names the failure instead of hiding it',
+    outcome.reason.includes('error') && outcome.reason.includes('rate_limit') && outcome.reason.includes('boom'),
+    outcome.reason)
+}
+{
+  // A reasoning preamble may consume the whole budget, so the answer the model
+  // did write still reaches the parser rather than counting as unreachable.
+  const truncated = {
+    async *stream() {
+      yield { type: 'text-delta', text: '{"verdict":"ALLOW","reason":"asked for exactly this"}' }
+      yield { type: 'finish', reason: { kind: 'max-tokens' } }
+    },
+  }
+  const reviewer = reviewerModule.createReviewer({ config: config(), logger, llmOf: () => truncated })
+  const outcome = await reviewer.review(request({}))
+  check('I: a max-tokens finish still yields the answer the model wrote',
+    outcome.verdict === 'ALLOW', JSON.stringify(outcome))
 }
 {
   const hanging = { async *stream(options) { await new Promise((_resolve, reject) => { options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }) }) } }
