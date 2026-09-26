@@ -1,0 +1,26 @@
+{
+  "name": "dsh-profile-desktop",
+  "private": true,
+  "dependencies": {
+    "dsh-balance": "link:/Users/wutianmu/projects/deepseek-harness/plugins/dsh-balance",
+    "dsh-better-sidebar": "^0.19.1",
+    "dsh-pocket": "^2.10.6",
+    "dsh-restart": "link:/Users/wutianmu/projects/deepseek-harness/plugins/dsh-restart",
+    "dshmarket": "^1.57.0",
+    "dsh-allow": "link:/Users/wutianmu/projects/deepseek-harness/plugins/dsh-allow"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-balance",
+        "dsh-restart",
+        "dsh-pocket",
+        "dshmarket",
+        "dsh-better-sidebar",
+        "dsh-allow"
+      ]
+    }
+  }
+}
