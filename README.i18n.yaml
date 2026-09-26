@@ -1,6 +1,61 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write plugins/dsh-allow/README.md
-README.md: d5fd5148e98e0c108bb15b8fc8ae6dde8943dc34
-README.zh.md: eb63222d36fecb90a7b8e2bbf4365563d8ee1fa4
+/:
+  en: 277336ac933965c9
+  zh: 183bcf01b97d53f0
+/dsh-allow:
+  en: 83483f39b57d39f8
+  zh: 9a016549bf8cb1cc
+/dsh-allow/where-it-hooks-in:
+  en: f360d3913ba72d02
+  zh: 1144a7881e375085
+/dsh-allow/capabilities-and-rules:
+  en: 09e7336d85def424
+  zh: 85d5fe2fcc1e6907
+/dsh-allow/the-permission-store-is-not-the-agent-s-to-change:
+  en: 950e6826fe791105
+  zh: debc36b4a85c0d8b
+/dsh-allow/precedence:
+  en: 768c465ad7bf95d0
+  zh: 2465ac650c5c4a3d
+/dsh-allow/defaults-and-the-platform-baseline:
+  en: efdadd6bcbf5c57a
+  zh: ed35e83766a3ee5d
+/dsh-allow/homebrew-and-symlinked-executables:
+  en: 126d74675bc60437
+  zh: 033463d9376c9e51
+/dsh-allow/how-effects-are-read-from-a-command:
+  en: 0a6d854a53f9de40
+  zh: b98c1f57eff24fab
+/dsh-allow/inline-programs-run-only-behind-a-fence-that-can-back-them:
+  en: d77d97f3a7627fc3
+  zh: 6a761b9094769d9c
+/dsh-allow/the-card:
+  en: 00b3aaad60bd1438
+  zh: 746ae0700d37cc7c
+/dsh-allow/auto-review-optional:
+  en: 9bc06a57bba58ab5
+  zh: a3268b0bdb03c929
+/dsh-allow/the-approval-ledger:
+  en: 3c3d2b97e8e62d2a
+  zh: 986a46fb17504716
+/dsh-allow/the-macos-backend:
+  en: 7ecfed39169c12cf
+  zh: f589cefe4fbbeecb
+/dsh-allow/allow:
+  en: 614ec6d840586f4e
+  zh: 85c4b007556cdc61
+/dsh-allow/configuration:
+  en: 1a4bacf426ad9548
+  zh: 2618f59f400e5f57
+/dsh-allow/test:
+  en: 1d295d1b3c8168eb
+  zh: e567453b981f1c3c
+/dsh-allow/limits:
+  en: 8cf6fd7d98bcba69
+  zh: a74505bb85f39124
+/dsh-allow/license:
+  en: aad9b93c8b488fac
+  zh: 0a553bf347728a12

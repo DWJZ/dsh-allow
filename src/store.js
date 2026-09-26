@@ -131,10 +131,25 @@ export function resolveConfig(config, home) {
   }
   const rulesFile = text(config?.rulesFile, 'rulesFile', join(home, RULES_FILE_NAME))
   const auditFile = text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME))
+  // Recording a decision as a session event needs a reader that honours the
+  // envelope's skip marker, so it stays off until a deployment asks for it.
+  const appendSessionEvents = config?.appendSessionEvents ?? false
+  if (typeof appendSessionEvents !== 'boolean') {
+    throw new TypeError(`dsh-allow: config appendSessionEvents must be a boolean, got ${JSON.stringify(appendSessionEvents)}`)
+  }
+  // A sandbox escalation widens the process fence rather than asking about a
+  // path, so `ask` keeps it a human decision. `rule` answers it from the rule
+  // that already allowed the call, which is the deployment's call to make.
+  const escalation = config?.escalation ?? 'ask'
+  if (escalation !== 'ask' && escalation !== 'rule') {
+    throw new TypeError(`dsh-allow: config escalation must be "ask" or "rule", got ${JSON.stringify(escalation)}`)
+  }
   return {
     rulesFile,
     auditFile,
     audit: config?.audit !== false,
+    appendSessionEvents,
+    escalation,
     sessionGrantTtlMs,
     grants: grants.map(entry => configGrantRule(entry, home)),
     // How much of the filesystem policy is compiled into the process sandbox.
@@ -657,9 +672,9 @@ export function createPendingStore({ ttlMs = PENDING_TTL_MS, limit = PENDING_LIM
  * Create the human-decision scratch space: what the user clicked, before the
  * approval service reports the outcome it produced.
  *
- * A card answers in two steps — it calls `/dsh-allow/remember` or
- * `/dsh-allow/once`, then settles the pending approval — and the pending record
- * is gone by the second. The note is keyed separately so both halves of one
+ * "Always allow" answers in two steps — it asks `/allow remember <callId>` to
+ * store the rules, then settles the pending approval — and the pending record is
+ * gone by the second. The note is keyed separately so both halves of one
  * decision still produce exactly one audit record.
  * @param options - how many unanswered notes may wait.
  * @returns note/take/peek operations.

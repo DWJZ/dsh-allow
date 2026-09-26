@@ -98,15 +98,13 @@ check('an absent interaction is ignored', client.escalationOf(undefined) === nul
 console.log('display helpers')
 check('an over-long display string is ellipsised', client.shorten('x'.repeat(80), 20).length === 20 && client.shorten('x'.repeat(80), 20).endsWith('\u2026'))
 check('a short string is untouched', client.shorten('short', 20) === 'short')
-const labels = (list) => client.alwaysText((key, params) => `${key}(${JSON.stringify(params)})`, list)
-check('one rule names itself', labels([{ label: 'delete · /w/build' }]) === 'alwaysOne({"rule":"delete · /w/build"})', labels([{ label: 'delete · /w/build' }]))
-check('two rules are listed', labels([{ label: 'a' }, { label: 'b' }]) === 'alwaysMany({"rules":"a + b"})', labels([{ label: 'a' }, { label: 'b' }]))
-const many = labels(Array.from({ length: 5 }, (_value, index) => ({ label: `r${String(index)}` })))
-check('a long list is capped with a count', many.includes('+2'), many)
+check('a policy ask is the one a rule can be stored for', client.isPolicyAsk(policyPrompt) === true)
+check('a sandbox escalation is not', client.isPolicyAsk(pending) === false)
 
 console.log('apply')
 const registrations = []
 const dictionaries = []
+const definitions = []
 const ctx = {
   effect: (factory) => factory(),
   locale: {
@@ -117,45 +115,122 @@ const ctx = {
     inject: (_name, factory) => factory(),
     register: (options, component) => { registrations.push({ options, component }); return () => {} },
   },
+  sessions: { binding: () => undefined },
+  uiConversation: { events: { register: (definition) => { definitions.push(definition); return () => {} } } },
 }
 client.apply(ctx)
 const card = registrations.find(entry => entry.options.name === 'conversation.composer')
-const ledger = registrations.find(entry => entry.options.name === 'conversation.view')
 check('a composer chain entry is registered', card?.options?.name === 'conversation.composer', JSON.stringify(registrations.map(entry => entry.options.name)))
 check('it runs before the built-in approval card (priority 1)', (card?.options?.priority ?? 99) < 1, String(card?.options?.priority))
 check('it declares its dictionary namespace', card?.options?.locale === 'dshAllow', String(card?.options?.locale))
 check('select matches an escalation', card?.options?.select({ pendingInteraction: pending }) === pending)
 check('select passes other interactions through', card?.options?.select({ pendingInteraction: { kind: 'question' } }) === null)
-
-console.log('the approval ledger tab')
-check('a conversation view is registered beside the shipped ones',
-  ledger?.options?.name === 'conversation.view' && ledger?.options?.id === 'allow-log', JSON.stringify(ledger?.options))
-check('it renders after the trajectory view (order 10)', (ledger?.options?.order ?? 0) > 10, String(ledger?.options?.order))
-check('and its tab label is a thunk, so it follows the active locale',
-  typeof ledger?.options?.label === 'function' && ledger.options.label() === 'viewAllowLog', String(ledger?.options?.label?.()))
-check('it declares the same dictionary namespace', ledger?.options?.locale === 'dshAllow', String(ledger?.options?.locale))
+check('no Web-facing conversation view is registered any more',
+  registrations.every(entry => entry.options.name !== 'conversation.view'),
+  JSON.stringify(registrations.map(entry => entry.options.name)))
+check('the remember action rides the composer inject face',
+  typeof card?.options?.inject === 'function'
+  && typeof card.options.inject()?.remember === 'function',
+  JSON.stringify(Object.keys(card?.options?.inject?.() ?? {})))
 check('the dictionary is registered for both locales and balanced',
   dictionaries.length === 1 && dictionaries[0].ns === 'dshAllow'
   && Object.keys(dictionaries[0].dicts.zh).length === Object.keys(dictionaries[0].dicts.en).length,
   JSON.stringify(dictionaries.map(entry => entry.ns)))
 
-/** One prompt, the human decision that answered it, and an auto-reviewed call. */
-const ledgerEntries = [
-  { at: '2026-01-01T00:00:00.000Z', origin: 'baseline', decision: 'prompt', callId: 'c1', command: 'rm -rf build', reason: 'filesystem permission required: delete(/w/build)', missing: [{ operation: 'delete', path: '/w/build' }], effects: [], matchedRules: [] },
-  { at: '2026-01-01T00:00:01.000Z', origin: 'human', action: 'allow-once', decision: 'allow', callId: 'c1', command: 'rm -rf build', reason: 'the user allowed this call once', missing: [], effects: [], matchedRules: [] },
-  { at: '2026-01-01T00:00:02.000Z', origin: 'auto-review', decision: 'allow', callId: 'c2', command: 'gh pr list', reason: 'auto review allowed this call once: the user asked', review: { verdict: 'ALLOW', reason: 'the user asked', latencyMs: 12, route: 'deepseek/test' }, missing: [], effects: [], matchedRules: [] },
+console.log('the decision row')
+const chatDefinition = definitions.find(entry => entry.target === 'chat')
+const trajectoryDefinition = definitions.find(entry => entry.target === 'trajectory')
+check('a Chat business definition is registered',
+  definitions.length === 2 && chatDefinition?.kind === 'allow-decision',
+  JSON.stringify(definitions.map(entry => [entry.kind, entry.target])))
+check('and a Trajectory one beside it, from the same event',
+  trajectoryDefinition?.kind === 'trajectory-allow-decision', String(trajectoryDefinition?.kind))
+check('their kinds differ, because the registry keys definitions by kind alone',
+  chatDefinition?.kind !== trajectoryDefinition?.kind,
+  `${String(chatDefinition?.kind)} / ${String(trajectoryDefinition?.kind)}`)
+const decisionEvent = {
+  type: client.DECISION_EVENT,
+  seq: 7,
+  time: 1_700_000_000_000,
+  data: { origin: 'rule', action: null, command: 'rm -rf build', missing: [] },
+}
+check('both claim their own event type only',
+  chatDefinition?.match(decisionEvent)?.role === 'start'
+  && trajectoryDefinition?.match(decisionEvent)?.role === 'start'
+  && chatDefinition?.match({ type: 'tool/call', seq: 1, data: {} }) === null
+  && trajectoryDefinition?.match({ type: 'tool/call', seq: 1, data: {} }) === null,
+  JSON.stringify(chatDefinition?.match(decisionEvent)))
+check('a row renderer is registered under the same kind',
+  registrations.some(entry => entry.options.name === 'conversation.chat.node' && entry.options.key === 'allow-decision'),
+  JSON.stringify(registrations.map(entry => entry.options.name)))
+const decisionContext = {
+  key: 'allow-decision:k',
+  kind: 'allow-decision',
+  id: 'allow:7',
+  state: { seq: 7, record: decisionEvent.data },
+  start: { event: decisionEvent, location: { kind: 'unresolved' } },
+}
+const builtNode = chatDefinition.buildViewNode(decisionContext)
+check('the built node carries the record and its log position',
+  builtNode?.kind === 'allow-decision' && builtNode?.anchorSeq === 7
+  && builtNode?.data === decisionEvent.data && builtNode?.target === 'chat',
+  JSON.stringify(builtNode))
+
+console.log('the trajectory row')
+const trajectoryNode = trajectoryDefinition.buildViewNode({
+  ...decisionContext,
+  state: { seq: 7, time: decisionEvent.time, record: decisionEvent.data },
+})
+check('the trajectory target gets a plugin-extension row',
+  trajectoryNode?.data?.kind === 'node' && trajectoryNode?.data?.node?.kind === 'extension',
+  JSON.stringify(trajectoryNode?.data))
+check('the row text is this plugin symbol plus dictionary copy, not a raw discriminant',
+  trajectoryNode?.data?.node?.text === '📋 logOriginRule · rm -rf build',
+  String(trajectoryNode?.data?.node?.text))
+check('and the payload rides along for the details panel',
+  trajectoryNode?.data?.node?.value === decisionEvent.data
+  && trajectoryNode?.data?.node?.key === client.DECISION_EVENT
+  && trajectoryNode?.data?.node?.time === decisionEvent.time,
+  JSON.stringify(trajectoryNode?.data?.node))
+check('the trajectory definition builds nothing without a matched start',
+  trajectoryDefinition.buildViewNode({ ...decisionContext, state: undefined }) === null)
+const toneOf = (origin) => trajectoryDefinition.buildViewNode({
+  ...decisionContext,
+  state: { seq: 7, time: 0, record: { origin, action: null, command: 'ls' } },
+})?.data?.node?.tone
+const tones = ['rule', 'baseline', 'auto-review', 'human', 'policy']
+  .map(origin => `${origin}=${String(toneOf(origin))}`)
+check('each origin asks for its own ledger tone',
+  tones.join(' ') === 'rule=positive baseline=neutral auto-review=accent human=warning policy=critical',
+  tones.join(' '))
+check('the tone vocabulary is closed: an unknown origin falls back to neutral',
+  toneOf('mystery') === 'neutral', String(toneOf('mystery')))
+const emojiOf = (record) => trajectoryDefinition.buildViewNode({
+  ...decisionContext,
+  state: { seq: 7, time: 0, record: { command: 'ls', ...record } },
+})?.data?.node?.text.split(' ')[0]
+// Colour separates origins; the symbol has to separate the two human outcomes
+// too, which share one origin.
+const symbols = [
+  ['allow once', emojiOf({ origin: 'human', action: 'allow-once' })],
+  ['always allow', emojiOf({ origin: 'human', action: 'always-allow' })],
+  ['denied', emojiOf({ origin: 'human', action: 'deny' })],
+  ['cancelled', emojiOf({ origin: 'human', action: 'cancelled' })],
+  ['no answerer', emojiOf({ origin: 'human', action: 'unavailable' })],
+  ['rule', emojiOf({ origin: 'rule', action: null })],
+  ['baseline', emojiOf({ origin: 'baseline', action: null })],
+  ['auto review', emojiOf({ origin: 'auto-review', action: null })],
+  ['policy', emojiOf({ origin: 'policy', action: null })],
 ]
-check('one call collapses to its strongest record', client.collapse(ledgerEntries).length === 2,
-  JSON.stringify(client.collapse(ledgerEntries).map(entry => entry.origin)))
-check('and the survivor is the human decision', client.collapse(ledgerEntries)[0].action === 'allow-once')
-check('a call with no id keeps its own row',
-  client.collapse([{ origin: 'rule' }, { origin: 'rule' }]).length === 2)
-check('a prompt names what was missing',
-  client.detailOf({ origin: 'baseline', missing: [{ operation: 'delete', path: '/w/build' }], matchedRules: [] }) === 'delete /w/build')
-check('a rule allow names the rule that answered',
-  client.detailOf({ origin: 'rule', missing: [], matchedRules: [{ path: '/w/build', access: { delete: true } }] }) === 'delete /w/build')
-check('a baseline allow names nothing',
-  client.detailOf({ origin: 'baseline', missing: [], matchedRules: [{ path: '/w', access: { read: true } }] }) === '')
+check('every decision category carries its own symbol',
+  new Set(symbols.map(([, symbol]) => symbol)).size === 8,
+  symbols.map(([name, symbol]) => `${name}=${String(symbol)}`).join(' '))
+check('a human denial and the plugin refusing its own share the denial symbol',
+  emojiOf({ origin: 'human', action: 'deny' }) === emojiOf({ origin: 'policy', action: null }),
+  `${String(emojiOf({ origin: 'human', action: 'deny' }))} / ${String(emojiOf({ origin: 'policy', action: null }))}`)
+check('and an unknown origin still gets one',
+  typeof emojiOf({ origin: 'mystery', action: null }) === 'string',
+  String(emojiOf({ origin: 'mystery', action: null })))
 
 if (found === null) {
   console.log('  skip render assertion (set DSH_CHECKOUT to a checkout with React installed)')
@@ -167,25 +242,84 @@ if (found === null) {
   const html = found.server.renderToStaticMarkup(react.createElement(card.component, { matched: pending, t }))
   check('the card renders the approval chrome', html.includes('dsha_card') && html.includes('dsha_strip'), html.slice(0, 200))
   check('the card renders 拒绝 and 允许一次', html.includes('reject') && html.includes('allowOnce'), html)
-  check('the card shows the reason', html.includes('escalate sandbox to danger-full-access'), html)
-  check('the card names the missing operation', html.includes('>delete<'), html)
-  check('the card names the missing path', html.includes('/Users/tester/project/build'), html)
-  check('the card names the command', html.includes('rm -rf build'), html)
-  check('the card shows the sandbox mode', html.includes('workspace-write'), html)
-  check('exactly one always-allow button is offered', html.split('alwaysOne').length - 1 === 1, html)
-  check('and no folder button exists', !html.includes('alwaysFolder') && !html.includes('alwaysFile'), html)
+  check('the card shows the reason the host sent', html.includes('escalate sandbox to danger-full-access'), html)
+  check('an escalation offers no always-allow button: a wider fence is not a stored rule',
+    !html.includes('alwaysAllow'), html)
 
-  hooks = 0
-  plan = [{ status: 'ready', entries: ledgerEntries, truncated: true, error: null }]
-  const logHtml = found.server.renderToStaticMarkup(react.createElement(ledger.component, { sessionId: 's1', t }))
-  check('the ledger renders one row per call', (logHtml.match(/class="dsha_logRow"/gu) ?? []).length === 2, logHtml.slice(0, 400))
-  check('the surviving row is the human decision', logHtml.includes('logOriginHuman') && logHtml.includes('logAllowOnce'), logHtml)
-  check('and the prompt it replaced is gone', !logHtml.includes('logOriginBaseline'), logHtml)
-  check('the ledger shows the command', logHtml.includes('rm -rf build'), logHtml)
-  check('an auto-reviewed row names the verdict, the latency, and the route', logHtml.includes('logReviewer'), logHtml)
-  check('the ledger offers the baseline toggle', logHtml.includes('logShowBaseline'), logHtml)
-  check('and says when older records were cut', logHtml.includes('logTruncated'), logHtml)
-  check('the ledger writes no copy of its own', !/[\u4e00-\u9fff]/u.test(logHtml), logHtml)
+  const policyAsk = { ...pending, reason: 'dsh-allow: delete is not granted in the workspace' }
+  const policyHtml = found.server.renderToStaticMarkup(react.createElement(card.component, { matched: policyAsk, t }))
+  check('a policy ask offers exactly one always-allow button',
+    policyHtml.split('alwaysAllow').length - 1 === 1, policyHtml)
+  check('beside 拒绝 and 允许一次', policyHtml.includes('reject') && policyHtml.includes('allowOnce'), policyHtml)
+  check('and carries the host reason verbatim',
+    policyHtml.includes('delete is not granted in the workspace'), policyHtml)
+  check('the card reads nothing from a host route any more: no detail rows',
+    !policyHtml.includes('dsha_row') && !policyHtml.includes('dsha_meta'), policyHtml)
+
+  const row = registrations.find(entry => entry.options.name === 'conversation.chat.node')
+  const rowHtml = found.server.renderToStaticMarkup(react.createElement(row.component, { node: builtNode, t }))
+  check('the decision row shows its origin and the command',
+    rowHtml.includes('logOriginRule') && rowHtml.includes('rm -rf build'), rowHtml)
+  const refusalHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
+    node: {
+      kind: 'allow-decision',
+      data: {
+        origin: 'policy',
+        action: 'deny',
+        command: null,
+        reason: 'delete is not granted in the workspace',
+        missing: [{ operation: 'delete', path: '/w/build' }],
+      },
+    },
+    t,
+  }))
+  check('a refusal row names the action and the missing capability',
+    refusalHtml.includes('logDeny') && refusalHtml.includes('delete /w/build'), refusalHtml)
+  const humanHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
+    node: { kind: 'allow-decision', data: { origin: 'human', action: 'always-allow', command: 'rm -rf build', missing: [] } },
+    t,
+  }))
+  check('a human decision names the action the user chose',
+    humanHtml.includes('logAlwaysAllow'), humanHtml)
+  const ruleHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
+    node: {
+      kind: 'allow-decision',
+      data: {
+        origin: 'rule', action: null, command: 'ls', matchedRules: [{ path: '/w', operation: null }],
+        rules: [], missing: [],
+      },
+    },
+    t,
+  }))
+  check('a rule allow names the rule path that answered',
+    ruleHtml.includes('logPaths') && ruleHtml.includes('/w'), ruleHtml)
+  const storedHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
+    node: {
+      kind: 'allow-decision',
+      data: {
+        origin: 'human', action: 'always-allow', command: 'ls',
+        rules: [{ path: '/w/build', operation: null }], missing: [],
+      },
+    },
+    t,
+  }))
+  check('an always-allow names the rules the button stored',
+    storedHtml.includes('logStoredRules') && storedHtml.includes('/w/build'), storedHtml)
+  const reviewHtml = found.server.renderToStaticMarkup(react.createElement(row.component, {
+    node: {
+      kind: 'allow-decision',
+      data: {
+        origin: 'auto-review', action: null, command: 'ls', missing: [],
+        review: { verdict: 'ALLOW', latencyMs: 412, route: 'deepseek-chat' },
+      },
+    },
+    t,
+  }))
+  check('an auto-reviewed allow carries its verdict and latency',
+    reviewHtml.includes('logReviewer') && reviewHtml.includes('ALLOW') && reviewHtml.includes('412'), reviewHtml)
+  check('and every row keeps its origin visible for the ledger',
+    rowHtml.includes('data-origin="rule"') && refusalHtml.includes('data-origin="policy"')
+    && humanHtml.includes('data-origin="human"'), rowHtml + refusalHtml + humanHtml)
 }
 
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)

@@ -1,5 +1,5 @@
 ---
-description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / create / delete / execute 文件权限,并在进程沙箱里真正强制;卡片上给「拒绝 / 允许一次 / 总是允许」,另有「审批」标签页显示每次判定是谁拍的板。"
+description: "dsh-allow:按路径给 DSH shell 调用授予 read / write / create / delete / execute 文件权限,并在进程沙箱里真正强制;卡片上给「拒绝 / 允许一次 / 总是允许」,每条判定另在对话里留一行,写明是规则、默认、自动复核、人工还是插件自己拒绝了它。"
 ---
 
 # dsh-allow
@@ -137,7 +137,7 @@ Sandbox:   workspace-write
 
 「允许一次」是真的只允许一次,而且有两道机制防止它横向泄漏:授权绑定到你批准的那一次调用,判定层只在那次调用看得见它;profile 构建时则靠「那次调用正在跑的命令行」再认一次 —— 因为一次 confinement 只知道会话、不知道调用。此外,只要有一条一次性授权还活着,同会话的其它调用都会先等它结算再被判定,所以两次重叠的调用不可能共用一条授权。调用结束时 `tools/post-execute` 立刻丢掉它(十分钟过期只是兜底);它绝不写规则文件,下一次调用仍然会问。
 
-`sandbox_permissions` 提权是「更宽的进程围栏」,不是文件能力,所以**永不自动批准** —— 即使这条命令需要的能力全都已授权。一次批准就等于让命令跑到模式之外,这个决定属于用户。
+`sandbox_permissions` 提权是「更宽的进程围栏」,不是文件能力,所以默认的 `escalation: ask` 把它留给人决定:一次批准就等于让命令跑到模式之外,这是能力规则回答不了的。改成 `escalation: rule` 后,若这条调用已经由某条规则、某个目录基线或一次 auto review 判定放行,它的升级也沿用同一个判定,不再重复询问 —— 用户已经授予了这条命令需要的全部能力,再问一次并不能决定什么新东西。台账会保留那个来源,所以这样被放行的升级不会被读成人工决定。
 
 ## 自动复核(可选)
 
@@ -159,6 +159,8 @@ missing (path, capability)
 | --- | --- |
 | `ALLOW` | 仅当这次请求明显来自用户最新那句话、且范围很窄时。它复用已有的「按调用绑定的一次性授权」—— 和卡片上「允许一次」走同一条路 —— 所以调用被绑定、profile 按命令认领、调用结束即回收。 |
 | `ASK` | 其余一切:不确定、路径比用户要求宽、用户从没提过的敏感路径、没有模型路由、没有 LLM 服务、超时、传输错误、不是 JSON、判定不是这两个值之一。 |
+
+复核失败时会记下这次调用终止在哪个 finish —— 类型、提供方错误码、错误消息 —— 所以「够不到复核模型」会写明原因,而不是只说答不上来。调用带一个很小的答复预算;预算用尽时,模型已经写出的内容仍会交给解析器。
 
 它**永不**拒绝、永不写规则、永不扩大 workspace、永不碰权限库或 sandbox profile,也没有任何审批记忆:持久规则仍然只由用户决定;确定性策略先跑,所以已有规则根本不会走到复核。
 
@@ -183,23 +185,22 @@ missing (path, capability)
     autoReview:
       enabled: false        # off by default; the card stays in charge
       timeoutMs: 10000      # a timeout is an ASK
-      # provider: inherit   # default: the session's latest model/selection route
+      # provider: inherit   # default: the session's latest model/selection route,
+      #                     # else the route its latest request used
       # model: inherit
 ```
 
-三个字段读作:`enabled` 默认关闭, 关着时一切照旧由卡片决定;`timeoutMs` 是按 `ASK` 处理的超时;`provider` / `model` 默认继承会话最近一次 model/selection 路由。
+三个字段读作:`enabled` 默认关闭, 关着时一切照旧由卡片决定;`timeoutMs` 是按 `ASK` 处理的超时;`provider` / `model` 默认继承会话最近一次 model/selection 路由;会话没有选择过时,回退到它最近一次请求实际使用的路由(模型来自 profile 配置的会话就属于这种)。
 
 每次复核都会写日志与审计:命令、请求的能力、判定、理由、耗时、模型路由 —— 不写文件内容、凭据、或隐藏推理。
 
 ## 审批记录
 
-这一层做出的每一个判定都会写进审计日志,而这个日志就摆在判定发生的地方:「对话 / 轨迹」旁边多了一个**审批**标签页。
+这一层做出的每一个判定都会记两处:策略层自己的审计日志,以及一条信息性会话事件(`dsh-allow/decision`)—— 界面从同一份日志把它渲染两次:**对话**里贴着它所回答的那次工具调用一行,**轨迹**账本里再一行。
 
-```
-Conversation views:   Chat  │  Trajectory  │  Approvals
-```
+轨迹那一行不需要插件自己写渲染器:它是一个 `extension` 记录,带着本插件的本地化摘要、色调和原始审计记录 —— 摘要与色调决定那一行的样子,原始记录由共用的详情面板负载页展示。两个视图里同一来源同一种颜色:`rule` 绿、`baseline` 灰、`auto-review` 蓝、`human` 琥珀、`policy` 红。每一行还带一个符号 —— `✅` 允许一次、`♾️` 总是允许、`🚫` 拒绝、`↩️` 已取消、`⌛` 无人应答、`📋` 规则放行、`⚪` 默认放行、`🤖` 自动审核 —— 因为颜色只分得开来源,而人工的两种结局同源。
 
-标签页从审计日志里读回**当前会话**的判定,新的在下,比日志晚三秒:
+一行就是一条事件,所以「询问」和解答它的那次人工决定是两行,这张表跟着事件流水走、不做合并:
 
 | 来源 | 谁拍的板 |
 | --- | --- |
@@ -209,11 +210,9 @@ Conversation views:   Chat  │  Trajectory  │  Approvals
 | `human` | 用户拍的板:允许一次、总是允许(连带按钮写入的规则)、拒绝、已取消、无人应答 |
 | `policy` | 本插件自己拒绝的:平台保护路径,或 shell 语法解析不了的一行 |
 
-默认放行藏在**显示默认放行**后面:工作区里它们是绝大多数,说明的信息也最少。一行代表一次工具调用 —— 询问和解答它的那次人工决定会合并成那唯一一行,所以这张表回答的是「这次是谁拍的板」,而不是回放事件流水。
+这条事件是 log-only(非 surface),并且带 envelope 的 `ignorable` 标记 —— 所以它永远不进模型请求,而一个不认识这个类型的构建会直接跳过它、而不是拒绝整个会话。这里没有任何东西走 HTTP:这一行读的是会话自己的日志,审计文件仍然只是策略层查历史与命中次数的地方。
 
-标签页是只读的。它读 Web 宿主的 `GET /dsh-allow/audit?sessionId=…&limit=…&baseline=1`,宿主按固定块大小从审计日志**尾部**往回读 —— 繁忙的会话从最后一块就答完了,而在没有新写入的情况下再问一次一个字节都不会读。这条路由只走 loopback,不授予任何权限、不写规则、也不回答任何审批。
-
-这个版本之前写下的记录没有 `sessionId`,会话读不回来,所以这张表从这个版本之后的第一个判定开始。
+这个版本之前写下的记录只留在审计文件里,所以会话的这份记录从这个版本之后的第一个判定开始。
 
 ## macOS 后端
 
@@ -269,6 +268,8 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
     rulesFile: /path/to/rules.json          # default $DSH_HOME/dsh-allow.json
     auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
     audit: true                             # false turns the audit log off
+    appendSessionEvents: false              # true also records each decision as a session event
+    escalation: ask                         # ask | rule: who answers a sandbox escalation the rule already covers
     sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
     enforce: auto                           # auto | full | guarded | process | writes | off
     autoReview:                             # optional: let the model answer "allow once"
@@ -280,7 +281,7 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
         access: { read: true, execute: true }
 ```
 
-每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算。
+每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`appendSessionEvents` 默认关闭,打开后每个判定除审计文件外还写一条带 `ignorable` 标记的会话事件(需要能识别该标记的 harness),界面据此在对话与轨迹里显示这些行;`escalation` 取 ask 或 rule —— 取 rule 时,若规则已经放行这条命令,它请求的沙箱升级也直接沿用该规则,不再弹卡片;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算。
 
 dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,并在第一次写入时留成 `<rulesFile>.v2.bak`:那些规则描述的是命令,不是文件能力,无法翻译。
 
@@ -296,7 +297,7 @@ npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start 
 
 `test/reviewer.spec.mjs` 注入模型,覆盖「告诉复核什么」(只有真实用户消息、分析过的权限、固定的 prompt)、各种答案形态(`ALLOW`、`ASK`、带围栏的 JSON、自然语言、未知判定、空答案),以及所有失败路径(没有路由、没有 LLM 服务、provider 抛错、终止错误块、超时、答案不合法)。`test/smoke.mjs` 覆盖闸门接线:`ALLOW` 走既有的按调用一次性授权、规则文件一个字节不改;`ASK`、复核失败、以及复核关闭时,都由卡片接管。
 
-`test/audit.spec.mjs` 不依赖宿主,把审批记录端到端跑一遍:一次判定记成哪个来源、点名了哪些规则;不管卡片是从哪一半回答的,一次人工决定只产出一行;半行、别人的审批、认不出的 outcome 都不能产出记录;尾部读取的块边界、会话过滤与字节上限;以及审计路由的方法、loopback、条数与 baseline 规则。`test/client.smoke.mjs` 另外用 React 渲染这个标签页,断言一次调用一行,且字典之外没有任何文案。
+`test/audit.spec.mjs` 不依赖宿主,把审批记录端到端跑一遍:一次判定记成哪个来源、点名了哪些规则;不管卡片是从哪一半回答的,一次人工决定只产出一行;半行、别人的审批、认不出的 outcome 都不能产出记录;以及 `/allow log` 的渲染。`test/smoke.mjs` 断言每条判定同时以可忽略事件落进会话日志。`test/client.smoke.mjs` 另外用 React 渲染那一行,断言来源徽章、命令和缺失的能力。
 
 `test/sandbox.integration.mjs` 跑的是真内核,覆盖:权限库对任何写入者都拒绝;`rm` / `rmdir` / `rename` / `python -c 'os.remove'` / `node -e 'fs.rmSync'` 全部被拒而写和建正常;再授予 delete 后又能删;单独关闭 write 与 create;读围栏让 `cat` 和 `open().read()` 失败;execute 围栏拒绝未授权二进制;`python → sh` 与 `node → sh` 的孙进程继承全部限制;内核拒绝的 profile 一个字节也不执行;workspace 外写入除非被授权否则一律拒绝。覆盖的内容包括:
 
@@ -314,7 +315,7 @@ CI 的 macOS 任务会设 `DSH_ALLOW_REQUIRE_SEATBELT=1`,把这个跳过变成�
 ## 限制
 
 - 如果一台 Mac 的 `xcode-select` 指向 Xcode bundle,`git`、`python3`、`clang` 都是 exec 进 `/Applications/Xcode*.app/Contents/Developer` 的 shim,而基线够不到那里:它给的是 `/Library/Developer` 下的 Command Line Tools,不是 Xcode 的 developer 目录。这样的宿主得自己开一次 —— `/allow add read,execute /Applications/Xcode.app/Contents/Developer folder` —— 否则策略层允许、内核却拒绝。
-- 「审批」标签页最多读审计日志最后 4 MiB、每次最多 500 条,打开期间每三秒重读一次:超长会话更早的判定会落在这个窗口之外。
+- 每条判定都由会话日志渲染,浏览器手里就有那条日志,所以更长的会话也不会丢掉已经载入的行。
 - 块边界正好落在一行审计记录中间时,那一行会被丢掉,而不是报出一条读不完整的判定。
 - 这个版本之前写下的记录没有 `sessionId`,所以永远不会出现在会话的审批记录里。
 - 被围住的区域仍然可以解析路径:`stat`、列目录会泄漏 metadata,被扣掉的只是文件内容。

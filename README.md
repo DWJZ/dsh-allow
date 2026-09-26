@@ -1,5 +1,5 @@
 ---
-description: "dsh-allow: filesystem permissions (read / write / create / delete / execute) per path for DSH shell calls, enforced in the process sandbox, with deny / allow once / always allow, and an Approvals tab that shows which layer decided each call."
+description: "dsh-allow: filesystem permissions (read / write / create / delete / execute) per path for DSH shell calls, enforced in the process sandbox, with deny / allow once / always allow, and one row per decision in the conversation naming the rule, the baseline, the auto reviewer, the user, or the plugin itself as the layer that answered."
 ---
 
 # dsh-allow
@@ -131,7 +131,7 @@ Sandbox:   workspace-write
 
 `allow once` is genuinely once, and it is kept from leaking sideways by two mechanisms. The grant is bound to the call the user approved, so the decision layer only ever sees it for that call; the profile builder recognises it again by the command line that call is running, because a confinement is told its session but not its call. And while a grant is live, every other call in the same session waits for the holder to settle before it is judged — so two overlapping calls can never share one grant. `tools/post-execute` drops the grant the moment that call settles, with a ten-minute expiry as a backstop; it is never written to the rules file, and the next call asks again.
 
-A `sandbox_permissions` escalation is a wider process fence, not a filesystem capability, so it is **never** approved automatically — not even for a command whose capabilities are all granted. One approval lets a command run outside its mode; that decision belongs to the user.
+A `sandbox_permissions` escalation is a wider process fence, not a filesystem capability, so the default `escalation: ask` keeps it a human decision: one approval lets a command run outside its mode, which the capability rules cannot answer for. With `escalation: rule`, an escalation for a call a rule, a directory baseline, or an auto review already settled follows that same decision instead of asking again: the user has granted every capability the line needs, and re-asking decides nothing new. The ledger keeps that origin, so an escalation answered this way never reads as a human answer.
 
 ## Auto review (optional)
 
@@ -151,6 +151,8 @@ The reviewer is not a security boundary and has exactly two answers:
 | --- | --- |
 | `ALLOW` | only when the request clearly follows from the user's latest message and is narrowly scoped. It reuses the existing call-scoped one-shot grant — the same path the card's `allow once` takes — so the call is bound, the profile carries it by command, and it is spent when the call settles. |
 | `ASK` | everything else: uncertainty, a wider path than the request implies, a sensitive path the user never mentioned, no model route, no LLM service, a timeout, a transport error, a non-JSON answer, or a verdict that is not one of the two. |
+
+A failed review records the terminal finish its call ended on — kind, provider code, and message — so an unreachable reviewer names its cause instead of only reporting that it could not answer. The call is bounded to a small answer budget, and an answer the model did write still reaches the parser when that budget runs out.
 
 It can never deny, never write a rule, never widen the workspace, never touch the permission store or the sandbox profile, and it has no memory of past approvals: persistent rules are still the user's decision alone, and the deterministic policy runs first, so an existing rule never reaches the reviewer.
 
@@ -175,7 +177,8 @@ What it is told is only the analyzed request and the user's own words:
     autoReview:
       enabled: false        # off by default; the card stays in charge
       timeoutMs: 10000      # a timeout is an ASK
-      # provider: inherit   # default: the session's latest model/selection route
+      # provider: inherit   # default: the session's latest model/selection route,
+      #                     # else the route its latest request used
       # model: inherit
 ```
 
@@ -183,13 +186,11 @@ Every review is logged and audited with the command, the requested capabilities,
 
 ## The approval ledger
 
-Every decision this layer makes is audited, and the audit log is readable where the decisions happen: the Conversation area gains an **Approvals** tab beside **Chat** and **Trajectory**.
+Every decision this layer makes is audited twice: the audit log the policy layer owns, and one informational session event (`dsh-allow/decision`) that the interface renders twice from the same log — a row beside the tool call in **Chat**, and a row in the **Trajectory** ledger.
 
-```
-Conversation views:   Chat  │  Trajectory  │  Approvals
-```
+The trajectory row needs no renderer of its own: it is an `extension` record carrying this plugin's localized summary, its tone, and the raw audit record — the summary and tone label the row, and the shared details payload tab shows the record. Each origin has its own colour in both views: `rule` green, `baseline` grey, `auto-review` blue, `human` amber, `policy` red. Every row also leads with a symbol — `✅` allow once, `♾️` always allow, `🚫` denied, `↩️` cancelled, `⌛` no answerer, `📋` rule, `⚪` baseline, `🤖` auto review — because colour separates origins and the two human outcomes share one.
 
-The tab reads the current session's decisions back from the audit log, newest last, three seconds behind it:
+A decision row is one event, so a prompt and the human answer that settled it are two rows and the ledger follows the traffic rather than collapsing it:
 
 | origin | what answered |
 | --- | --- |
@@ -199,11 +200,9 @@ The tab reads the current session's decisions back from the audit log, newest la
 | `human` | the user answered: allow once, always allow (with the rules the button wrote), deny, cancelled, or no answerer |
 | `policy` | this plugin refused on its own: a platform-protected path, or a line the shell grammar cannot parse |
 
-Default allows stay behind **Show default allows**, because inside a workspace they are the overwhelming majority and say the least. One row stands for one tool call: a prompt and the human decision that answered it collapse into that single human row, so the ledger answers "who decided this call" rather than replaying event traffic.
+The event is log-only and carries the envelope's `ignorable` marker, so it never reaches a model request, and a build that does not know the type skips it instead of refusing the session. Nothing here is served over HTTP: the row reads the session's own log, and the audit file stays what the policy layer consults for history and hit counts.
 
-The tab is read-only. It reads `GET /dsh-allow/audit?sessionId=…&limit=…&baseline=1` on the Web host, which walks the audit log backwards in fixed chunks — a busy session answers from the last chunk, and a request that follows no write reads no file at all. The route is loopback-only, grants nothing, writes no rule, and answers no approval.
-
-Records written before this version carry no `sessionId`, so a session's ledger cannot attribute them and starts from the first decision made after the upgrade.
+Records written before this version stay in the audit file only, so a session's ledger starts from the first decision made after the upgrade.
 
 ## The macOS backend
 
@@ -257,6 +256,8 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
     rulesFile: /path/to/rules.json          # default $DSH_HOME/dsh-allow.json
     auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
     audit: true                             # false turns the audit log off
+    appendSessionEvents: false              # true also records each decision as a session event
+    escalation: ask                         # ask | rule: who answers a sandbox escalation the rule already covers
     sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
     enforce: auto                           # auto | full | guarded | process | writes | off
     autoReview:                             # optional: let the model answer "allow once"
@@ -280,7 +281,7 @@ npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start 
 
 `test/reviewer.spec.mjs` injects the model and covers what the reviewer is told (only real user messages, the analyzed permissions, the fixed prompt), every answer shape (`ALLOW`, `ASK`, fenced JSON, prose, an unknown verdict, an empty answer), and every failure path (no route, no LLM service, a provider throw, a terminal error chunk, a timeout, an invalid answer). `test/smoke.mjs` covers the gate integration: an `ALLOW` runs the call through the existing call-scoped one-shot grant and leaves the rules file untouched, while an `ASK`, a failing reviewer and a disabled reviewer all leave the card in charge.
 
-`test/audit.spec.mjs` covers the ledger end to end without a host: which layer a decision records as its origin and which rules it names, the single record one human decision produces whichever half of the card answered, the records a half-written line, a foreign approval or an unrecognized outcome must not produce, the backwards reader's chunk boundaries, session filter and byte cap, and the audit route's method, loopback, limit and baseline rules. `test/client.smoke.mjs` additionally renders the tab through React and asserts one row per call, with no copy outside the dictionary.
+`test/audit.spec.mjs` covers the ledger end to end without a host: which layer a decision records as its origin and which rules it names, the single record one human decision produces whichever half of the card answered, the records a half-written line, a foreign approval or an unrecognized outcome must not produce, and the `/allow log` rendering. `test/smoke.mjs` asserts every decision also lands in the session log as an ignorable event. `test/client.smoke.mjs` renders the decision row through React and asserts its origin badge, its command and the capability it was missing.
 
 `test/sandbox.integration.mjs` runs the real kernel and covers:
 
@@ -298,7 +299,7 @@ CI sets `DSH_ALLOW_REQUIRE_SEATBELT=1` on its macOS job, which turns that skip i
 ## Limits
 
 - A Mac whose `xcode-select` points into an Xcode bundle keeps `git`, `python3` and `clang` behind shims that exec into `/Applications/Xcode*.app/Contents/Developer`, which the baseline does not reach: it grants the Command Line Tools under `/Library/Developer`, not an Xcode developer directory. Such a host opens it once — `/allow add read,execute /Applications/Xcode.app/Contents/Developer folder` — or the kernel refuses those commands while the policy allows them.
-- The Approvals tab reads at most the last 4 MiB of the audit log, 500 records per request, and it re-reads every three seconds while it is open: the older decisions of a very long session fall outside that window.
+- A decision row is rendered from the session log the browser already holds, so a session longer than that window keeps every row it loaded.
 - A chunk boundary that lands inside an audit line drops that line from an answer, rather than reporting a decision the reader could not parse.
 - Records written before this version carry no `sessionId`, so they never appear in a session's ledger.
 - Path resolution still works inside the fenced areas: `stat` and directory listing leak metadata, only file contents are withheld.

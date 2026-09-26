@@ -115,8 +115,8 @@ console.log('installing on the registered provider')
 function fakeProvider() {
   return {
     calls: [],
-    confine(argv, policy) {
-      this.calls.push({ argv, policy })
+    async confine(argv, policy, signal) {
+      this.calls.push({ argv, policy, signal })
       return { argv: ['original', ...argv], enforcement: 'full', denialSignatures: ['read-only file system'], runnerFailureRules: [] }
     },
   }
@@ -127,13 +127,29 @@ const ctx = { get: name => (name === 'sandbox' ? provider : undefined) }
 const enforcer = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: okSpawn, ...runnerPresent })
 check('install wraps the provider', enforcer.install(ctx) === true)
 const policy = { mode: 'workspace-write', workspaceRoot: WORKSPACE }
-const confined = provider.confine(['bash', '-c', 'rm -rf build'], policy)
+const pending = provider.confine(['bash', '-c', 'rm -rf build'], policy)
+check('the wrapped confine returns a promise, as the provider contract requires', typeof pending?.then === 'function')
+const confined = await pending
 check('the caller gets the Seatbelt argv', confined.argv[0] === '/usr/bin/sandbox-exec' && confined.argv[1] === '-p', JSON.stringify(confined.argv.slice(0, 2)))
 check('and its own command', confined.argv.slice(-3).join(' ') === 'bash -c rm -rf build', JSON.stringify(confined.argv.slice(-3)))
 check('with the denial dialect the shell tool classifies', confined.denialSignatures.includes('operation not permitted'))
 check('and a runner-failure rule for a profile the kernel refuses',
   confined.runnerFailureRules[0]?.fatalSignatures?.[0] === 'sandbox-exec: ')
 check('the status reports full enforcement', enforcer.status().state === 'full', JSON.stringify(enforcer.status()))
+
+const delegated = new AbortController()
+await provider.confine(['bash', '-c', 'true'], { ...policy, mode: 'danger-full-access' }, delegated.signal)
+check('the delegated branch forwards the caller signal', provider.calls.at(-1)?.signal === delegated.signal)
+const aborted = new AbortController()
+aborted.abort()
+let abortedThrew = false
+try {
+  await provider.confine(['bash', '-c', 'true'], policy, aborted.signal)
+}
+catch {
+  abortedThrew = true
+}
+check('an already-aborted call fails before the fence is compiled', abortedThrew)
 
 console.log('what a session grant does to the profile')
 const sessionPolicy = { mode: 'workspace-write', workspaceRoot: WORKSPACE, sessionId: 's1' }
@@ -158,25 +174,26 @@ check('a command the builder cannot read carries no grant',
 console.log('delegating what it cannot refine')
 const other = fakeProvider()
 enforcer.uninstall()
+const restored = await provider.confine(['x'], policy)
 check('uninstall restores the provider method',
-  provider.confine(['x'], policy).argv[0] === 'original', JSON.stringify(provider.confine(['x'], policy).argv))
+  restored.argv[0] === 'original', JSON.stringify(restored.argv))
 const nonDarwin = enforce.createEnforcer({ config, grants, logger, platform: 'linux', spawn: okSpawn, ...runnerPresent })
 nonDarwin.install({ get: () => other })
 check('a non-darwin host delegates to the original',
-  other.confine(['bash', '-c', 'ls'], policy).argv[0] === 'original')
+  (await other.confine(['bash', '-c', 'ls'], policy)).argv[0] === 'original')
 check('and reports that nothing is enforced', nonDarwin.status().state === 'off', JSON.stringify(nonDarwin.status()))
 
 const offProvider = fakeProvider()
 const offEnforcer = enforce.createEnforcer({ config: { ...config, enforce: 'off' }, grants, logger, platform: 'darwin', spawn: okSpawn, ...runnerPresent })
 offEnforcer.install({ get: () => offProvider })
-check('enforce: off delegates too', offProvider.confine(['bash', '-c', 'ls'], policy).argv[0] === 'original')
+check('enforce: off delegates too', (await offProvider.confine(['bash', '-c', 'ls'], policy)).argv[0] === 'original')
 check('and says why', offEnforcer.status().reason.includes('disabled'), offEnforcer.status().reason)
 
 console.log('a kernel that refuses the full read fence')
 const partialProvider = fakeProvider()
 const partial = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: readRefusing, ...runnerPresent })
 partial.install({ get: () => partialProvider })
-const partialConfined = partialProvider.confine(['bash', '-c', 'echo hi'], policy)
+const partialConfined = await partialProvider.confine(['bash', '-c', 'echo hi'], policy)
 check('the call still runs under a profile', partialConfined.argv[0] === '/usr/bin/sandbox-exec')
 check('one with the guarded read fence instead',
   partialConfined.argv[2].includes('(deny file-read-data (subpath "/Users"))')
@@ -201,7 +218,7 @@ const unbacked = fakeProvider()
 const noRunner = enforce.createEnforcer({ config, grants, logger, platform: 'darwin', spawn: okSpawn, exists: () => false })
 check('the enforcer still installs', noRunner.install({ get: () => unbacked }) === true)
 check('but delegates every confinement to the provider',
-  unbacked.confine(['bash', '-c', 'ls'], policy).argv[0] === 'original')
+  (await unbacked.confine(['bash', '-c', 'ls'], policy)).argv[0] === 'original')
 check('and reports why nothing is enforced',
   noRunner.status().state === 'off' && noRunner.status().reason.includes('is not installed'),
   JSON.stringify(noRunner.status()))

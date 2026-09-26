@@ -282,7 +282,11 @@ export function createEnforcer({
       }
       provider = found
       original = found.confine
-      found.confine = (argv, policy) => {
+      found.confine = async (argv, policy, signal) => {
+        // The provider contract carries cancellation on the call, so an
+        // already-aborted call must fail before either branch runs and the
+        // delegated branch must forward the signal it was given.
+        signal?.throwIfAborted()
         let profile = null
         try {
           profile = refine(argv, policy)
@@ -293,7 +297,7 @@ export function createEnforcer({
           report.reason = `profile compilation failed: ${error instanceof Error ? error.message : String(error)}`
           logger.warn(`dsh-allow: ${report.reason}; refusing to widen the fence`)
         }
-        if (profile === null) return original.call(provider, argv, policy)
+        if (profile === null) return await original.call(provider, argv, policy, signal)
         return {
           argv: [SANDBOX_EXEC, '-p', profile, '--', ...argv],
           enforcement: report.state === 'full' ? 'full' : 'partial',

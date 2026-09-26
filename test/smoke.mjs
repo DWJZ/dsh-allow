@@ -22,7 +22,7 @@ const HOME = '/Users/tester'
 const WORKSPACE = `${HOME}/project`
 const CWD = WORKSPACE
 const config = {
-  ...store.resolveConfig({ rulesFile, auditFile, audit: true }, root),
+  ...store.resolveConfig({ rulesFile, auditFile, audit: true, appendSessionEvents: true }, root),
   harnessHome: root,
 }
 
@@ -36,7 +36,14 @@ const check = (name, condition, detail = '') => {
 }
 
 const logger = { info: () => {}, warn: () => {}, error: () => {} }
-const session = { id: 's1', seq: 0, header: { cwd: CWD }, eventAt: () => undefined }
+const decisionEvents = []
+const session = {
+  id: 's1',
+  seq: 0,
+  header: { cwd: CWD },
+  eventAt: () => undefined,
+  append: (type, data, opts) => { decisionEvents.push({ type, data, opts }); return { type, data } },
+}
 const otherSession = { id: 's2', seq: 0, header: { cwd: CWD }, eventAt: () => undefined }
 const exec = (command, { name = 'bash', callId = 'c1', workdir, agent = { session } } = {}) => ({
   name,
@@ -49,50 +56,18 @@ const pendings = store.createPendingStore()
 const grants = store.createGrantStore()
 const engine = host.createEngine({ config, home: HOME, grants, pendings, ctx })
 const gate = host.createGate({ engine, pendings, logger, config })
-const approval = host.createApprovalListener({ engine, pendings, logger })
+const approval = host.createApprovalListener({ engine, pendings, logger, config })
 
 let nextCalls = 0
 const next = () => { nextCalls += 1; return Promise.resolve({ kind: 'allow' }) }
 
-/** A Web route request. */
-function fakeRequest({ method = 'GET', url = '/', headers = {}, body, remoteAddress = '127.0.0.1' } = {}) {
-  return {
-    method,
-    url,
-    headers: { host: '127.0.0.1:3080', ...headers },
-    socket: { remoteAddress },
-    async *[Symbol.asyncIterator]() {
-      if (body !== undefined) yield Buffer.from(body)
-    },
-  }
-}
+const rememberCall = host.createRememberCall({ pendings, config, logger })
+const runAllow = rawInput => host.runAllowCommand({
+  file: rulesFile,
+  auditFile,
+  remember: callId => rememberCall('s1', callId),
+}, rawInput)
 
-/** A response object recording what a handler wrote. */
-function fakeResponse() {
-  return {
-    statusCode: 0,
-    body: '',
-    writeHead(code) { this.statusCode = code },
-    end(chunk) { if (chunk !== undefined) this.body += String(chunk) },
-  }
-}
-
-/** Drive one route handler and return its parsed answer. */
-async function call(handler, request) {
-  const response = fakeResponse()
-  await handler(request, response)
-  return { status: response.statusCode, json: response.body === '' ? null : JSON.parse(response.body) }
-}
-
-const post = (path, body) => fakeRequest({
-  method: 'POST',
-  url: path,
-  headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
-  body: JSON.stringify(body),
-})
-const pendingHandler = host.createPendingHandler({ pendings })
-const rememberHandler = host.createRememberHandler({ pendings, config, logger })
-const onceHandler = host.createOnceHandler({ pendings, grants, logger })
 
 console.log('rule store')
 rmSync(rulesFile, { force: true })
@@ -144,23 +119,10 @@ check('a non-shell tool is untouched', decision.kind === 'allow' && nextCalls ==
 decision = await gate(exec('rm -rf /System/Library/x', { callId: 'cf' }), next)
 check('a platform-protected path is denied outright', decision.kind === 'deny', JSON.stringify(decision))
 
-console.log('card routes')
-let answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1' }))
-check('the pending route describes the decision', answer.status === 200 && answer.json.rememberable === true, JSON.stringify(answer.json))
-check('and lists the operation and the path', answer.json.missing[0].operation === 'delete'
-  && answer.json.missing[0].path === `${WORKSPACE}/build`, JSON.stringify(answer.json.missing))
-check('and the sandbox mode', answer.json.mode === 'workspace-write', JSON.stringify(answer.json.mode))
-answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=nope' }))
-check('an unknown pending is a 404', answer.status === 404)
-answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending?sessionId=s1&callId=c1', remoteAddress: '10.0.0.9' }))
-check('a non-loopback read is refused', answer.status === 403)
-answer = await call(pendingHandler, fakeRequest({ url: '/dsh-allow/pending', method: 'POST' }))
-check('a wrong method is refused', answer.status === 405)
-
-console.log('always allow')
-answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c1' }))
-check('remembering succeeds', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
-check('and writes exactly one rule, the one the button named', store.readRules(rulesFile).length === 1
+console.log('always allow through the command channel')
+let answer = runAllow('remember c1')
+check('remembering succeeds', answer.kind === 'success', JSON.stringify(answer))
+check('and writes exactly one rule, the one the gate derived', store.readRules(rulesFile).length === 1
   && store.readRules(rulesFile)[0].path === `${WORKSPACE}/build`
   && store.readRules(rulesFile)[0].recursive === false
   && store.readRules(rulesFile)[0].access.delete === true, JSON.stringify(store.readRules(rulesFile)))
@@ -168,27 +130,28 @@ decision = await gate(exec('rm -rf build'), next)
 check('the same command no longer asks', decision.kind === 'allow', JSON.stringify(decision))
 decision = await gate(exec('rm -rf build/nested', { callId: 'c6' }), next)
 check('a path beside it still asks: the folder was not opened', decision.kind === 'ask', JSON.stringify(decision))
-answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c6' }))
-check('and its own grant stays narrow too', answer.status === 200
+answer = runAllow('remember c6')
+check('and its own grant stays narrow too', answer.kind === 'success'
   && store.readRules(rulesFile).length === 2
   && store.readRules(rulesFile)[1].path === `${WORKSPACE}/build/nested`
   && store.readRules(rulesFile)[1].recursive === false, JSON.stringify(store.readRules(rulesFile)))
 decision = await gate(exec('rm -rf build/nested', { callId: 'c7' }), next)
 check('which then covers that path', decision.kind === 'allow', JSON.stringify(decision))
-answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'c1' }))
-check('remembering a stale approval is a 404', answer.status === 404)
-answer = await call(rememberHandler, fakeRequest({
-  method: 'POST', url: '/dsh-allow/remember', headers: { origin: 'http://evil.invalid' }, body: '{}',
-}))
-check('a cross-origin write is refused', answer.status === 403)
+answer = runAllow('remember c1')
+check('remembering a stale approval is refused', answer.kind === 'error', JSON.stringify(answer))
+answer = runAllow('remember')
+check('remembering without a call id is a usage error', answer.kind === 'error', JSON.stringify(answer))
 
-console.log('allow once')
+console.log('allow once is the approval answer itself')
+const grantApproval = (callId, outcome) => host
+  .createApprovalListener({ engine, pendings, grants, logger, config })
+  ({ agent: { session }, callId }, async () => outcome)
 await gate(exec('rm -rf unopened', { callId: 'c2' }), next)
 check('a second path is pending', pendings.get('s1', 'c2') !== null)
 const rulesBefore = store.readRules(rulesFile).length
-answer = await call(onceHandler, post('/dsh-allow/once', { sessionId: 's1', callId: 'c2' }))
-check('the once route grants it', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
-check('as a one-shot rule, not a stored one', grants.rulesFor('s1', 'c2').length > 0
+const onceOutcome = await grantApproval('c2', 'allowed-once')
+check('the waterfall answer is returned unchanged', onceOutcome === 'allowed-once')
+check('and the listener minted the one-shot grant itself', grants.rulesFor('s1', 'c2').length > 0
   && grants.rulesFor('s1', 'c2')[0].source === 'session'
   && store.readRules(rulesFile).length === rulesBefore, JSON.stringify(grants.rulesFor('s1', 'c2')))
 decision = await gate(exec('rm -rf unopened', { callId: 'c2' }), next)
@@ -199,8 +162,6 @@ decision = await gate(exec('rm -rf unopened', { callId: 'c4', agent: { session: 
 check('and another session always asks', decision.kind === 'ask', JSON.stringify(decision))
 decision = await gate(exec('rm -rf build', { callId: 'c5', agent: { session: otherSession } }), next)
 check('the stored rule holds for every session', decision.kind === 'allow', JSON.stringify(decision))
-
-console.log('a one-shot grant is spent by the call it was given to')
 const settle = host.createSettleListener({ grants, logger })
 check('the one-shot is still live for its call', grants.rulesFor('s1', 'c2').length === 1)
 check('the profile sees it only for the approved command',
@@ -259,7 +220,7 @@ const escalation = (command, callId, id = 's3') => ({
   callId,
 })
 let outcome = await approval(escalation('rm -rf build', 'e1'), next)
-check('an escalation is never approved automatically, even for a granted command',
+check('under the default "ask" policy an escalation always reaches the card',
   outcome?.kind === 'allow', JSON.stringify(outcome))
 check('and it is on the card', pendings.get('s3', 'e1') !== null)
 outcome = await approval(escalation('rm -rf /System/Library/x', 'e2'), next)
@@ -349,6 +310,45 @@ console.log('auto reviewer')
   const reviewSettle = host.createSettleListener({ grants: reviewGrants, logger })
   await reviewSettle(exec('rm -rf review-only', { callId: 'rc1', agent: { session: reviewSession } }), { kind: 'accepted' }, next)
   check('K: the grant is spent when the call settles', reviewGrants.rulesFor('sr1', 'rc1').length === 0)
+
+  // An auto-review ALLOW is a decision the user already delegated, so the
+  // escalation of that same call follows it instead of asking again.
+  const recorded = store.createPendingStore()
+  const followedConfig = { ...reviewConfig, escalation: 'rule', auditFile: reviewAudit }
+  const followedGate = host.createGate({
+    engine: reviewEngine,
+    pendings: reviewPendings,
+    logger,
+    config: followedConfig,
+    grants: reviewGrants,
+    reviewer: reviewerModule.createReviewer({ config: reviewConfig, logger, llmOf: () => scripted('{"verdict":"ALLOW","reason":"same"}') }),
+    ruleAllows: recorded,
+  })
+  const followedDecision = await followedGate(
+    exec('rm -rf review-only', { callId: 'rc9', agent: { session: reviewSession } }), next,
+  )
+  check('an auto-review ALLOW settles the call', followedDecision.kind === 'allow', JSON.stringify(followedDecision))
+  let reviewAsked = 0
+  const reviewFollowed = await host.createApprovalListener({
+    engine: reviewEngine,
+    pendings: reviewPendings,
+    grants: reviewGrants,
+    logger,
+    config: followedConfig,
+    ruleAllows: recorded,
+  })({ agent: { session: reviewSession }, callId: 'rc9' }, async () => { reviewAsked += 1; return 'allowed-once' })
+  check('its escalation follows the review instead of asking again',
+    reviewAsked === 0 && reviewFollowed === 'allowed-once', `asked=${String(reviewAsked)} outcome=${String(reviewFollowed)}`)
+  const followedRows = readFileSync(reviewAudit, 'utf8').trim().split('\n')
+    .map(line => { try { return JSON.parse(line) } catch { return null } })
+    .filter(entry => entry !== null && entry.callId === 'rc9')
+  check('and the ledger keeps auto review as the origin',
+    followedRows.some(entry => entry.origin === 'auto-review' && entry.action === 'allow-once')
+    && !followedRows.some(entry => entry.origin === 'human'),
+    JSON.stringify(followedRows.map(entry => [entry.origin, entry.action])))
+  await reviewSettle(exec('rm -rf review-only', { callId: 'rc9', agent: { session: reviewSession } }), { kind: 'accepted' }, next)
+  check('and its one-shot grant is spent like any other',
+    reviewGrants.rulesFor('sr1', 'rc9').length === 0)
 
   llm = scripted('{"verdict":"ASK","reason":"the request is not clearly the user\'s"}')
   gateReview = gateWith(llm)
@@ -448,14 +448,22 @@ check('every listener is prepended', registered.listeners.every(entry => entry.o
 check('the gate listens on tools/pre-execute', registered.listeners.some(entry => entry.name === 'tools/pre-execute'))
 check('the card listens on approval/request', registered.listeners.some(entry => entry.name === 'approval/request'))
 check('the one-shot grants settle on tools/post-execute', registered.listeners.some(entry => entry.name === 'tools/post-execute'))
-check('all four routes are registered',
-  registered.routes.map(route => route.path).join(',') === '/dsh-allow/pending,/dsh-allow/remember,/dsh-allow/once,/dsh-allow/audit',
-  JSON.stringify(registered.routes.map(route => route.path)))
+check('no Web route is exposed at all',
+  registered.routes.length === 0, JSON.stringify(registered.routes.map(route => route.path)))
 check('/allow is registered', registered.commands[0]?.name === 'allow')
 check('the process fence is installed as an effect', registered.effects.length >= 1)
 check('a bad config fails loud', (() => {
   try {
     host.apply(pluginCtx, { sessionGrantTtlMs: -1 })
+    return false
+  }
+  catch {
+    return true
+  }
+})())
+check('a non-boolean session-event switch fails loud', (() => {
+  try {
+    store.resolveConfig({ appendSessionEvents: 'yes' }, root)
     return false
   }
   catch {
@@ -472,6 +480,98 @@ check('an ordinary file write is left to the harness fence',
   (await gate({ name: 'write', callId: 'w3', arguments: { path: join(WORKSPACE, 'notes.md'), content: 'x' }, agent: { session } }, next)).kind === 'allow')
 check('an unknown tool is untouched',
   (await gate({ name: 'present', callId: 'w4', arguments: {}, agent: { session } }, next)).kind === 'allow')
+
+console.log('session decision events')
+const switchEvents = []
+const switchSession = {
+  id: 's-switch',
+  seq: 0,
+  header: { cwd: CWD },
+  eventAt: () => undefined,
+  append: (type, data, opts) => { switchEvents.push({ type, data, opts }); return { type, data } },
+}
+const probe = { tool: 'bash', origin: 'rule', decision: 'allow' }
+host.recordDecision(store.resolveConfig({ rulesFile, auditFile }, root), probe, switchSession)
+check('a decision writes no session event until a deployment asks for it',
+  switchEvents.length === 0, JSON.stringify(switchEvents))
+host.recordDecision(store.resolveConfig({ rulesFile, auditFile, appendSessionEvents: true }, root), probe, switchSession)
+check('and writes exactly one, marked, once the switch is on',
+  switchEvents.length === 1 && switchEvents[0].opts?.ignorable === true, JSON.stringify(switchEvents))
+check('the audit file is written either way',
+  readFileSync(auditFile, 'utf8').trim().split('\n').length >= 2, String(switchEvents.length))
+
+const decided = decisionEvents.filter(entry => entry.type === host.DECISION_EVENT)
+check('every decision this session judged also lands in its log', decided.length > 0, String(decided.length))
+check('each carries the marker a reader without this plugin needs to skip it',
+  decided.every(entry => entry.opts?.ignorable === true), JSON.stringify(decided.map(entry => entry.opts)))
+check('a stored rule is recorded as a rule allow',
+  decided.some(entry => entry.data.origin === 'rule' && entry.data.decision === 'allow'),
+  JSON.stringify(decided.map(entry => [entry.data.origin, entry.data.decision])))
+check('a platform-protected path is recorded as a policy refusal',
+  decided.some(entry => entry.data.origin === 'policy' && entry.data.action === 'deny'),
+  JSON.stringify(decided.map(entry => [entry.data.origin, entry.data.action])))
+check('a human decision is recorded with the action the user chose',
+  decided.some(entry => entry.data.origin === 'human' && entry.data.action === 'allow-once'),
+  JSON.stringify(decided.map(entry => [entry.data.origin, entry.data.action])))
+check('the payload is the redacted audit record, never a live reference',
+  decided.every(entry => entry.data !== undefined && typeof entry.data === 'object'),
+  JSON.stringify(decided[0]?.data))
+
+console.log('rule-settled sandbox escalations')
+{
+  store.addRule(rulesFile, { path: `${WORKSPACE}/build`, recursive: true, access: { delete: true } })
+  const settled = store.createPendingStore()
+  const escPendings = store.createPendingStore()
+  const escGrants = store.createGrantStore({ ttlMs: 600000 })
+  const askConfig = { ...store.resolveConfig({ rulesFile, auditFile }, root), harnessHome: root, home: HOME }
+  const ruleConfig = {
+    ...store.resolveConfig({ rulesFile, auditFile, escalation: 'rule' }, root), harnessHome: root, home: HOME,
+  }
+  const escEngine = host.createEngine({ config: ruleConfig, home: HOME, grants: escGrants, pendings: escPendings, ctx })
+  const escGate = host.createGate({
+    engine: escEngine, pendings: escPendings, logger, config: ruleConfig, grants: escGrants, ruleAllows: settled,
+  })
+  const escListener = cfg => host.createApprovalListener({
+    engine: escEngine, pendings: escPendings, grants: escGrants, logger, config: cfg, ruleAllows: settled,
+  })
+  const covered = await escGate(exec('rm -rf build', { callId: 'esc1' }), next)
+  check('a rule-covered call runs without a card', covered.kind === 'allow', JSON.stringify(covered))
+
+  let asked = 0
+  const handled = await escListener(askConfig)(
+    { agent: { session }, callId: 'esc1' },
+    async () => { asked += 1; return 'allowed-once' },
+  )
+  check('the default escalation policy hands the escalation to the card',
+    asked === 1 && handled === 'allowed-once', `asked=${String(asked)} outcome=${String(handled)}`)
+
+  const coveredAgain = await escGate(exec('rm -rf build', { callId: 'esc2' }), next)
+  check('a second rule-covered call runs without a card', coveredAgain.kind === 'allow', JSON.stringify(coveredAgain))
+  let askedAgain = 0
+  const followed = await escListener(ruleConfig)(
+    { agent: { session }, callId: 'esc2' },
+    async () => { askedAgain += 1; return 'allowed-once' },
+  )
+  check('escalation "rule" answers it from the rule and never reaches the card',
+    askedAgain === 0 && followed === 'allowed-once', `asked=${String(askedAgain)} outcome=${String(followed)}`)
+
+  const audited = readFileSync(auditFile, 'utf8').trim().split('\n')
+    .map(line => { try { return JSON.parse(line) } catch { return null } })
+    .filter(entry => entry !== null && entry.callId === 'esc2')
+  check('and audits it as the rule it followed, never as a human answer',
+    audited.some(entry => entry.origin === 'rule' && entry.action === 'allow-once')
+    && !audited.some(entry => entry.origin === 'human'),
+    JSON.stringify(audited.map(entry => [entry.origin, entry.action])))
+  check('a non-vocabulary escalation policy fails loud', (() => {
+    try {
+      store.resolveConfig({ escalation: 'always' }, root)
+      return false
+    }
+    catch {
+      return true
+    }
+  })())
+}
 
 rmSync(root, { recursive: true, force: true })
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)

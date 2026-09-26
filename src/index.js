@@ -11,10 +11,10 @@
  *       prompt: raise the approval card (deny / always allow / allow once)
  *       forbidden: refuse outright — the platform protects that path
  *
- * The card consults this process through three loopback routes, because the
- * browser knows only the session id and call id: `/pending` describes what is
- * missing, `/remember` writes a persistent rule, and `/once` grants the
- * capability for this session only. Nothing here is remembered as command text.
+ * The card reaches this process through the harness's own channels, never a Web
+ * route: "allow once" is the approval waterfall's return value, which this half
+ * observes and turns into a session grant, and "always allow" arrives as the
+ * `/allow remember <callId>` command. Nothing here is remembered as command text.
  */
 import { homedir } from 'node:os'
 import { canonicalPath, describeRule, protectedRefusal } from './fspolicy.js'
@@ -23,7 +23,7 @@ import { createEnforcer } from './enforce.js'
 import { createReviewer } from './reviewer.js'
 import {
   addRule, appendAudit, clearRules, countHit, createDecisionLog, createGrantStore, createPendingStore,
-  readAuditTail, readRules, removeRule, resolveConfig, resolveHome,
+  readAuditTail, readRules, redact, removeRule, resolveConfig, resolveHome,
 } from './store.js'
 
 /** Stable Cordis plugin name. */
@@ -38,10 +38,10 @@ export const POLICY_REASON_PREFIX = 'dsh-allow: '
 /** How many trailing session events one tool-call lookup scans. */
 const MAX_SCAN_EVENTS = 2000
 
-/** Default answer size of the audit route. */
+/** Default answer size of `/allow log`. */
 const AUDIT_PAGE = 200
 
-/** Largest answer the audit route will build, however the caller asks. */
+/** Largest answer `/allow log` will build, however the caller asks. */
 const AUDIT_PAGE_MAX = 500
 
 /**
@@ -200,7 +200,7 @@ export function createEngine({ config, home, grants, pendings, ctx = null, enfor
       unknown: decision.unknown.map(entry => entry.reason),
       matchedRules: matchedRulesOf(decision.usedRules),
     }
-    if (config.audit && !silent && !deferAudit) appendAudit(config.auditFile, audit)
+    if (config.audit && !silent && !deferAudit) recordDecision(config, audit, exec?.agent?.session ?? null)
     return { decision, policy, workspaceRoot, audit }
   }
 
@@ -277,7 +277,22 @@ export function fileTargetOf(exec) {
  *   grants, the reviewer, and the logger.
  * @returns the waterfall listener.
  */
-export function createGate({ engine, pendings, logger, config = null, grants = null, reviewer = null }) {
+export function createGate({ engine, pendings, logger, config = null, grants = null, reviewer = null, ruleAllows = null }) {
+  // Remember which non-human decision settled this call, so a later escalation
+  // can follow the same decision instead of reaching the user. Only decisions
+  // the user already made once — a rule, a directory baseline, or an auto review
+  // — qualify; anything else leaves the escalation to the card.
+  const markSettled = (exec, origin, audit, command, cwd) => {
+    if (ruleAllows === null) return
+    if (origin !== 'rule' && origin !== 'baseline' && origin !== 'auto-review') return
+    ruleAllows.remember(exec?.agent?.session?.id, exec?.callId, {
+      origin,
+      command,
+      cwd,
+      mode: audit?.mode ?? null,
+      matchedRules: audit?.matchedRules ?? [],
+    })
+  }
   return async (exec, next) => {
     if (grants !== null) await waitForGrantHolder(grants, exec, logger)
     const command = commandOf(exec)
@@ -289,7 +304,7 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
       if (refusal === null) return next()
       logger.warn(`dsh-allow: denied a ${String(exec?.name)} of ${path} — ${refusal}`)
       if (config?.audit === true) {
-        appendAudit(config.auditFile, {
+        recordDecision(config, {
           tool: exec?.name ?? 'unknown',
           cwd: cwdOf(exec),
           command: null,
@@ -300,7 +315,7 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
           sessionId: exec?.agent?.session?.id ?? null,
           callId: typeof exec?.callId === 'string' ? exec.callId : null,
           matchedRules: [],
-        })
+        }, exec?.agent?.session ?? null)
       }
       return {
         kind: 'deny',
@@ -312,7 +327,8 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
     const context = engine.decide({ exec, command, cwd, deferAudit: reviewing })
     const { decision } = context
     if (decision.decision === 'allow') {
-      if (reviewing) appendAudit(auditTarget(config), context.audit)
+      if (reviewing) recordDecision(config, context.audit, exec?.agent?.session ?? null)
+      markSettled(exec, context.audit?.origin, context.audit, command, cwd)
       return next()
     }
     if (decision.decision === 'prompt' && reviewing) {
@@ -336,24 +352,25 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
         // The same one-shot grant the card would write: bound to this call,
         // carried into the profile by its command, spent when the call settles.
         grants.grant(exec?.agent?.session?.id, exec?.callId, command, decision.suggestions)
-        appendAudit(auditTarget(config), {
+        recordDecision(config, {
           ...record,
           decision: 'allow',
           origin: 'auto-review',
           reason: `auto review allowed this call once: ${review.reason}`,
-        })
+        }, exec?.agent?.session ?? null)
         logger.info(`dsh-allow: auto review allowed this call once — ${review.reason}`)
+        markSettled(exec, 'auto-review', record, command, cwd)
         return next()
       }
-      appendAudit(auditTarget(config), {
+      recordDecision(config, {
         ...record,
         decision: 'prompt',
         reason: `auto review deferred to the user: ${review.reason}`,
-      })
+      }, exec?.agent?.session ?? null)
     } else if (reviewing) {
       // The reviewer answers prompts only; a decision it was never asked about
       // still owes the one audit record this layer deferred.
-      appendAudit(auditTarget(config), context.audit)
+      recordDecision(config, context.audit, exec?.agent?.session ?? null)
     }
     remember(pendings, exec, context, command, cwd)
     if (decision.decision === 'forbidden') {
@@ -404,6 +421,34 @@ function auditTarget(config) {
   return config.auditFile ?? null
 }
 
+/** Session event type this plugin records each policy decision under. */
+export const DECISION_EVENT = 'dsh-allow/decision'
+
+/**
+ * Record one decision: the audit line this layer owns, and — when the deployment
+ * enabled it and the deciding session is live — an informational session event the
+ * Conversation renders as a row beside the call it answered.
+ *
+ * The event carries the envelope's `ignorable` marker, so a build that does not
+ * know this type skips it instead of refusing the whole session. Its payload is
+ * the same redacted record the audit file holds, so a log reader sees exactly
+ * what an audit line holds and nothing more.
+ *
+ * The audit file follows the `audit` switch. The event follows
+ * `appendSessionEvents`, which is off by default: a reader only accepts the
+ * marker from a build that honours it, so a deployment asks for the rows rather
+ * than receiving them unasked.
+ * @param config - resolved plugin configuration (the audit and session-event switches).
+ * @param audit - the decision record.
+ * @param session - the deciding session, when the caller holds it.
+ */
+export function recordDecision(config, audit, session = null) {
+  appendAudit(auditTarget(config), audit)
+  if (config?.appendSessionEvents !== true) return
+  if (session === null || session === undefined || typeof session.append !== 'function') return
+  session.append(DECISION_EVENT, JSON.parse(redact(JSON.stringify(audit))), { ignorable: true })
+}
+
 /** The recorded action one approval outcome stands for. */
 const OUTCOME_ACTIONS = {
   'allowed-once': 'allow-once',
@@ -442,17 +487,20 @@ function describeHumanAction(action, note) {
 /**
  * Record the one audit line a human decision produces, and drop the state that
  * carried it: the pending record (written by the gate or the escalation
- * listener) and the note the card left (written by `/once` or `/remember`).
+ * listener) and the note `/allow remember` left.
  *
- * The callback's action wins over the outcome, because the card reports both —
- * it calls the grant route and then settles the approval as `allowed-once`
- * either way. With neither a pending record nor a note there is nothing this
- * plugin judged, so a foreign approval leaves no line.
+ * The callback's action wins over the outcome, because both paths settle the
+ * approval as `allowed-once` either way. With neither a pending record nor a
+ * note there is nothing this plugin judged, so a foreign approval leaves no line.
  * @param options - configuration, the pending store, and the decision log.
- * @param decision - the session, the call, the outcome, and the tool name.
+ * @param decision - the session, the call, the outcome, the tool name, and the
+ *   live session when the caller holds it.
  * @returns the recorded action, or null when nothing was recorded.
  */
-export function settleHumanDecision({ config = null, pendings, decisions = null }, { sessionId, callId, outcome, tool = 'bash' }) {
+export function settleHumanDecision(
+  { config = null, pendings, decisions = null },
+  { sessionId, callId, outcome, tool = 'bash', session = null },
+) {
   if (typeof callId !== 'string') return null
   const note = decisions === null ? null : decisions.peek(sessionId, callId)
   const action = note?.action ?? OUTCOME_ACTIONS[outcome]
@@ -465,7 +513,7 @@ export function settleHumanDecision({ config = null, pendings, decisions = null 
   if (pending !== null) pendings.forget(sessionId, callId)
   const record = note ?? pending
   const { decision, reason } = describeHumanAction(action, record)
-  appendAudit(auditTarget(config), {
+  recordDecision(config, {
     tool: record?.tool ?? tool,
     cwd: record?.cwd ?? null,
     command: record?.command ?? null,
@@ -478,7 +526,7 @@ export function settleHumanDecision({ config = null, pendings, decisions = null 
     callId,
     missing: record?.missing ?? [],
     ...(action === 'always-allow' ? { rules: note?.rules ?? [] } : {}),
-  })
+  }, session)
   return action
 }
 
@@ -499,7 +547,13 @@ export function createSettleListener({ grants, logger, pendings = null, decision
     if (pendings !== null && decisions !== null && decisions.peek(exec?.agent?.session?.id, exec?.callId) !== null) {
       settleHumanDecision(
         { config, pendings, decisions },
-        { sessionId: exec?.agent?.session?.id, callId: exec?.callId, outcome: 'allowed-once', tool: exec?.name ?? 'bash' },
+        {
+          sessionId: exec?.agent?.session?.id,
+          callId: exec?.callId,
+          outcome: 'allowed-once',
+          tool: exec?.name ?? 'bash',
+          session: exec?.agent?.session ?? null,
+        },
       )
     }
     return next()
@@ -512,35 +566,83 @@ export function createSettleListener({ grants, logger, pendings = null, decision
  *
  * A `sandbox_permissions` escalation widens the process fence itself — an
  * approval here is what lets a command run outside the mode the session is in,
- * which is more than the filesystem policy it may also be asking about. It is
- * therefore never answered here: a fully granted command runs without an
- * escalation, and every escalation is a human decision.
+ * which is more than the filesystem policy it may also be asking about. Under
+ * the default `escalation: "ask"` it is therefore never answered here, and every
+ * escalation is a human decision. Under `escalation: "rule"` an escalation for a
+ * call that a rule, a directory baseline, or an auto review already settled is
+ * answered from that same decision, because the user has granted every
+ * capability the line needs and re-asking decides nothing new.
  *
  * Every outcome this listener sees is also the moment one human decision
  * becomes knowable — the waterfall's return value is the answer the card sent,
- * and nothing else in this process observes it.
+ * and nothing else in this process observes it. An answer this listener gives
+ * itself is audited as the rule it followed, never as a human answer.
  * @param options - the engine, the pending store, the human-decision log, the
- *   configuration, and the logger.
+ *   rule-allowed call store, the configuration, and the logger.
  * @returns the waterfall listener.
  */
-export function createApprovalListener({ engine, pendings, logger, config = null, decisions = null }) {
-  const settle = (sessionId, callId, outcome) => settleHumanDecision(
-    { config, pendings, decisions },
-    { sessionId, callId, outcome, tool: 'bash' },
-  )
+export function createApprovalListener({ engine, pendings, grants = null, logger, config = null, decisions = null, ruleAllows = null }) {
+  // "Allow once" is the card's plain approval answer, so the grant the command
+  // needs is minted here — from the record the gate wrote, and before the settle
+  // forgets it. Nothing else in this process observes the waterfall's return
+  // value, and the command cannot be confined from a rule that was never stored.
+  const settle = (sessionId, callId, outcome, session = null) => {
+    if (outcome === 'allowed-once' && grants !== null) {
+      const record = pendings.get(sessionId, callId)
+      if (record !== null) {
+        const granted = grants.grant(record.sessionId ?? sessionId, callId, record.command, record.suggestions ?? [])
+        if (granted.length > 0) {
+          logger.info(`dsh-allow: granted ${String(granted.length)} capability rule(s) to call ${String(callId)}`)
+        }
+      }
+    }
+    return settleHumanDecision(
+      { config, pendings, decisions },
+      { sessionId, callId, outcome, tool: 'bash', session },
+    )
+  }
   return async (request, next) => {
     const sessionId = request?.agent?.session?.id
     const callId = request?.callId
     if (typeof callId !== 'string') return next()
     // The gate already recorded its own prompt for this call, so this listener
-    // owns only the outcome. The card's grant routes drop the pending record
-    // before they settle the approval, so the note is the second half of the
-    // same identity: a call this plugin judged is one it must account for.
-    const ours = pendings.get(sessionId, callId) !== null
+    // owns only the outcome. `/allow remember` drops the pending record before
+    // the card settles the approval, so the note is the second half of the same
+    // identity: a call this plugin judged is one it must account for. A call the
+    // gate allowed by rule has no pending record, and its own store carries the
+    // identity instead.
+    const settled = ruleAllows === null ? null : ruleAllows.get(sessionId, callId)
+    const ours = settled !== null
+      || pendings.get(sessionId, callId) !== null
       || (decisions !== null && decisions.peek(sessionId, callId) !== null)
     if (ours) {
+      if (config?.escalation === 'rule' && settled !== null) {
+        // The call ran under a rule that grants every capability it needs, so
+        // widening the fence for it asks the user to re-decide what the rule
+        // already settled. The audit line keeps the rule as its origin: no human
+        // answered this, and a later reader must not believe one did.
+        ruleAllows.forget(sessionId, callId)
+        pendings.forget(sessionId, callId)
+        recordDecision(config, {
+          tool: 'bash',
+          cwd: settled.cwd ?? null,
+          command: settled.command ?? null,
+          decision: 'allow',
+          origin: settled.origin ?? 'rule',
+          action: 'allow-once',
+          reason: settled.origin === 'auto-review'
+            ? 'auto review allowed this call once, so its sandbox escalation followed that review'
+            : 'the rule that allowed this call already grants every capability it needs, so its sandbox escalation followed the rule',
+          mode: settled.mode ?? null,
+          sessionId: sessionId ?? null,
+          callId,
+          matchedRules: settled.matchedRules ?? [],
+        }, request?.agent?.session ?? null)
+        logger.info(`dsh-allow: followed the rule for the escalation of call ${String(callId)}`)
+        return 'allowed-once'
+      }
       const outcome = await next()
-      settle(sessionId, callId, outcome)
+      settle(sessionId, callId, outcome, request?.agent?.session ?? null)
       return outcome
     }
     const args = toolCallArguments(request?.agent?.session, callId)
@@ -560,73 +662,14 @@ export function createApprovalListener({ engine, pendings, logger, config = null
     logger.info(`dsh-allow: sending the escalation for ${JSON.stringify(command.slice(0, 80))} to the card — a wider process fence is not the policy's to grant`)
     remember(pendings, { callId, agent: request.agent }, context, command, cwd)
     const outcome = await next()
-    settle(sessionId, callId, outcome)
+    settle(sessionId, callId, outcome, request?.agent?.session ?? null)
     return outcome
   }
 }
 
-/**
- * Answer one route with JSON.
- * @param res - the response to own.
- * @param statusCode - HTTP status.
- * @param payload - JSON body.
- */
-function sendJson(res, statusCode, payload) {
-  const body = JSON.stringify(payload)
-  res.writeHead(statusCode, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body),
-  })
-  res.end(body)
-}
 
-/** Whether a request arrived from this host on loopback. */
-function isLoopback(req) {
-  const address = req.socket.remoteAddress
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
-}
 
-/**
- * Whether a state-changing request came from this Web host itself.
- * @param req - incoming request.
- * @returns true only for a direct same-origin loopback request.
- */
-function sameOriginLoopback(req) {
-  if (!isLoopback(req)) return false
-  if (req.headers.forwarded !== undefined
-    || req.headers['x-forwarded-for'] !== undefined
-    || req.headers['x-real-ip'] !== undefined) return false
-  const host = req.headers.host
-  const origin = req.headers.origin
-  if (typeof host !== 'string' || typeof origin !== 'string') return false
-  try {
-    const parsed = new URL(origin)
-    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host === host
-  }
-  catch {
-    // URL() rejects a malformed Origin; an unparseable authority authorizes nothing.
-    return false
-  }
-}
 
-/**
- * Read one JSON request body.
- * @param req - incoming request.
- * @param limit - largest accepted body in bytes.
- * @returns the parsed body.
- */
-async function readJsonBody(req, limit = 64 * 1024) {
-  const chunks = []
-  let size = 0
-  for await (const chunk of req) {
-    size += chunk.length
-    if (size > limit) throw new Error('request body too large')
-    chunks.push(chunk)
-  }
-  if (chunks.length === 0) return {}
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
-}
 
 /** The card's view of one pending decision. */
 function pendingPayload(record) {
@@ -653,150 +696,13 @@ function pendingPayload(record) {
   }
 }
 
-/**
- * The card's read route.
- * @param options - the pending store.
- * @returns a Web-host route handler.
- */
-export function createPendingHandler({ pendings }) {
-  return (req, res) => {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      res.writeHead(405, { allow: 'GET, HEAD' })
-      res.end()
-      return
-    }
-    if (!isLoopback(req)) {
-      sendJson(res, 403, { ok: false, error: 'loopback only' })
-      return
-    }
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    const record = pendings.get(url.searchParams.get('sessionId'), url.searchParams.get('callId'))
-    if (record === null) {
-      sendJson(res, 404, { ok: false })
-      return
-    }
-    sendJson(res, 200, pendingPayload(record))
-  }
-}
+
+
 
 /**
- * The card's "always allow" route: it writes the persistent rules the user is
- * looking at, and answers with their labels.
- *
- * The route notes what the user clicked instead of writing the audit line
- * itself: the card settles the approval right after, and that is the moment one
- * decision — and one record — is complete.
- * @param options - pending store, the human-decision log, configuration, and logger.
- * @returns a Web-host route handler.
- */
-export function createRememberHandler({ pendings, config, logger, decisions = null }) {
-  return async (req, res) => {
-    if (req.method !== 'POST') {
-      res.writeHead(405, { allow: 'POST' })
-      res.end()
-      return
-    }
-    if (!sameOriginLoopback(req)) {
-      sendJson(res, 403, { ok: false, error: 'same-origin loopback only' })
-      return
-    }
-    try {
-      const body = await readJsonBody(req)
-      const record = pendings.get(body?.sessionId, body?.callId)
-      if (record === null) {
-        sendJson(res, 404, { ok: false, error: 'this approval is no longer pending' })
-        return
-      }
-      const suggestions = record.suggestions ?? []
-      if (suggestions.length === 0 || record.decision === 'forbidden') {
-        sendJson(res, 409, { ok: false, error: 'this command cannot be remembered' })
-        return
-      }
-      // One button, and exactly the narrowest rules it named: no folder is
-      // opened behind the user's back.
-      const stored = suggestions.map(suggestion => addRule(config.rulesFile, {
-        path: suggestion.path,
-        recursive: suggestion.recursive,
-        access: suggestion.access,
-      }))
-      const labels = stored.map(describeRule)
-      if (decisions !== null) {
-        decisions.note(body?.sessionId, body?.callId, {
-          action: 'always-allow',
-          tool: 'bash',
-          command: record.command,
-          cwd: record.cwd,
-          mode: record.mode,
-          missing: record.missing ?? [],
-          rules: stored.map((rule, index) => ({ ...rule, label: labels[index] })),
-        })
-      }
-      pendings.forget(body?.sessionId, body?.callId)
-      logger.info(`dsh-allow: remembered ${labels.map(label => `"${label}"`).join(', ')}`)
-      sendJson(res, 200, {
-        ok: true,
-        label: labels.join(' + '),
-        labels,
-        rules: stored.map(rule => ({ path: rule.path, recursive: rule.recursive, access: rule.access })),
-      })
-    }
-    catch (error) {
-      sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
-    }
-  }
-}
-
-/**
- * The card's "allow once" route: it grants the missing capabilities to this
- * session only, for a bounded time, and never touches the rules file.
- * @param options - pending store, the session grant store, the human-decision
- *   log, and logger.
- * @returns a Web-host route handler.
- */
-export function createOnceHandler({ pendings, grants, logger, decisions = null }) {
-  return async (req, res) => {
-    if (req.method !== 'POST') {
-      res.writeHead(405, { allow: 'POST' })
-      res.end()
-      return
-    }
-    if (!sameOriginLoopback(req)) {
-      sendJson(res, 403, { ok: false, error: 'same-origin loopback only' })
-      return
-    }
-    try {
-      const body = await readJsonBody(req)
-      const record = pendings.get(body?.sessionId, body?.callId)
-      if (record === null) {
-        sendJson(res, 404, { ok: false, error: 'this approval is no longer pending' })
-        return
-      }
-      const suggestions = record.suggestions ?? []
-      const granted = grants.grant(record.sessionId ?? body?.sessionId, body?.callId, record.command, suggestions)
-      if (decisions !== null) {
-        decisions.note(body?.sessionId, body?.callId, {
-          action: 'allow-once',
-          tool: 'bash',
-          command: record.command,
-          cwd: record.cwd,
-          mode: record.mode,
-          missing: record.missing ?? [],
-        })
-      }
-      pendings.forget(body?.sessionId, body?.callId)
-      logger.info(`dsh-allow: granted ${String(granted.length)} capability rule(s) to call ${String(body?.callId)}`)
-      sendJson(res, 200, { ok: true, granted: granted.map(describeRule) })
-    }
-    catch (error) {
-      sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
-    }
-  }
-}
-
-/**
- * The audit route's view of one recorded decision.
+ * The `/allow log` view of one recorded decision.
  * @param record - one parsed audit-log record.
- * @returns the fields the approval tab renders, with the absent ones explicit.
+ * @returns the fields the command renders, with the absent ones explicit.
  */
 function auditPayload(record) {
   return {
@@ -820,48 +726,6 @@ function auditPayload(record) {
   }
 }
 
-/**
- * The approval tab's read route: the newest decisions of one session, read from
- * the end of the audit log.
- *
- * Read-only and loopback-only, like the card's own routes: it answers what the
- * policy already decided and grants nothing.
- * @param options - configuration and the logger.
- * @returns a Web-host route handler.
- */
-export function createAuditHandler({ config, logger }) {
-  return (req, res) => {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      res.writeHead(405, { allow: 'GET, HEAD' })
-      res.end()
-      return
-    }
-    if (!isLoopback(req)) {
-      sendJson(res, 403, { ok: false, error: 'loopback only' })
-      return
-    }
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    const sessionId = url.searchParams.get('sessionId')
-    const requested = Number(url.searchParams.get('limit'))
-    const limit = Number.isFinite(requested) && requested > 0
-      ? Math.min(Math.floor(requested), AUDIT_PAGE_MAX)
-      : AUDIT_PAGE
-    const answer = readAuditTail(config.auditFile, {
-      sessionId,
-      limit,
-      includeBaseline: url.searchParams.get('baseline') === '1',
-    })
-    logger.info(`dsh-allow: the approval tab read ${String(answer.entries.length)} record(s) for ${sessionId ?? 'every session'}`)
-    sendJson(res, 200, {
-      ok: true,
-      sessionId,
-      limit,
-      entries: answer.entries.map(auditPayload),
-      scannedBytes: answer.scannedBytes,
-      truncated: answer.truncated,
-    })
-  }
-}
 
 /**
  * Render the stored rules.
@@ -880,6 +744,34 @@ export function renderRules(file) {
     }
   }
   lines.push('用 /allow remove <编号> 删除，/allow clear 清空，/allow status 看强制层现状。')
+  return lines.join('\n')
+}
+
+/** Human label for one recorded action. */
+const AUDIT_ACTION_LABELS = {
+  'allow-once': '允许一次',
+  'always-allow': '总是允许',
+  deny: '拒绝',
+  cancelled: '已取消',
+  unavailable: '无人应答',
+}
+
+/**
+ * Render the newest approval decisions from the audit log.
+ * @param file - audit-file path.
+ * @param limit - largest number of records to render.
+ * @returns the command's answer text.
+ */
+export function renderAuditLog(file, limit) {
+  const answer = readAuditTail(file, { limit })
+  if (answer.entries.length === 0) return '还没有审批记录。'
+  const lines = [`最近 ${String(answer.entries.length)} 条审批记录${answer.truncated ? '（已截断）' : ''}：`]
+  for (const record of answer.entries.map(auditPayload)) {
+    const at = typeof record.at === 'string' ? new Date(record.at).toLocaleTimeString() : ''
+    const action = AUDIT_ACTION_LABELS[record.action] ?? record.decision ?? record.action ?? '记录'
+    const what = record.command ?? record.reason ?? ''
+    lines.push(`${at}  ${action}  ${what}`.trim())
+  }
   return lines.join('\n')
 }
 
@@ -913,17 +805,77 @@ export function renderStatus({ workspaceRoot, mode, enforcement = null }) {
 }
 
 /**
+ * The host-side operation behind `/allow remember <callId>` and the card's
+ * "always allow" button: store exactly the narrowest rules the gate derived for
+ * that call, note the decision, and forget the pending record.
+ * @param options - the pending store, the configuration, the decision log, and the logger.
+ * @returns the operation, taking a session id and a call id.
+ */
+export function createRememberCall({ pendings, config, logger, decisions = null }) {
+  return (sessionId, callId) => {
+    const record = pendings.get(sessionId, callId)
+    if (record === null) return { ok: false, error: '这次审批已经结束，无法记住' }
+    const suggestions = record.suggestions ?? []
+    if (suggestions.length === 0 || record.decision === 'forbidden') {
+      return { ok: false, error: '这条命令无法被记住' }
+    }
+    // One button, and exactly the narrowest rules it named: no folder is opened
+    // behind the user's back.
+    const stored = suggestions.map(suggestion => addRule(config.rulesFile, {
+      path: suggestion.path,
+      recursive: suggestion.recursive,
+      access: suggestion.access,
+    }))
+    const labels = stored.map(describeRule)
+    if (decisions !== null) {
+      decisions.note(sessionId, callId, {
+        action: 'always-allow',
+        tool: 'bash',
+        command: record.command,
+        cwd: record.cwd,
+        mode: record.mode,
+        missing: record.missing ?? [],
+        rules: stored.map((rule, index) => ({ ...rule, label: labels[index] })),
+      })
+    }
+    pendings.forget(sessionId, callId)
+    logger.info(`dsh-allow: remembered ${labels.map(label => `"${label}"`).join(', ')}`)
+    return { ok: true, labels }
+  }
+}
+
+/**
  * Answer `/allow`.
- * @param options - rules file, workspace root, and the resolved sandbox mode.
+ * @param options - rules file, audit file, workspace root, the resolved sandbox
+ *   mode, and the host-side "remember this call" operation.
  * @param rawInput - text after the command name.
  * @returns the command result.
  */
-export function runAllowCommand({ file, workspaceRoot, mode, enforcement = null }, rawInput) {
+export function runAllowCommand({ file, auditFile = null, workspaceRoot, mode, enforcement = null, remember = null }, rawInput) {
   const input = rawInput.trim()
   if (input === '' || input === 'list') return { kind: 'success', text: renderRules(file) }
   const [verb, ...rest] = input.split(/\s+/u)
   if (verb === 'status') return { kind: 'success', text: renderStatus({ workspaceRoot, mode, enforcement }) }
   if (verb === 'clear') return { kind: 'success', text: `已清空 ${String(clearRules(file))} 条文件权限。` }
+  if (verb === 'remember') {
+    const callId = rest[0]
+    if (callId === undefined) {
+      return { kind: 'error', text: '用法：/allow remember <callId>（审批卡片上的「总是允许」按钮走的就是这条）' }
+    }
+    if (remember === null) return { kind: 'error', text: '这个部署没有可用的记住通道。' }
+    const outcome = remember(callId)
+    return outcome.ok === true
+      ? { kind: 'success', text: `已记住：${outcome.labels.join(' + ')}` }
+      : { kind: 'error', text: outcome.error }
+  }
+  if (verb === 'log') {
+    if (auditFile === null) return { kind: 'error', text: '这个部署没有可读的审批记录。' }
+    const requested = Number(rest[0])
+    const limit = Number.isFinite(requested) && requested > 0
+      ? Math.min(Math.floor(requested), AUDIT_PAGE_MAX)
+      : AUDIT_PAGE
+    return { kind: 'success', text: renderAuditLog(auditFile, limit) }
+  }
   if (verb === 'remove') {
     const removed = removeRule(file, Number(rest[0]))
     return removed === null
@@ -967,6 +919,10 @@ export function apply(ctx, pluginConfig) {
   const harnessHome = resolveHome()
   const config = { ...resolveConfig(pluginConfig, harnessHome), harnessHome, home }
   const pendings = createPendingStore()
+  // Which calls a rule already settled. Separate from `pendings`, which is the
+  // queue of decisions still owed to the user, because a settled call owes
+  // nothing.
+  const ruleAllows = createPendingStore()
   const grants = createGrantStore({ ttlMs: config.sessionGrantTtlMs })
   const decisions = createDecisionLog()
   // The process fence is refined before anything can be judged against it, so
@@ -982,50 +938,31 @@ export function apply(ctx, pluginConfig) {
     logger: ctx.logger,
     llmOf: () => ctx.get('llm'),
   })
-  const gate = createGate({ engine, pendings, logger: ctx.logger, config, grants, reviewer })
+  const gate = createGate({ engine, pendings, logger: ctx.logger, config, grants, reviewer, ruleAllows })
   // Ahead of every other pre-execute listener: a protected path must be refused
   // before any other policy can allow it.
   ctx.on('tools/pre-execute', (exec, next) => gate(exec, next), { prepend: true })
-  const approvalListener = createApprovalListener({ engine, pendings, logger: ctx.logger, config, decisions })
+  const approvalListener = createApprovalListener({ engine, pendings, grants, logger: ctx.logger, config, decisions, ruleAllows })
   ctx.on('approval/request', (request, next) => approvalListener(request, next), { prepend: true })
   const settleListener = createSettleListener({ grants, logger: ctx.logger, pendings, decisions, config })
   ctx.on('tools/post-execute', (exec, result, next) => settleListener(exec, result, next), { prepend: true })
-  const pendingHandler = createPendingHandler({ pendings })
-  const rememberHandler = createRememberHandler({ pendings, config, logger: ctx.logger, decisions })
-  const onceHandler = createOnceHandler({ pendings, grants, logger: ctx.logger, decisions })
-  const auditHandler = createAuditHandler({ config, logger: ctx.logger })
-  ctx.inject(['webServer'], (webCtx) => {
-    webCtx.effect(() => webCtx.webServer.register({
-      kind: 'exact',
-      path: '/dsh-allow/pending',
-      handler: pendingHandler,
-    }), 'dsh-allow: pending route')
-    webCtx.effect(() => webCtx.webServer.register({
-      kind: 'exact',
-      path: '/dsh-allow/remember',
-      handler: rememberHandler,
-    }), 'dsh-allow: remember route')
-    webCtx.effect(() => webCtx.webServer.register({
-      kind: 'exact',
-      path: '/dsh-allow/once',
-      handler: onceHandler,
-    }), 'dsh-allow: once route')
-    webCtx.effect(() => webCtx.webServer.register({
-      kind: 'exact',
-      path: '/dsh-allow/audit',
-      handler: auditHandler,
-    }), 'dsh-allow: audit route')
-  })
+  // The card's "always allow" and the approval ledger reach the host through the
+  // session's own command channel: the client names the call, and the policy
+  // layer stores exactly the narrowest rules it derived for it. No Web route is
+  // involved, so the card works under any page origin.
+  const rememberCall = createRememberCall({ pendings, config, logger: ctx.logger, decisions })
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.effect(() => commandCtx.commands.register({
       name: 'allow',
       description: 'List or change the filesystem permissions that no longer ask for approval',
-      input: { hint: '[list|status|add <operations> <path> [file|folder]|remove <number>|clear]' },
+      input: { hint: '[list|status|log [n]|add <operations> <path> [file|folder]|remember <callId>|remove <number>|clear]' },
       handler: invocation => runAllowCommand({
         file: config.rulesFile,
+        auditFile: config.auditFile,
         workspaceRoot: engine.policyOf({ agent: invocation.agent })?.workspaceRoot,
         mode: engine.policyOf({ agent: invocation.agent })?.mode,
         enforcement: enforcement.status(),
+        remember: callId => rememberCall(invocation.agent.session.id, callId),
       }, invocation.rawInput),
     }), 'dsh-allow: /allow command')
   })

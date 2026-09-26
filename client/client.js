@@ -7,9 +7,10 @@
  *   - 沙箱提权请求(reason 里 `escalate sandbox to <mode>:`)
  *   - 本插件权限策略的询问(reason 里 `dsh-allow: ` 前缀)
  *
- * 卡片回答的是「缺哪个文件权限」:操作(operation)、路径(path)、命令(command),
- * 以及三个出口 —— 拒绝 / 总是允许(写持久规则) / 允许一次(只写会话规则)。
- * 宿主在 `/dsh-allow/pending` 上给出这次缺什么、能记住什么。
+ * 卡片回答的是「缺哪个文件权限」,三个出口 —— 拒绝 / 总是允许 / 允许一次。
+ * 两个出口都不经宿主接口:「允许一次」就是 approval waterfall 的返回值本身,
+ * 「总是允许」走会话命令通道 `/allow remember <callId>`,由宿主写入它自己从待
+ * 审批记录推导出的最窄规则。
  *
  * 样式逐条照抄 `ui-approval` 的 ApprovalPanel.module.css(用内联 <style> 注入),
  * 所以外观与内置卡片一致。
@@ -57,14 +58,20 @@ window.__ModuleLoader__.load({
 				".dsha_logTop{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}",
 				".dsha_logTime{font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}",
 				".dsha_logBadge{font-size:12px;line-height:16px;padding:1px 8px;border:1px solid currentColor;border-radius:999px;white-space:nowrap}",
-				".dsha_logBadge[data-origin=human]{color:var(--dsw-alias-brand-primary)}",
+				// 同一来源在对话与轨迹里必须是同一个颜色:这里的取值与
+				// ORIGIN_TONES 一一对应(人工=琥珀、自动复核=品牌蓝)。
+				".dsha_logBadge[data-origin=human]{color:var(--dsw-alias-state-warn-primary)}",
 				".dsha_logBadge[data-origin=rule]{color:var(--dsw-alias-state-success-primary)}",
-				".dsha_logBadge[data-origin=auto-review]{color:var(--dsw-alias-state-success-primary)}",
+				".dsha_logBadge[data-origin=auto-review]{color:var(--dsw-alias-brand-primary-new-colorprimary-new-color)}",
 				".dsha_logBadge[data-origin=policy]{color:var(--dsw-alias-state-error-primary)}",
 				".dsha_logBadge[data-origin=baseline],.dsha_logBadge[data-origin=legacy]{color:var(--dsw-alias-label-secondary)}",
 				".dsha_logCommand{font-family:var(--ds-font-family-code);font-size:13px;line-height:20px;word-break:break-all}",
 				".dsha_logDetail{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);word-break:break-all}",
-				".dsha_logReason{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}"
+				".dsha_logReason{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
+				".dsha_decision{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;padding:6px 0;font-size:12px;line-height:18px}",
+				".dsha_decisionEmoji{flex:0 0 auto;font-size:12px;line-height:18px}",
+				".dsha_decisionCommand{font-family:var(--ds-font-family-code);font-size:12px;line-height:18px;word-break:break-all}",
+				".dsha_decisionDetail{color:var(--dsw-alias-label-secondary);word-break:break-all}"
 			].join("");
 			document.head.appendChild(tag);
 		}
@@ -76,8 +83,7 @@ window.__ModuleLoader__.load({
 			waiting: "需要文件权限",
 			reject: "拒绝",
 			allowOnce: "允许一次",
-			alwaysOne: "总是允许：{rule}",
-			alwaysMany: "总是允许 {rules}",
+			alwaysAllow: "总是允许",
 			remembering: "正在记住…",
 			rememberFailed: "没记住:{message}",
 			cannotRemember: "这次没法记住，只能用「允许一次」:{reason}",
@@ -117,8 +123,7 @@ window.__ModuleLoader__.load({
 			waiting: "Filesystem permission required",
 			reject: "Deny",
 			allowOnce: "Allow once",
-			alwaysOne: "Always allow: {rule}",
-			alwaysMany: "Always allow {rules}",
+			alwaysAllow: "Always allow",
 			remembering: "Remembering…",
 			rememberFailed: "Not remembered: {message}",
 			cannotRemember: "This cannot be remembered; only \u201callow once\u201d is available: {reason}",
@@ -174,6 +179,17 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * 这条待审批是不是权限策略的询问(而不是沙箱提权)。只有它带得出可记住的文件规则。
+		 * @param pending - composer 上的待处理交互。
+		 * @returns 是则为 true。
+		 */
+		function isPolicyAsk(pending) {
+			return pending !== null && pending !== undefined
+				&& typeof pending.reason === "string"
+				&& pending.reason.startsWith(POLICY_REASON);
+		}
+
+		/**
 		 * Shorten one display string, keeping the head and marking the cut.
 		 * @param text - full text.
 		 * @param max - longest accepted length.
@@ -184,36 +200,6 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 「总是允许」按钮上的文案:把这次会写入的规则念出来(最多 3 条,再多给数量)。
-		 * @param t - 本命名空间的翻译函数。
-		 * @param suggestions - 宿主给出的最窄规则。
-		 * @returns 按钮文字。
-		 */
-		function alwaysText(t, suggestions) {
-			const labels = suggestions.map((suggestion) => suggestion.label);
-			if (labels.length === 1) return t("alwaysOne", { rule: labels[0] });
-			const head = labels.length <= 3 ? labels.join(" + ") : labels.slice(0, 3).join(" + ") + " +" + String(labels.length - 3) + "\u2026";
-			return t("alwaysMany", { rules: head });
-		}
-
-		/** 读取这次审批缺什么、能记住什么;失败返回 null(卡片退化成两按钮)。 */
-		async function readPending(pending) {
-			if (typeof pending.sessionId !== "string" || typeof pending.callId !== "string") return null;
-			try {
-				const query = "?sessionId=" + encodeURIComponent(pending.sessionId) + "&callId=" + encodeURIComponent(pending.callId);
-				const response = await fetch("/dsh-allow/pending" + query, {
-					cache: "no-store",
-					headers: { accept: "application/json" }
-				});
-				if (!response.ok) return null;
-				const data = await response.json();
-				return data && data.ok === true ? data : null;
-			} catch {
-				return null;
-			}
-		}
-
-		/**
 		 * 同款审批卡片 + 文件权限出口。
 		 * @param props.matched - 命中的待审批(Remote waterfall 的本次请求)。
 		 * @param props.t - 由 `locale: NS` 注入的翻译函数。
@@ -221,47 +207,31 @@ window.__ModuleLoader__.load({
 		function AllowPanel(props) {
 			const pending = props.matched;
 			const t = props.t;
-			const [info, setInfo] = React.useState(null);
 			const [answered, setAnswered] = React.useState(false);
 			const [busy, setBusy] = React.useState(null);
 			const [error, setError] = React.useState(null);
-
-			React.useEffect(() => {
-				let cancelled = false;
-				void readPending(pending).then((value) => {
-					if (!cancelled) setInfo(value);
-				});
-				return () => { cancelled = true; };
-			}, [pending]);
 
 			const answer = (outcome) => {
 				setAnswered(true);
 				void pending.answer(outcome).catch(() => { setAnswered(false); });
 			};
 
-			/** 先调宿主写入/授予,成功后再以 allowed-once 结束这次审批。 */
-			const post = (path, body, tag, fallback) => {
-				setBusy(tag);
+			/**
+			 * 「总是允许」:走会话命令通道让宿主写入这次命中的最窄规则,成功后再以
+			 * allowed-once 结束审批。规则由宿主从它自己的待审批记录推导,浏览器半
+			 * 不需要知道内容,也就不需要任何宿主接口。
+			 */
+			const remember = () => {
+				setBusy("remember");
 				setError(null);
 				void (async () => {
 					try {
-						const response = await fetch(path, {
-							method: "POST",
-							headers: { "content-type": "application/json" },
-							body: JSON.stringify(Object.assign({
-								sessionId: pending.sessionId,
-								callId: pending.callId
-							}, body))
-						});
-						if (response.status === 404 || response.status === 405) {
-							// 宿主那一半还是旧版本(浏览器半会热更新,宿主半不会):
-							// 没有这条路由,就退回到内置的「允许一次」语义。
-							if (fallback === true) { answer("allowed-once"); return; }
-							throw new Error("HTTP " + String(response.status));
+						const result = await props.remember(pending.sessionId, pending.callId);
+						if (result === undefined || result.ok !== true) {
+							throw new Error(result?.error?.message ?? "宿主没有受理这次记住请求");
 						}
-						const data = await response.json().catch(() => null);
-						if (!response.ok || data?.ok !== true) {
-							throw new Error(data?.error ?? ("HTTP " + String(response.status)));
+						if (result.value?.matched !== true) {
+							throw new Error("宿主没有受理 /allow remember");
 						}
 						answer("allowed-once");
 					} catch (cause) {
@@ -280,36 +250,24 @@ window.__ModuleLoader__.load({
 					onClick: () => { answer("rejected"); }
 				}, t("reject"))
 			];
-			const suggestions = info === null || !Array.isArray(info.suggestions) ? [] : info.suggestions;
-			if (info !== null && info.rememberable === true && suggestions.length > 0) {
-				// 只有一个「总是允许」按钮:写入的就是卡片上念出来的那几条最窄规则。
+			// 「总是允许」只对策略询问开放:提权请求要的是更宽的进程围栏,那不是文件
+			// 权限库能记住的东西,所以提权只有拒绝 / 允许一次。
+			if (isPolicyAsk(pending)) {
 				buttons.push(React.createElement(primitives.Button, {
 					key: "always",
 					variant: "outline",
 					disabled: disabled,
-					title: suggestions.map((suggestion) => suggestion.label).join(" + "),
-					onClick: () => { post("/dsh-allow/remember", {}, "remember"); }
-				}, busy === "remember"
-					? t("remembering")
-					: React.createElement("span", { className: "dsha_ellipsis" }, shorten(alwaysText(t, suggestions), 48))));
+					onClick: remember
+				}, busy === "remember" ? t("remembering") : t("alwaysAllow")));
 			}
+			// 「允许一次」不经宿主接口:approval waterfall 的返回值本身就是答案,
+			// 宿主那一半观察到 allowed-once 时自行授予本次命令所需的能力。
 			buttons.push(React.createElement(primitives.Button, {
 				key: "once",
 				variant: "primary",
 				disabled: disabled,
-				onClick: () => { post("/dsh-allow/once", {}, "once", true); }
-			}, busy === "once" ? t("remembering") : t("allowOnce")));
-
-			const missing = info === null || !Array.isArray(info.missing) ? [] : info.missing;
-			const rows = [];
-			for (const [index, entry] of missing.entries()) {
-				rows.push(React.createElement("div", { className: "dsha_row", key: "op-" + String(index) },
-					React.createElement("span", { className: "dsha_key" }, t("operation")),
-					React.createElement("span", { className: "dsha_value" }, entry.operation)));
-				rows.push(React.createElement("div", { className: "dsha_row", key: "path-" + String(index) },
-					React.createElement("span", { className: "dsha_key" }, t("path")),
-					React.createElement("span", { className: "dsha_value" }, entry.path)));
-			}
+				onClick: () => { answer("allowed-once"); }
+			}, t("allowOnce")));
 
 			return React.createElement("div", { className: "dsha_root", "data-approval-key": pending.key },
 				React.createElement("div", { className: "dsha_card" },
@@ -318,32 +276,17 @@ window.__ModuleLoader__.load({
 						t("waiting")),
 					React.createElement("div", { className: "dsha_body", tabIndex: 0, role: "group", "aria-label": t("detailAria") },
 						React.createElement("div", { className: "dsha_headline" },
-							typeof pending.reason === "string" && pending.reason !== "" ? pending.reason : t("escalation", { toolName: pending.toolName })),
-						rows.length > 0 ? rows : null,
-						info === null ? null : React.createElement("div", { className: "dsha_row" },
-							React.createElement("span", { className: "dsha_key" }, t("command")),
-							React.createElement("span", { className: "dsha_command" }, info.command)),
-						info === null ? null : React.createElement("div", { className: "dsha_meta" },
-							React.createElement("span", null, t("mode", { mode: info.mode === null || info.mode === undefined ? "unknown" : info.mode })),
-							React.createElement("span", null, t("cwd", { cwd: info.cwd })))),
+							typeof pending.reason === "string" && pending.reason !== "" ? pending.reason : t("escalation", { toolName: pending.toolName }))),
 					error === null ? null : React.createElement("div", { className: "dsha_notice" }, t("rememberFailed", { message: error })),
-					info !== null && Array.isArray(info.unknown) && info.unknown.length > 0
-						? React.createElement("div", { className: "dsha_hint" }, t("unknownHint"))
-						: null,
-					info !== null && info.rememberable !== true
-						? React.createElement("div", { className: "dsha_hint" }, t("cannotRemember", { reason: info.reason }))
-						: null,
 					React.createElement("div", { className: "dsha_actions" }, buttons)));
 		}
 
-		//#region approval ledger
-		/** 审批记录标签页的轮询间隔(毫秒)。 */
-		const LOG_POLL_MS = 3000;
-		/** 一次向宿主拉取的记录条数。 */
-		const LOG_PAGE_LIMIT = 200;
-		/** 来源分类的权重:同一个 callId 上更权威的记录会取代较弱的。 */
-		const ORIGIN_RANK = { human: 4, "auto-review": 3, policy: 2, rule: 1, baseline: 0, legacy: 0 };
-		const ORIGIN_LABEL = {
+
+		//#region decisions
+		/** 宿主给每条策略决定写下的会话事件类型。 */
+		const DECISION_EVENT = "dsh-allow/decision";
+		/** 记录来源的分类文案。 */
+		const ORIGIN_KEYS = {
 			rule: "logOriginRule",
 			baseline: "logOriginBaseline",
 			"auto-review": "logOriginAutoReview",
@@ -351,195 +294,277 @@ window.__ModuleLoader__.load({
 			policy: "logOriginPolicy",
 			legacy: "logOriginLegacy"
 		};
-		const ACTION_LABEL = {
+		/**
+		 * 来源 → 轨迹标签的色调。轨迹侧只提供这套封闭语义,配色由它自己拥有,
+		 * 所以这里给的是「该有多醒目」,不是颜色。
+		 */
+		const ORIGIN_TONES = {
+			rule: "positive",
+			baseline: "neutral",
+			"auto-review": "accent",
+			human: "warning",
+			policy: "critical",
+			legacy: "neutral"
+		};
+		/** 人工动作的文案;自动记录没有 action,按 origin 归类即可。 */
+		const ACTION_KEYS = {
 			"allow-once": "logAllowOnce",
 			"always-allow": "logAlwaysAllow",
 			deny: "logDeny",
 			cancelled: "logCancelled",
 			unavailable: "logUnavailable"
 		};
+		/**
+		 * 一行决定前面的符号。颜色只能分出「来源」,而「允许一次」和「总是允许」
+		 * 来源相同,所以符号按动作优先、来源兜底 —— 扫一眼就能分清是哪一类。
+		 */
+		const ACTION_EMOJI = {
+			"allow-once": "✅",
+			"always-allow": "♾️",
+			deny: "🚫",
+			cancelled: "↩️",
+			unavailable: "⌛"
+		};
+		/** 没有人工动作时的符号(规则放行、默认放行、自动复核、插件自拒)。 */
+		const ORIGIN_EMOJI = {
+			rule: "📋",
+			baseline: "⚪",
+			"auto-review": "🤖",
+			human: "👤",
+			policy: "🚫",
+			legacy: "•"
+		};
 
 		/**
-		 * 读当前会话最近的审批记录。
-		 * @param sessionId - 当前会话 id。
-		 * @param showBaseline - 是否连默认放行一起要。
-		 * @returns 宿主返回的记录与截断标记。
+		 * 一条决定该配哪个符号。
+		 * @param record - 宿主写下的审计记录。
+		 * @returns 一个符号。
 		 */
-		async function readLedger(sessionId, showBaseline) {
-			const query = "?sessionId=" + encodeURIComponent(sessionId)
-				+ "&limit=" + String(LOG_PAGE_LIMIT)
-				+ (showBaseline ? "&baseline=1" : "");
-			const response = await fetch("/dsh-allow/audit" + query, {
-				cache: "no-store",
-				headers: { accept: "application/json" }
+		function decisionEmoji(record) {
+			return ACTION_EMOJI[record.action]
+				?? ORIGIN_EMOJI[originOfRecord(record)]
+				?? ORIGIN_EMOJI.legacy;
+		}
+
+		/**
+		 * 一条决定在 Chat 流里的身份:一个事件一行,seq 就是它的稳定身份,
+		 * 所以同一次调用的「询问」和「人工答复」各占一行,重放时也各归各位。
+		 * @param event - 会话事件。
+		 * @returns 该事件的渲染标识。
+		 */
+		function decisionIdOf(event) {
+			return "allow:" + String(event.seq);
+		}
+
+		/**
+		 * 一条审计记录的来源分类;这个字段之前写下的记录归为 legacy。
+		 * @param record - 宿主写下的审计记录。
+		 * @returns 来源分类。
+		 */
+		function originOfRecord(record) {
+			return typeof record.origin === "string" ? record.origin : "legacy";
+		}
+
+		/**
+		 * 一条决定的标签字典键:人工动作优先,自动记录按来源归类。
+		 * @param record - 宿主写下的审计记录。
+		 * @returns 本命名空间里的字典键。
+		 */
+		function decisionLabelKey(record) {
+			const origin = originOfRecord(record);
+			return ACTION_KEYS[record.action]
+				?? (ORIGIN_KEYS[origin] === undefined ? "logOriginLegacy" : ORIGIN_KEYS[origin]);
+		}
+
+		/**
+		 * 一条决定在轨迹账本里的一行摘要:符号 + 本地化标签 + 命令(或原因)。
+		 * @param record - 宿主写下的审计记录。
+		 * @param translate - 本命名空间的翻译函数。
+		 * @returns 一行摘要文本。
+		 */
+		function decisionSummary(record, translate) {
+			const head = decisionEmoji(record) + " " + translate(decisionLabelKey(record));
+			const said = typeof record.command === "string" && record.command !== ""
+				? record.command
+				: (typeof record.reason === "string" ? record.reason : "");
+			return said === "" ? head : head + " · " + shorten(said, 120);
+		}
+
+		/**
+		 * 轨迹定义:同一条事件在轨迹账本里占一行。
+		 *
+		 * 行类型由 ui-trajectory 提供(`extension`),插件只提供文案与负载,所以
+		 * 轨迹侧不需要认识任何一个插件的字段。文案在建节点时由本插件的字典生成。
+		 * @param translate - 本命名空间在当前语言下的翻译函数。
+		 * @returns 轨迹标的的业务定义。
+		 */
+		function createTrajectoryDefinition(translate) {
+			const fold = (match) => ({
+				seq: match.event.seq,
+				time: typeof match.event.time === "number" ? match.event.time : 0,
+				record: match.event.data
 			});
-			if (!response.ok) throw new Error("HTTP " + String(response.status));
-			const data = await response.json();
-			if (data === null || data.ok !== true) throw new Error("bad answer");
 			return {
-				entries: Array.isArray(data.entries) ? data.entries : [],
-				truncated: data.truncated === true
+				// Definitions are keyed by kind across every target, so the ledger
+				// row carries its own name: the chat kind is the keyed-slot entry
+				// the chat renderer dispatches on, and this one only names the row.
+				kind: "trajectory-allow-decision",
+				target: "trajectory",
+				match: (event) => (event.type === DECISION_EVENT
+					? { id: decisionIdOf(event), role: "start" }
+					: null),
+				start: (_context, match) => fold(match),
+				update: (context, match) => (match.event.type === DECISION_EVENT ? fold(match) : context.state),
+				buildViewNode: (context) => {
+					const current = context.state;
+					if (current === undefined) return null;
+					return {
+						key: context.key,
+						kind: context.kind,
+						id: context.id,
+						target: "trajectory",
+						anchorSeq: current.seq,
+						location: context.start !== undefined && context.start.location !== undefined
+							? context.start.location
+							: { kind: "unresolved" },
+						data: {
+							kind: "node",
+							node: {
+								kind: "extension",
+								seq: current.seq,
+								time: current.time,
+								key: DECISION_EVENT,
+								text: decisionSummary(current.record, translate),
+								value: current.record,
+								tone: ORIGIN_TONES[originOfRecord(current.record)] ?? "neutral"
+							}
+						}
+					};
+				}
 			};
 		}
 
-		/** 一条记录的来源权重。 */
-		function rankOf(entry) {
-			return ORIGIN_RANK[entry.origin] ?? 0;
-		}
-
 		/**
-		 * 每个工具调用只留一行:同一 callId 上更权威的记录取代较弱的,行位置保持
-		 * 该调用第一次出现的位置,所以轮询到新决策时已有行不会跳动。
-		 * @param entries - 宿主返回的记录,由旧到新。
-		 * @returns 每行一条的记录。
-		 */
-		function collapse(entries) {
-			const rows = new Map();
-			for (const [index, entry] of entries.entries()) {
-				const key = typeof entry.callId === "string" && entry.callId !== ""
-					? entry.callId
-					: "record-" + String(index);
-				const previous = rows.get(key);
-				if (previous === undefined || rankOf(entry) >= rankOf(previous)) rows.set(key, entry);
-			}
-			return Array.from(rows.values());
-		}
-
-		/** 一行里的时间,读不出来时为空。 */
-		function timeOf(entry) {
-			const at = typeof entry.at === "string" ? new Date(entry.at) : null;
-			return at === null || Number.isNaN(at.getTime()) ? "" : at.toLocaleTimeString();
-		}
-
-		/** 一行里点名的路径:优先说缺什么,其次说哪条规则放行的。 */
-		function detailOf(entry) {
-			const labels = [];
-			for (const item of entry.missing ?? []) labels.push(item.operation + " " + (item.path ?? entry.command ?? ""));
-			if (labels.length > 0) return labels.join(", ");
-			if (entry.origin !== "rule") return "";
-			for (const rule of entry.matchedRules ?? []) {
-				const access = Object.keys(rule.access ?? {}).join("+");
-				labels.push((access === "" ? "" : access + " ") + rule.path);
-			}
-			return labels.join(", ");
-		}
-
-		/** 一行里自动审核那次的结论。 */
-		function reviewOf(t, entry) {
-			if (entry.review === null || typeof entry.review !== "object") return null;
-			return t("logReviewer", {
-				verdict: entry.review.verdict ?? "?",
-				latency: entry.review.latencyMs === undefined ? "?" : String(entry.review.latencyMs),
-				route: entry.review.route ?? "inherit"
-			});
-		}
-
-		/** 一行里「总是允许」写下的规则。 */
-		function storedRulesOf(t, entry) {
-			if (entry.action !== "always-allow" || !Array.isArray(entry.rules) || entry.rules.length === 0) return null;
-			return t("logStoredRules", { rules: entry.rules.map((rule) => rule.label ?? rule.path).join(" + ") });
-		}
-
-		/**
-		 * 一行审批记录。
-		 * @param props.entry - 一条审计记录。
+		 * 一条策略决定的紧凑行:来源徽章 + 命令(或原因) + 细节。
+		 * @param props.node - 本行对应的 Chat Node,负载是宿主写下的审计记录。
 		 * @param props.t - 本命名空间的翻译函数。
+		 * @returns 这一行的元素。
 		 */
-		function LedgerRow(props) {
-			const entry = props.entry;
+		function AllowDecisionRow(props) {
 			const t = props.t;
-			const action = ACTION_LABEL[entry.action];
-			const detail = detailOf(entry);
-			const review = reviewOf(t, entry);
-			const stored = storedRulesOf(t, entry);
-			const time = timeOf(entry);
-			return React.createElement("div", { className: "dsha_logRow" },
-				React.createElement("div", { className: "dsha_logTop" },
-					time === "" ? null : React.createElement("span", { className: "dsha_logTime" }, time),
-					React.createElement("span", { className: "dsha_logBadge", "data-origin": entry.origin },
-						ORIGIN_LABEL[entry.origin] === undefined ? entry.origin : t(ORIGIN_LABEL[entry.origin])),
-					action === undefined ? null : React.createElement("span", { className: "dsha_logTime" }, t(action))),
-				entry.command === null || entry.command === undefined
-					? null
-					: React.createElement("div", { className: "dsha_logCommand" }, entry.command),
-				detail === "" ? null : React.createElement("div", { className: "dsha_logDetail" }, t("logPaths", { paths: detail })),
-				stored === null ? null : React.createElement("div", { className: "dsha_logDetail" }, stored),
-				review === null ? null : React.createElement("div", { className: "dsha_logDetail" }, review),
-				entry.reason === null || entry.reason === undefined
-					? null
-					: React.createElement("div", { className: "dsha_logReason" }, entry.reason));
+			const record = props.node !== undefined && props.node !== null && typeof props.node.data === "object" && props.node.data !== null
+				? props.node.data
+				: {};
+			const origin = originOfRecord(record);
+			const label = t(decisionLabelKey(record));
+			const said = typeof record.command === "string" && record.command !== ""
+				? record.command
+				: (typeof record.reason === "string" && record.reason !== "" ? record.reason : null);
+			const detail = decisionDetail(record, t);
+			return React.createElement("div", { className: "dsha_decision" },
+				// 与轨迹行同一个符号:两个视图扫一眼是同一套标记。
+				React.createElement("span", { className: "dsha_decisionEmoji", "aria-hidden": "true" }, decisionEmoji(record)),
+				React.createElement("span", { className: "dsha_logBadge", "data-origin": origin }, label),
+				said === null ? null : React.createElement("span", { className: "dsha_decisionCommand" }, shorten(said, 160)),
+				detail === null ? null : React.createElement("span", { className: "dsha_decisionDetail" }, detail));
 		}
 
 		/**
-		 * 审批记录标签页:当前会话里每一次决策是谁拍的板。
-		 *
-		 * 只读,只走宿主那条 loopback 读路由;它不写规则、不回答任何审批。
-		 * @param props.sessionId - 当前会话 id。
-		 * @param props.t - 由 `locale: NS` 注入的翻译函数。
+		 * 一行决定里除命令以外的细节:命中/写入的规则路径、自动复核的判定,
+		 * 或这次调用还缺哪些能力。文案全部取自既有字典键。
+		 * @param record - 宿主写下的审计记录。
+		 * @param t - 本命名空间的翻译函数。
+		 * @returns 要显示的细节,没有可说的则为 null。
 		 */
-		function AllowLogView(props) {
-			const t = props.t;
-			const sessionId = typeof props.sessionId === "string" ? props.sessionId : null;
-			const [state, setState] = React.useState({ status: "loading", entries: [], truncated: false, error: null });
-			const [showBaseline, setShowBaseline] = React.useState(false);
-
-			React.useEffect(() => {
-				if (sessionId === null) return undefined;
-				let cancelled = false;
-				const load = () => {
-					void readLedger(sessionId, showBaseline).then((answer) => {
-						if (!cancelled) {
-							setState({ status: "ready", entries: answer.entries, truncated: answer.truncated, error: null });
-						}
-					}, (cause) => {
-						if (!cancelled) {
-							setState({
-								status: "error",
-								entries: [],
-								truncated: false,
-								error: cause && cause.message ? cause.message : String(cause)
-							});
-						}
-					});
-				};
-				load();
-				const timer = setInterval(load, LOG_POLL_MS);
-				return () => {
-					cancelled = true;
-					clearInterval(timer);
-				};
-			}, [sessionId, showBaseline]);
-
-			const rows = collapse(state.entries);
-			const body = [];
-			if (sessionId === null) body.push(React.createElement("div", { className: "dsha_logNote", key: "nosession" }, t("logEmpty")));
-			else if (state.status === "loading") body.push(React.createElement("div", { className: "dsha_logNote", key: "loading" }, t("logLoading")));
-			else if (state.status === "error") body.push(React.createElement("div", { className: "dsha_logNote", key: "error" }, t("logError", { message: String(state.error) })));
-			else if (rows.length === 0) body.push(React.createElement("div", { className: "dsha_logNote", key: "empty" }, t("logEmpty")));
-			else {
-				for (const [index, entry] of rows.entries()) body.push(React.createElement(LedgerRow, { key: "row-" + String(index), entry, t }));
-				if (state.truncated) body.push(React.createElement("div", { className: "dsha_logNote", key: "truncated" }, t("logTruncated", { count: String(rows.length) })));
+		function decisionDetail(record, t) {
+			const paths = (entries) => {
+				if (!Array.isArray(entries)) return "";
+				const seen = [];
+				for (const entry of entries) {
+					const path = String(entry?.path ?? "");
+					if (path !== "" && !seen.includes(path)) seen.push(path);
+				}
+				return seen.join(", ");
+			};
+			if (record.origin === "rule") {
+				const named = paths(record.matchedRules);
+				if (named !== "") return t("logPaths", { paths: named });
 			}
-
-			return React.createElement("div", { className: "dsha_log" },
-				React.createElement("div", { className: "dsha_logBar" },
-					React.createElement("span", { className: "dsha_logTitle" }, t("logTitle")),
-					React.createElement("span", { className: "dsha_logCount" }, t("logScope")),
-					React.createElement("span", { className: "dsha_logSpacer" }),
-					React.createElement(primitives.Button, {
-						variant: showBaseline ? "primary" : "outline",
-						onClick: () => { setShowBaseline(!showBaseline); }
-					}, showBaseline ? t("logHideBaseline") : t("logShowBaseline"))),
-				React.createElement("div", { className: "dsha_logList" }, body));
+			if (record.action === "always-allow") {
+				const stored = paths(record.rules);
+				if (stored !== "") return t("logStoredRules", { rules: stored });
+			}
+			if (record.origin === "auto-review" && record.review !== undefined && record.review !== null) {
+				return t("logReviewer", {
+					verdict: String(record.review.verdict ?? ""),
+					latency: String(record.review.latencyMs ?? ""),
+					route: String(record.review.route ?? "")
+				});
+			}
+			const missing = Array.isArray(record.missing)
+				? record.missing
+					.map((entry) => String(entry?.operation ?? "") + " " + String(entry?.path ?? ""))
+					.join(", ")
+					.trim()
+				: "";
+			return missing === "" ? null : missing;
 		}
+
+		/**
+		 * Chat 业务定义:把宿主的每条 `dsh-allow/decision` 事件折成一行,紧挨着
+		 * 它所回答的那次工具调用。事件是 log-only(非 surface)的,所以这条路
+		 * 既不进模型上下文,也不需要任何宿主接口。
+		 */
+		const allowDecisionDefinition = {
+			kind: "allow-decision",
+			target: "chat",
+			match: (event) => (event.type === DECISION_EVENT
+				? { id: decisionIdOf(event), role: "start" }
+				: null),
+			start: (_context, match) => ({ seq: match.event.seq, record: match.event.data }),
+			update: (context, match) => (match.event.type === DECISION_EVENT
+				? { seq: match.event.seq, record: match.event.data }
+				: context.state),
+			buildViewNode: (context) => {
+				const state = context.state;
+				if (state === undefined) return null;
+				return {
+					key: context.key,
+					kind: "allow-decision",
+					id: context.id,
+					target: "chat",
+					anchorSeq: state.seq,
+					location: context.start !== undefined && context.start.location !== undefined
+						? context.start.location
+						: { kind: "unresolved" },
+					visibility: "visible",
+					data: state.record
+				};
+			}
+		};
 		//#endregion
 
 		//#region plugin
-		const inject = ["slots", "locale"];
+		const inject = ["slots", "locale", "sessions", "uiConversation"];
 
-		/** 注册字典、同款审批卡片,以及轨迹旁边的审批记录标签页。 */
+		/** 注册字典、同款审批卡片,以及每条策略决定在对话流里的一行。 */
 		function apply(ctx) {
 			ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-allow: dictionaries");
+			// 每条决定都由宿主写进会话日志,这里把那条事件折成一行,渲染在它回答的
+			// 工具调用旁边 —— 数据全程来自事件流,没有宿主接口参与。
+			ctx.effect(() => ctx.uiConversation.events.register(allowDecisionDefinition), "dsh-allow: decision definition");
+			// 同一条事件再进轨迹账本一份:轨迹的行类型由宿主提供,文案由本插件的字典生成。
+			ctx.effect(() => ctx.uiConversation.events.register(
+				createTrajectoryDefinition((key, params) => ctx.locale.bind(NS)(key, params))
+			), "dsh-allow: trajectory definition");
+			ctx.slots.inject("conversation.chat.node", () => {
+				const dispose = ctx.slots.register({
+					name: "conversation.chat.node",
+					key: "allow-decision",
+					locale: NS
+				}, AllowDecisionRow);
+				return () => { dispose(); };
+			});
 			// priority 0 排在内置审批卡片(priority 1)之前:本插件接管的审批由本卡片渲染,
 			// 其它审批 select 返回 null,链继续走到内置卡片。
 			ctx.slots.inject("conversation.composer", () => {
@@ -547,20 +572,21 @@ window.__ModuleLoader__.load({
 					name: "conversation.composer",
 					priority: 0,
 					select: ({ pendingInteraction }) => escalationOf(pendingInteraction),
-					locale: NS
-				}, AllowPanel);
-				return () => { dispose(); };
-			});
-			// 「对话 / 轨迹」旁边的第三个标签页。label 走 thunk,所以跟着当前语言走。
-			ctx.slots.inject("conversation.view", () => {
-				const t = ctx.locale.bind(NS);
-				const dispose = ctx.slots.register({
-					name: "conversation.view",
-					id: "allow-log",
-					order: 20,
 					locale: NS,
-					label: () => t("viewAllowLog")
-				}, AllowLogView);
+					// 记住动作走会话命令通道,由宿主写入它自己推导出的规则。
+					inject: () => ({
+						remember: (sessionId, callId) => {
+							const binding = ctx.sessions.binding(sessionId);
+							if (binding === undefined) {
+								return Promise.resolve({
+									ok: false,
+									error: { code: "NO_SESSION", message: "这个会话还没有物化" }
+								});
+							}
+							return binding.session.command("/allow remember " + callId);
+						}
+					})
+				}, AllowPanel);
 				return () => { dispose(); };
 			});
 		}
@@ -569,12 +595,13 @@ window.__ModuleLoader__.load({
 		exports.inject = inject;
 		// 供离线冒烟测试使用。
 		exports.escalationOf = escalationOf;
+		exports.isPolicyAsk = isPolicyAsk;
 		exports.shorten = shorten;
-		exports.alwaysText = alwaysText;
 		exports.AllowPanel = AllowPanel;
-		exports.collapse = collapse;
-		exports.detailOf = detailOf;
-		exports.AllowLogView = AllowLogView;
+		exports.AllowDecisionRow = AllowDecisionRow;
+		exports.allowDecisionDefinition = allowDecisionDefinition;
+		exports.createTrajectoryDefinition = createTrajectoryDefinition;
+		exports.DECISION_EVENT = DECISION_EVENT;
 		//#endregion
 
 		return module.exports;

@@ -52,38 +52,6 @@ const recordsOf = (file, callId) => auditOf(file).filter(entry => entry.callId =
 /** The one decision the user made about a call, or undefined. */
 const humanRecordOf = (file, callId) => recordsOf(file, callId).find(entry => entry.origin === 'human')
 
-/** A Web route request. */
-function fakeRequest({ method = 'GET', url = '/', headers = {}, body, remoteAddress = '127.0.0.1' } = {}) {
-  return {
-    method,
-    url,
-    headers: { host: '127.0.0.1:3080', ...headers },
-    socket: { remoteAddress },
-    async *[Symbol.asyncIterator]() {
-      if (body !== undefined) yield Buffer.from(body)
-    },
-  }
-}
-
-/** Drive one route handler and return its parsed answer. */
-async function call(handler, request) {
-  const response = {
-    statusCode: 0,
-    body: '',
-    writeHead(code) { this.statusCode = code },
-    end(chunk) { if (chunk !== undefined) this.body += String(chunk) },
-  }
-  await handler(request, response)
-  return { status: response.statusCode, json: response.body === '' ? null : JSON.parse(response.body) }
-}
-
-const post = (path, body) => fakeRequest({
-  method: 'POST',
-  url: path,
-  headers: { origin: 'http://127.0.0.1:3080', 'content-type': 'application/json' },
-  body: JSON.stringify(body),
-})
-
 console.log('who answered a decision')
 {
   const file = join(root, 'origin.ndjson')
@@ -204,27 +172,27 @@ console.log('what the user clicked')
   const approval = host.createApprovalListener({
     engine: host.createEngine({ config: where, home: HOME, grants, pendings, ctx }),
     pendings,
+    grants,
     logger,
     config: where,
     decisions,
   })
-  const onceHandler = host.createOnceHandler({ pendings, grants, logger, decisions })
-  const rememberHandler = host.createRememberHandler({ pendings, config: where, logger, decisions })
+  const rememberCall = host.createRememberCall({ pendings, config: where, logger, decisions })
 
-  // "allow once": the card grants through the route and then settles the approval.
+  // "allow once": the card answers the approval, and this listener grants it.
   await gate(exec('rm -rf one', { callId: 'h1' }), next)
-  let answer = await call(onceHandler, post('/dsh-allow/once', { sessionId: 's1', callId: 'h1' }))
-  check('the once route still grants', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
   const settled = await approval({ agent: { session: sessionOf('s1') }, callId: 'h1' }, () => Promise.resolve('allowed-once'))
   check('the approval outcome passes through unchanged', settled === 'allowed-once', String(settled))
   const onceRecord = humanRecordOf(file, 'h1')
   check('recorded as a human allow-once with the command it answered',
     onceRecord?.action === 'allow-once' && onceRecord?.command === 'rm -rf one', JSON.stringify(recordsOf(file, 'h1')))
+  check('and the host minted the one-shot grant from its own record',
+    grants.rulesFor('s1', 'h1').length === 1, JSON.stringify(grants.rulesFor('s1', 'h1')))
 
-  // "always allow": the route writes the rule and the note carries its label.
+  // "always allow": the command writes the rule and the note carries its label.
   await gate(exec('rm -rf two', { callId: 'h2' }), next)
-  answer = await call(rememberHandler, post('/dsh-allow/remember', { sessionId: 's1', callId: 'h2' }))
-  check('the remember route still writes the rule', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
+  const remembered = rememberCall('s1', 'h2')
+  check('remembering writes the rule', remembered.ok === true, JSON.stringify(remembered))
   await approval({ agent: { session: sessionOf('s1') }, callId: 'h2' }, () => Promise.resolve('allowed-once'))
   const alwaysRecord = humanRecordOf(file, 'h2')
   check('one call, one always-allow record', recordsOf(file, 'h2').filter(entry => entry.origin === 'human').length === 1,
@@ -265,12 +233,12 @@ console.log('what the user clicked')
 
   // The settle listener is the last moment a note is still attributable.
   await gate(exec('rm -rf five', { callId: 'h5' }), next)
-  await call(onceHandler, post('/dsh-allow/once', { sessionId: 's1', callId: 'h5' }))
+  rememberCall('s1', 'h5')
   const settle = host.createSettleListener({ grants, logger, pendings, decisions, config: where })
   await settle(exec('rm -rf five', { callId: 'h5' }), { kind: 'accepted' }, next)
   const settledRecord = humanRecordOf(file, 'h5')
   check('a note no approval consumed is recorded when the call settles',
-    settledRecord?.action === 'allow-once', JSON.stringify(recordsOf(file, 'h5')))
+    settledRecord?.action === 'always-allow', JSON.stringify(recordsOf(file, 'h5')))
 
   // Auditing off means no line, whichever layer decided.
   const silent = join(root, 'silent.ndjson')
@@ -349,43 +317,28 @@ console.log('reading the log from its end')
   check('a file of blank lines answers nothing', store.readAuditTail(partial, { sessionId: 's4' }).entries.length === 0)
 }
 
-console.log('the audit route')
+console.log('the /allow log view')
 {
   const file = join(root, 'route.ndjson')
-  const where = { ...config, auditFile: file }
-  const handler = host.createAuditHandler({ config: where, logger })
+  const rules = join(root, 'log-rules.json')
   rmSync(file, { force: true })
   mkdirSync(dirname(file), { recursive: true })
   for (const [sessionId, origin, action] of [['s1', 'baseline', null], ['s1', 'rule', null], ['s1', 'human', 'allow-once'], ['s2', 'rule', null]]) {
     appendFileSync(file, `${JSON.stringify({ at: '2026-01-01T00:00:00.000Z', sessionId, origin, action, decision: 'allow', command: 'ls', tool: 'bash' })}\n`)
   }
-  let answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit?sessionId=s1' }))
-  check('the route answers', answer.status === 200 && answer.json.ok === true, JSON.stringify(answer.json))
-  check('with the session\'s non-baseline records',
-    answer.json.entries.length === 2 && answer.json.entries.every(entry => entry.sessionId === 's1'),
-    JSON.stringify(answer.json.entries))
-  check('and the shape the tab renders',
-    answer.json.entries.at(-1)?.origin === 'human' && answer.json.entries.at(-1)?.action === 'allow-once'
-    && answer.json.entries.at(-1)?.matchedRules?.length === 0, JSON.stringify(answer.json.entries.at(-1)))
-  answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit?sessionId=s1&baseline=1' }))
-  check('the baseline flag includes platform allows', answer.json.entries.length === 3, JSON.stringify(answer.json.entries.length))
-  answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit?sessionId=s2' }))
-  check('another session sees only its own', answer.json.entries.length === 1 && answer.json.entries[0].sessionId === 's2')
-  answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit?sessionId=s1&limit=1' }))
-  check('the limit keeps the newest', answer.json.entries.length === 1 && answer.json.entries[0].action === 'allow-once', JSON.stringify(answer.json.entries))
-  answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit?sessionId=s1&limit=99999' }))
-  check('the limit is clamped to the route maximum', answer.json.limit === 500, String(answer.json.limit))
-  answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit?sessionId=s1&limit=nonsense' }))
-  check('a nonsense limit falls back to the default', answer.json.limit === 200, String(answer.json.limit))
-  answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit?sessionId=unknown' }))
-  check('an unknown session answers an empty list', answer.json.entries.length === 0)
-  answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit?sessionId=s1', remoteAddress: '10.0.0.9' }))
-  check('a non-loopback read is refused', answer.status === 403)
-  answer = await call(handler, fakeRequest({ url: '/dsh-allow/audit', method: 'POST' }))
-  check('a write method is refused', answer.status === 405)
-  const empty = host.createAuditHandler({ config: { ...where, auditFile: join(root, 'none.ndjson') }, logger })
-  answer = await call(empty, fakeRequest({ url: '/dsh-allow/audit?sessionId=s1' }))
-  check('a missing log answers an empty list', answer.status === 200 && answer.json.entries.length === 0)
+  const log = limit => host.runAllowCommand(
+    { file: rules, auditFile: file },
+    limit === undefined ? 'log' : `log ${String(limit)}`,
+  )
+  const answer = log()
+  check('the command answers', answer.kind === 'success', JSON.stringify(answer))
+  check('with the newest records', answer.text.includes('approval') || answer.text.includes('审批'), answer.text)
+  check('and the human decision it holds', answer.text.includes('允许一次'), answer.text)
+  check('a limit keeps the newest only', log(1).text.split('\n').length === 2, log(1).text)
+  const missing = host.runAllowCommand({ file: rules, auditFile: join(root, 'none.ndjson') }, 'log')
+  check('a missing log answers an empty list', missing.kind === 'success' && missing.text.includes('还没有'), missing.text)
+  const unusable = host.runAllowCommand({ file: rules }, 'log')
+  check('a deployment without an audit file says so', unusable.kind === 'error', JSON.stringify(unusable))
 }
 
 rmSync(root, { recursive: true, force: true })
