@@ -306,8 +306,18 @@ window.__ModuleLoader__.load({
 
 
 		//#region decisions
-		/** 宿主给每条策略决定写下的会话事件类型。 */
-		const DECISION_EVENT = "dsh-allow/decision";
+		/**
+		 * 宿主给每条策略决定写下的记录名，以及迁移到 harness 的 `plugin:` 命名空间之前
+		 * 使用的旧名。Session 保留它被写入时的名字，所以两个名字都折叠成同一行。
+		 */
+		const DECISION_EVENT = "plugin:dsh-allow/decision";
+		const DECISION_EVENT_LEGACY = "dsh-allow/decision";
+		/**
+		 * 这条事件是否是一条策略决定记录。
+		 * @param event - 会话事件。
+		 * @returns 是当前记录名或迁移前的旧名时为 true。
+		 */
+		const isDecisionEvent = (event) => event?.type === DECISION_EVENT || event?.type === DECISION_EVENT_LEGACY;
 		/** 记录来源的分类文案。 */
 		const ORIGIN_KEYS = {
 			rule: "logOriginRule",
@@ -425,6 +435,7 @@ window.__ModuleLoader__.load({
 			const fold = (match) => ({
 				seq: match.event.seq,
 				time: typeof match.event.time === "number" ? match.event.time : 0,
+				key: String(match.event.type),
 				record: match.event.data
 			});
 			return {
@@ -433,11 +444,11 @@ window.__ModuleLoader__.load({
 				// the chat renderer dispatches on, and this one only names the row.
 				kind: "trajectory-allow-decision",
 				target: "trajectory",
-				match: (event) => (event.type === DECISION_EVENT
+				match: (event) => (isDecisionEvent(event)
 					? { id: decisionIdOf(event), role: "start" }
 					: null),
 				start: (_context, match) => fold(match),
-				update: (context, match) => (match.event.type === DECISION_EVENT ? fold(match) : context.state),
+				update: (context, match) => (isDecisionEvent(match.event) ? fold(match) : context.state),
 				buildViewNode: (context) => {
 					const current = context.state;
 					if (current === undefined) return null;
@@ -456,7 +467,7 @@ window.__ModuleLoader__.load({
 								kind: "extension",
 								seq: current.seq,
 								time: current.time,
-								key: DECISION_EVENT,
+								key: current.key,
 								text: decisionSummary(current.record, translate),
 								value: current.record,
 								tone: ORIGIN_TONES[originOfRecord(current.record)] ?? "neutral"
@@ -550,18 +561,18 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Chat 业务定义:把宿主的每条 `dsh-allow/decision` 事件折成一行,紧挨着
-		 * 它所回答的那次工具调用。事件是 log-only(非 surface)的,所以这条路
-		 * 既不进模型上下文,也不需要任何宿主接口。
+		 * Chat 业务定义:把宿主的每条策略决定记录折成一行,紧挨着它所回答的那次
+		 * 工具调用。记录是 log-only(非 surface)的,所以这条路既不进模型上下文,
+		 * 也不需要任何宿主接口。迁移前写入的旧名同样折叠。
 		 */
 		const allowDecisionDefinition = {
 			kind: "allow-decision",
 			target: "chat",
-			match: (event) => (event.type === DECISION_EVENT
+			match: (event) => (isDecisionEvent(event)
 				? { id: decisionIdOf(event), role: "start" }
 				: null),
 			start: (_context, match) => ({ seq: match.event.seq, record: match.event.data }),
-			update: (context, match) => (match.event.type === DECISION_EVENT
+			update: (context, match) => (isDecisionEvent(match.event)
 				? { seq: match.event.seq, record: match.event.data }
 				: context.state),
 			buildViewNode: (context) => {

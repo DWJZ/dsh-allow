@@ -226,7 +226,7 @@ Every review is logged and audited with the command, the requested capabilities,
 
 ## The approval ledger
 
-Every decision this layer makes is audited twice: the audit log the policy layer owns, and one informational session event (`dsh-allow/decision`) that the interface renders twice from the same log — a row beside the tool call in **Chat**, and a row in the **Trajectory** ledger.
+Every decision this layer makes is audited twice: the audit log the policy layer owns, and one Session record (`plugin:dsh-allow/decision`, written through the harness's `appendPluginRecord`) that the interface renders twice from the same log — a row beside the tool call in **Chat**, and a row in the **Trajectory** ledger. A Session written before the migration keeps its older `dsh-allow/decision` name, and both views fold that too.
 
 The trajectory row needs no renderer of its own: it is an `extension` record carrying this plugin's localized summary, its tone, and the raw audit record — the summary and tone label the row, and the shared details payload tab shows the record. Each origin has its own colour in both views: `rule` green, `baseline` grey, `auto-review` blue, `human` amber, `policy` red. Every row also leads with a symbol — `✅` allow once, `♾️` always allow, `🚫` denied, `↩️` cancelled, `⌛` no answerer, `📋` rule, `⚪` baseline, `🤖` auto review — because colour separates origins and the two human outcomes share one.
 

@@ -21,6 +21,7 @@
  * what answers it is one operation of one tool — see `src/toolrules.js`.
  */
 import { homedir } from 'node:os'
+import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { canonicalPath, describeRule, protectedRefusal } from './fspolicy.js'
 import { describeToolRule, isJudgedTool, matchToolRule, matchedToolRuleOf, toolRequestOf } from './toolrules.js'
 import { evaluateCommandLine } from './decide.js'
@@ -206,7 +207,7 @@ export function createEngine({ config, home, grants, pendings, ctx = null, enfor
       unknown: decision.unknown.map(entry => entry.reason),
       matchedRules: matchedRulesOf(decision.usedRules),
     }
-    if (config.audit && !silent && !deferAudit) recordDecision(config, audit, exec?.agent?.session ?? null)
+    if (config.audit && !silent && !deferAudit) recordDecision(config, audit, exec?.agent?.session ?? null, ctx?.logger ?? null)
     return { decision, policy, workspaceRoot, audit }
   }
 
@@ -321,7 +322,7 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
           sessionId: exec?.agent?.session?.id ?? null,
           callId: typeof exec?.callId === 'string' ? exec.callId : null,
           matchedRules: [],
-        }, exec?.agent?.session ?? null)
+        }, exec?.agent?.session ?? null, logger)
       }
       return {
         kind: 'deny',
@@ -333,7 +334,7 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
     const context = engine.decide({ exec, command, cwd, deferAudit: reviewing })
     const { decision } = context
     if (decision.decision === 'allow') {
-      if (reviewing) recordDecision(config, context.audit, exec?.agent?.session ?? null)
+      if (reviewing) recordDecision(config, context.audit, exec?.agent?.session ?? null, logger)
       markSettled(exec, context.audit?.origin, context.audit, command, cwd)
       return next()
     }
@@ -363,7 +364,7 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
           decision: 'allow',
           origin: 'auto-review',
           reason: `auto review allowed this call once: ${review.reason}`,
-        }, exec?.agent?.session ?? null)
+        }, exec?.agent?.session ?? null, logger)
         logger.info(`dsh-allow: auto review allowed this call once — ${review.reason}`)
         markSettled(exec, 'auto-review', record, command, cwd)
         return next()
@@ -372,11 +373,11 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
         ...record,
         decision: 'prompt',
         reason: `auto review deferred to the user: ${review.reason}`,
-      }, exec?.agent?.session ?? null)
+      }, exec?.agent?.session ?? null, logger)
     } else if (reviewing) {
       // The reviewer answers prompts only; a decision it was never asked about
       // still owes the one audit record this layer deferred.
-      recordDecision(config, context.audit, exec?.agent?.session ?? null)
+      recordDecision(config, context.audit, exec?.agent?.session ?? null, logger)
     }
     remember(pendings, exec, context, command, cwd)
     if (decision.decision === 'forbidden') {
@@ -427,32 +428,40 @@ function auditTarget(config) {
   return config.auditFile ?? null
 }
 
-/** Session event type this plugin records each policy decision under. */
-export const DECISION_EVENT = 'dsh-allow/decision'
+/** Session record name this plugin records each policy decision under. */
+export const DECISION_EVENT = 'plugin:dsh-allow/decision'
 
 /**
  * Record one decision: the audit line this layer owns, and — when the deployment
- * enabled it and the deciding session is live — an informational session event the
- * Conversation renders as a row beside the call it answered.
+ * enabled it and the deciding session is live — a Session record the Conversation
+ * renders as a row beside the call it answered.
  *
- * The event carries the envelope's `ignorable` marker, so a build that does not
- * know this type skips it instead of refusing the whole session. Its payload is
- * the same redacted record the audit file holds, so a log reader sees exactly
+ * `appendPluginRecord` writes the harness's own record envelope: the name grammar,
+ * the `ignorable` marker and the JSON snapshot are the harness's to apply, which
+ * is why this half imports it rather than appending an event itself. The payload
+ * is the same redacted record the audit file holds, so a log reader sees exactly
  * what an audit line holds and nothing more.
  *
- * The audit file follows the `audit` switch. The event follows
- * `appendSessionEvents`, which is off by default: a reader only accepts the
- * marker from a build that honours it, so a deployment asks for the rows rather
- * than receiving them unasked.
- * @param config - resolved plugin configuration (the audit and session-event switches).
+ * The audit file follows the `audit` switch. The record follows
+ * `appendSessionEvents`, which is off by default: a record is an echo of the
+ * decision, so a deployment asks for the rows rather than receiving them unasked.
+ * @param config - resolved plugin configuration (the audit and session-record switches).
  * @param audit - the decision record.
  * @param session - the deciding session, when the caller holds it.
+ * @param logger - optional sink for a record that could not be written.
  */
-export function recordDecision(config, audit, session = null) {
+export function recordDecision(config, audit, session = null, logger = null) {
   appendAudit(auditTarget(config), audit)
   if (config?.appendSessionEvents !== true) return
-  if (session === null || session === undefined || typeof session.append !== 'function') return
-  session.append(DECISION_EVENT, JSON.parse(redact(JSON.stringify(audit))), { ignorable: true })
+  if (session === null || session === undefined) return
+  // The audit line is the guarantee; the record is the trace the Conversation
+  // draws beside the call it answered. A record that cannot be written must not
+  // take the decision down with it, so it is contained and reported.
+  try {
+    appendPluginRecord(session, DECISION_EVENT, JSON.parse(redact(JSON.stringify(audit))))
+  } catch (failure) {
+    logger?.warn?.(`dsh-allow: could not record the decision on the Session: ${String(failure?.message ?? failure)}`)
+  }
 }
 
 /** The recorded action one approval outcome stands for. */
@@ -504,7 +513,7 @@ function describeHumanAction(action, note) {
  * @returns the recorded action, or null when nothing was recorded.
  */
 export function settleHumanDecision(
-  { config = null, pendings, decisions = null },
+  { config = null, pendings, decisions = null, logger = null },
   { sessionId, callId, outcome, tool = 'bash', session = null },
 ) {
   if (typeof callId !== 'string') return null
@@ -532,7 +541,7 @@ export function settleHumanDecision(
     callId,
     missing: record?.missing ?? [],
     ...(action === 'always-allow' ? { rules: note?.rules ?? [] } : {}),
-  }, session)
+  }, session, logger)
   return action
 }
 
@@ -552,7 +561,7 @@ export function createSettleListener({ grants, logger, pendings = null, decision
     // that decision is still attributable.
     if (pendings !== null && decisions !== null && decisions.peek(exec?.agent?.session?.id, exec?.callId) !== null) {
       settleHumanDecision(
-        { config, pendings, decisions },
+        { config, pendings, decisions, logger },
         {
           sessionId: exec?.agent?.session?.id,
           callId: exec?.callId,
@@ -656,7 +665,7 @@ export function createApprovalListener({ engine, pendings, grants = null, logger
       }
     }
     return settleHumanDecision(
-      { config, pendings, decisions },
+      { config, pendings, decisions, logger },
       { sessionId, callId, outcome, tool: 'bash', session },
     )
   }
@@ -696,7 +705,7 @@ export function createApprovalListener({ engine, pendings, grants = null, logger
           sessionId: sessionId ?? null,
           callId,
           matchedRules: settled.matchedRules ?? [],
-        }, request?.agent?.session ?? null)
+        }, request?.agent?.session ?? null, logger)
         logger.info(`dsh-allow: followed the rule for the escalation of call ${String(callId)}`)
         return 'allowed-once'
       }
@@ -725,7 +734,7 @@ export function createApprovalListener({ engine, pendings, grants = null, logger
           sessionId: sessionId ?? null,
           callId,
           matchedRules: [matchedToolRuleOf(matched)],
-        }, request?.agent?.session ?? null)
+        }, request?.agent?.session ?? null, logger)
         logger.info(`dsh-allow: the tool rule "${describeToolRule(matched)}" allowed call ${String(callId)} without a card`)
         return 'allowed-once'
       }

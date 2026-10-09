@@ -186,7 +186,7 @@ check('the built node carries the record and its log position',
 console.log('the trajectory row')
 const trajectoryNode = trajectoryDefinition.buildViewNode({
   ...decisionContext,
-  state: { seq: 7, time: decisionEvent.time, record: decisionEvent.data },
+  state: { seq: 7, time: decisionEvent.time, key: String(decisionEvent.type), record: decisionEvent.data },
 })
 check('the trajectory target gets a plugin-extension row',
   trajectoryNode?.data?.kind === 'node' && trajectoryNode?.data?.node?.kind === 'extension',

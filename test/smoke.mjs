@@ -35,16 +35,37 @@ const check = (name, condition, detail = '') => {
   }
 }
 
-const logger = { info: () => {}, warn: () => {}, error: () => {} }
-const decisionEvents = []
-const session = {
-  id: 's1',
-  seq: 0,
-  header: { cwd: CWD },
-  eventAt: () => undefined,
-  append: (type, data, opts) => { decisionEvents.push({ type, data, opts }); return { type, data } },
+const { Session, SessionId, SESSION_FORMAT_VERSION, pluginRecordOf } = await import('@deepseek-ai/dsh-session')
+
+/**
+ * Every plugin record one Session holds, in log order.
+ * @param target - the Session to read.
+ * @returns the records `pluginRecordOf` recognizes.
+ */
+const recordsOf = (target) => Array.from({ length: Number(target.seq) })
+  .map((_unused, index) => target.eventAt(index))
+  .map(event => (event === undefined ? undefined : pluginRecordOf(event)))
+  .filter(record => record !== undefined)
+
+/**
+ * One Session carrying a working directory, as the runtime creates it.
+ * @param id - the session id.
+ * @returns the Session.
+ */
+const sessionAt = (id) => {
+  const sessionId = SessionId(id)
+  return Session.create(sessionId, undefined, {
+    version: SESSION_FORMAT_VERSION,
+    id: sessionId,
+    createdAt: Date.now(),
+    cwd: CWD,
+    isSeeded: false,
+  })
 }
-const otherSession = { id: 's2', seq: 0, header: { cwd: CWD }, eventAt: () => undefined }
+
+const logger = { info: () => {}, warn: () => {}, error: () => {} }
+const session = sessionAt('s1')
+const otherSession = sessionAt('s2')
 const exec = (command, { name = 'bash', callId = 'c1', workdir, agent = { session } } = {}) => ({
   name,
   callId,
@@ -679,28 +700,23 @@ check('an unknown tool is untouched',
   (await gate({ name: 'present', callId: 'w4', arguments: {}, agent: { session } }, next)).kind === 'allow')
 
 console.log('session decision events')
-const switchEvents = []
-const switchSession = {
-  id: 's-switch',
-  seq: 0,
-  header: { cwd: CWD },
-  eventAt: () => undefined,
-  append: (type, data, opts) => { switchEvents.push({ type, data, opts }); return { type, data } },
-}
+const switchSession = sessionAt('s-switch')
 const probe = { tool: 'bash', origin: 'rule', decision: 'allow' }
 host.recordDecision(store.resolveConfig({ rulesFile, auditFile }, root), probe, switchSession)
-check('a decision writes no session event until a deployment asks for it',
-  switchEvents.length === 0, JSON.stringify(switchEvents))
+check('a decision writes no Session record until a deployment asks for it',
+  recordsOf(switchSession).length === 0, JSON.stringify(recordsOf(switchSession)))
 host.recordDecision(store.resolveConfig({ rulesFile, auditFile, appendSessionEvents: true }, root), probe, switchSession)
 check('and writes exactly one, marked, once the switch is on',
-  switchEvents.length === 1 && switchEvents[0].opts?.ignorable === true, JSON.stringify(switchEvents))
+  recordsOf(switchSession).length === 1 && switchSession.eventAt(0)?.ignorable === true,
+  JSON.stringify(recordsOf(switchSession)))
 check('the audit file is written either way',
-  readFileSync(auditFile, 'utf8').trim().split('\n').length >= 2, String(switchEvents.length))
+  readFileSync(auditFile, 'utf8').trim().split('\n').length >= 2, String(recordsOf(switchSession).length))
 
-const decided = decisionEvents.filter(entry => entry.type === host.DECISION_EVENT)
+const decided = recordsOf(session).filter(entry => entry.type === host.DECISION_EVENT)
 check('every decision this session judged also lands in its log', decided.length > 0, String(decided.length))
 check('each carries the marker a reader without this plugin needs to skip it',
-  decided.every(entry => entry.opts?.ignorable === true), JSON.stringify(decided.map(entry => entry.opts)))
+  decided.every(entry => session.eventAt(entry.seq)?.ignorable === true),
+  JSON.stringify(decided.map(entry => session.eventAt(entry.seq)?.ignorable)))
 check('a stored rule is recorded as a rule allow',
   decided.some(entry => entry.data.origin === 'rule' && entry.data.decision === 'allow'),
   JSON.stringify(decided.map(entry => [entry.data.origin, entry.data.decision])))
