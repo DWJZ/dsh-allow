@@ -5,7 +5,7 @@
  * Usage: `node test/smoke.mjs`.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -670,6 +670,17 @@ check('no Web route is exposed at all',
   registered.routes.length === 0, JSON.stringify(registered.routes.map(route => route.path)))
 check('/allow is registered', registered.commands[0]?.name === 'allow')
 check('the process fence is installed as an effect', registered.effects.length >= 1)
+check('the harness home follows the harness resolver: $DSH_HOME, then the default',
+  store.resolveHome({ DSH_HOME: '/abs/home' }) === '/abs/home'
+  && store.resolveHome({ DSH_HOME: '   ' }) === join(homedir(), '.dsh')
+  && store.resolveHome({}) === join(homedir(), '.dsh'),
+  JSON.stringify([store.resolveHome({ DSH_HOME: '   ' }), store.resolveHome({})]))
+// A relative or `~`-prefixed value stays as written under a second implementation,
+// which moves the rules and the audit log outside the harness home.
+check('a relative or tilde home is normalized the way the harness normalizes it',
+  store.resolveHome({ DSH_HOME: 'relative/home' }) === resolve('relative/home')
+  && store.resolveHome({ DSH_HOME: '~/harness' }) === join(homedir(), 'harness'),
+  JSON.stringify([store.resolveHome({ DSH_HOME: 'relative/home' }), store.resolveHome({ DSH_HOME: '~/harness' })]))
 check('a bad config fails loud', (() => {
   try {
     host.apply(pluginCtx, { sessionGrantTtlMs: -1 })

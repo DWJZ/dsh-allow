@@ -13,8 +13,8 @@ import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync,
   statSync, unlinkSync, writeFileSync,
 } from 'node:fs'
-import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { OPERATIONS, canonicalPath, describeRule, makeRule, normalizeStoredRule } from './fspolicy.js'
 import { makeToolRule, normalizeStoredToolRule, validateToolRule } from './toolrules.js'
 
@@ -52,14 +52,17 @@ const AUDIT_CACHE_LIMIT = 8
 const DECISION_NOTE_LIMIT = 100
 
 /**
- * Resolve the harness home: `$DSH_HOME` when set, otherwise `~/.dsh`.
+ * Resolve the harness home through the harness's own resolver.
+ *
+ * Two implementations of one rule drift: a relative or `~`-prefixed `$DSH_HOME`
+ * used to stay as written here, which put the rules and the audit log somewhere
+ * the harness does not consider its home. The harness normalizes both, and this
+ * plugin runs inside it, so the value comes from there.
  * @param env - environment to read.
  * @returns the absolute harness home.
  */
 export function resolveHome(env = process.env) {
-  const configured = env.DSH_HOME
-  if (typeof configured === 'string' && configured.trim() !== '') return configured.trim()
-  return join(homedir(), '.dsh')
+  return resolveDshHome(undefined, env)
 }
 
 /**
