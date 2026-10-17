@@ -1112,6 +1112,12 @@ export function apply(ctx, pluginConfig) {
   const home = homedir()
   const harnessHome = resolveHome()
   const config = { ...resolveConfig(pluginConfig, harnessHome), harnessHome, home }
+  // The settings shell reads a plugin's schema through `entry.fiber.runtime.Config`. A plugin that
+  // keeps its own settings page declares `auto: false` the way the locale plugin does, so the
+  // shell offers the namespace to the browser without also generating a page for it.
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber))
+  })
   // Before anything can render: the page needs the switch as soon as it loads.
   publishPageConfig(ctx, config.debugRows)
   const pendings = createPendingStore()

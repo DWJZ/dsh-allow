@@ -653,7 +653,12 @@ const pluginCtx = {
       factory({ effect: create => create(), on: () => () => {}, webServer: { register: route => { registered.routes.push(route); return () => {} } } })
       return
     }
-    factory({ effect: create => create(), commands: { register: definition => { registered.commands.push(definition); return () => {} } } })
+    factory({
+      effect: create => create(),
+      commands: { register: definition => { registered.commands.push(definition); return () => {} } },
+      // The settings shell receives this entry's presentation policy.
+      settings: { configure: (presentation) => { registered.presentation = presentation; return () => {} } },
+    })
   },
 }
 host.apply(pluginCtx, { rulesFile, appendSessionEvents: true })
@@ -663,6 +668,8 @@ check('the config schema exposes debugRows as a client-editable field', (() => {
   // Unknown keys survive validation: the plugin keeps its own config resolution.
   return accepted.debugRows !== undefined && accepted.escalation === 'rule' && accepted.appendSessionEvents === true
 })(), JSON.stringify(host.Config({ debugRows: false })))
+check('the entry tells the settings shell not to auto-generate a page',
+  registered.presentation?.auto === false, JSON.stringify(registered.presentation))
 check('the rendering switch is published to every served page', (() => {
   const table = []
   let listener
