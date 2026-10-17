@@ -650,15 +650,21 @@ const pluginCtx = {
   get: (name) => (name === 'profileContext' ? { patchPath: join(root, 'smoke-patch.yml') } : undefined),
   effect: (create) => { registered.effects.push(create()); return () => {} },
   inject: (names, factory) => {
+    const child = {
+      effect: create => create(),
+      on: () => () => {},
+      inject: (innerNames, innerFactory) => pluginCtx.inject(innerNames, innerFactory),
+      webServer: { register: route => { registered.routes.push(route); return () => {} } },
+    }
     if (names.includes('webServer')) {
-      factory({ effect: create => create(), on: () => () => {}, webServer: { register: route => { registered.routes.push(route); return () => {} } } })
+      factory(child)
       return
     }
     factory({
-      effect: create => create(),
+      ...child,
       commands: { register: definition => { registered.commands.push(definition); return () => {} } },
-      // The settings shell receives this entry's presentation policy.
-      settings: { configure: (presentation) => { registered.presentation = presentation; return () => {} } },
+      // The settings shell receives this entry's presentation policy and knows the patch path.
+      settings: { configure: (presentation) => { registered.presentation = presentation; return () => {} }, documentPath: join(root, 'smoke-patch.yml') },
     })
   },
 }

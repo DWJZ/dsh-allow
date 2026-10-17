@@ -639,7 +639,7 @@ window.__ModuleLoader__.load({
 				setBusy(true);
 				setFailed(null);
 				const settle = (accepted) => {
-					if (accepted !== true) { setFailed(t("debugFailed", { message: "refused" })); return }
+					if (accepted !== true) { if (failed === null) setFailed(t("debugFailed", { message: "refused" })); return }
 					setRouted(next);
 					applyDebugRows?.(next);
 				};
@@ -655,7 +655,11 @@ window.__ModuleLoader__.load({
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({ enabled: next })
 				}))
-					.then((response) => response.ok)
+					.then((response) => {
+						if (response.ok) return true;
+						setFailed(t("debugFailed", { message: "HTTP " + String(response.status) }));
+						return false;
+					})
 					.then(settle)
 					.catch((cause) => { setFailed(t("debugFailed", { message: String(cause?.message ?? cause) })) })
 					.finally(() => { setBusy(false) });

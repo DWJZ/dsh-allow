@@ -1104,7 +1104,7 @@ export function runAllowCommand({ file, workspaceRoot, mode, enforcement = null,
 export function publishPageConfig(ctx, state) {
   ctx.inject(['webServer'], (webCtx) => {
     webCtx.effect(() => webCtx.on('webserver/index-inject', (table) => {
-      table.push({ kind: 'global', name: '__DSH_ALLOW_CONFIG__', value: { debugRows: state.debugRows === true } })
+      table.push({ kind: 'global', name: '__DSH_ALLOW_CONFIG__', value: { debugRows: state.debugRows === true, route: state.route === true } })
     }), 'dsh-allow: page config')
   })
 }
@@ -1178,6 +1178,7 @@ export function publishDebugRoute(ctx, state, patchPath) {
         let payload
         try { payload = JSON.parse(request.body ?? '{}') } catch { return { status: 400, body: 'invalid json' } }
         const enabled = payload?.enabled === true
+        state.route = true
         const next = setDebugRowsInPatch(readFileSync(patchPath, 'utf8'), enabled)
         if (next === undefined) return { status: 409, body: 'no dsh-allow entry in this profile patch' }
         writeFileSync(patchPath, next, 'utf8')
@@ -1202,8 +1203,12 @@ export function apply(ctx, pluginConfig) {
   const pageState = { debugRows: config.debugRows === true }
   // Before anything can render: the page needs the switch as soon as it loads.
   publishPageConfig(ctx, pageState)
-  const patchPath = ctx.get('profileContext')?.patchPath
-  publishDebugRoute(ctx, pageState, typeof patchPath === 'string' ? patchPath : undefined)
+  // The settings service already knows which patch this profile edits; it is the same file the
+  // native configuration editor opens, so the switch writes where the form would have written.
+  ctx.inject(['settings'], (settingsCtx) => {
+    const path = settingsCtx.settings?.documentPath
+    if (typeof path === 'string' && path.length > 0) publishDebugRoute(settingsCtx, pageState, path)
+  })
   const pendings = createPendingStore()
   // Which calls a rule already settled. Separate from `pendings`, which is the
   // queue of decisions still owed to the user, because a settled call owes
