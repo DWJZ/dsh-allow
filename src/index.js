@@ -469,8 +469,8 @@ export function isAmbientAllow(audit, config = null) {
   if (audit?.decision !== 'allow') return false
   if (audit?.origin !== 'rule' && audit?.origin !== 'baseline') return false
   const rules = Array.isArray(audit?.matchedRules) ? audit.matchedRules : []
-  if (rules.length === 0) return audit?.origin === 'baseline'
-  return rules.every(rule => rule?.source === 'workspace' || rule?.source === 'system')
+  // A one-shot grant exists because a person pressed a button just now; that is worth a row.
+  return !rules.some(rule => rule?.source === 'session')
 }
 
 export function recordDecision(config, audit, session = null, logger = null) {

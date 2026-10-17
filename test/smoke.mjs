@@ -712,7 +712,8 @@ check('an unknown tool is untouched',
 
 console.log('session decision events')
 const switchSession = sessionAt('s-switch')
-const probe = { tool: 'bash', origin: 'rule', decision: 'allow' }
+// A human answer stays visible regardless of the automatic-allow filter.
+const probe = { tool: 'bash', origin: 'human', decision: 'allow' }
 host.recordDecision(store.resolveConfig({ rulesFile, auditFile }, root), probe, switchSession)
 check('a decision writes no Session record until a deployment asks for it',
   recordsOf(switchSession).length === 0, JSON.stringify(recordsOf(switchSession)))

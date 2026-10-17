@@ -25,8 +25,8 @@ check('a pure baseline allow is dropped', isAmbientAllow(allow('baseline', []), 
 check('mixed workspace+system is dropped', isAmbientAllow(allow('rule', [workspaceRule, systemRule]), {}) === true)
 
 console.log('kept: anything a person would read')
-check('a user rule allow is kept', isAmbientAllow(allow('rule', [userRule]), {}) === false)
-check('a one-shot grant is kept', isAmbientAllow(allow('rule', [userRule, sessionRule]), {}) === false)
+check('a standing user rule allow is dropped too', isAmbientAllow(allow('rule', [userRule]), {}) === true)
+check('a one-shot grant stays visible', isAmbientAllow(allow('rule', [userRule, sessionRule]), {}) === false)
 check('a human allow is kept', isAmbientAllow(allow('human', [workspaceRule]), {}) === false)
 check('an auto-review allow is kept', isAmbientAllow(allow('auto-review', [workspaceRule]), {}) === false)
 check('a prompt is kept', isAmbientAllow({ decision: 'prompt', origin: 'rule', matchedRules: [workspaceRule] }, {}) === false)
