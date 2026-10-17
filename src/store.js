@@ -22,7 +22,6 @@ import { makeToolRule, normalizeStoredToolRule, validateToolRule } from './toolr
 const RULES_FILE_NAME = 'dsh-allow.json'
 
 /** Default file name for the audit log below the harness home. */
-const AUDIT_FILE_NAME = 'dsh-allow-audit.ndjson'
 
 /** How many escalations may wait for a card at once. */
 const PENDING_LIMIT = 100
@@ -154,14 +153,9 @@ export function resolveConfig(config, home) {
     throw new TypeError('dsh-allow: config autoReview.provider and autoReview.model are configured together')
   }
   const rulesFile = text(config?.rulesFile, 'rulesFile', join(home, RULES_FILE_NAME))
-  const auditFile = text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME))
   // Recording a decision as a session event needs a reader that honours the
   // envelope's skip marker, so it stays off until a deployment asks for it.
   const appendSessionEvents = config?.appendSessionEvents ?? false
-  const showAllowedRows = config?.showAllowedRows ?? false
-  if (typeof showAllowedRows !== 'boolean') {
-    throw new TypeError(`dsh-allow: config showAllowedRows must be a boolean, got ${JSON.stringify(config?.showAllowedRows)}`)
-  }
   if (typeof appendSessionEvents !== 'boolean') {
     throw new TypeError(`dsh-allow: config appendSessionEvents must be a boolean, got ${JSON.stringify(appendSessionEvents)}`)
   }
@@ -174,10 +168,7 @@ export function resolveConfig(config, home) {
   }
   return {
     rulesFile,
-    auditFile,
-    audit: config?.audit !== false,
     appendSessionEvents,
-    showAllowedRows,
     escalation,
     sessionGrantTtlMs,
     grants: grants.map(entry => configGrantRule(entry, home)),
@@ -198,7 +189,7 @@ export function resolveConfig(config, home) {
     // Nothing the agent runs may change the rules that judge it. The paths are
     // canonical so they match the paths a decision compares, whatever spelling
     // the configuration used.
-    protectedFiles: [rulesFile, auditFile, join(home, 'dsh-allow.json'), join(home, 'dsh-allow-audit.ndjson')]
+    protectedFiles: [rulesFile, join(home, 'dsh-allow.json')]
       .map(file => canonicalPath(file, { cwd: process.cwd(), home })),
   }
 }
@@ -626,23 +617,6 @@ export function redact(text) {
   return SECRET_PATTERNS.reduce((current, pattern) => current.replace(pattern, '[redacted]'), text)
 }
 
-/**
- * Append one policy decision to the audit log.
- * @param file - absolute audit-file path, or null to disable.
- * @param entry - the decision record.
- */
-export function appendAudit(file, entry) {
-  if (file === null) return
-  try {
-    mkdirSync(dirname(file), { recursive: true })
-    // Redact the serialized record, so arguments and reasons are covered too.
-    const line = JSON.stringify({ at: new Date().toISOString(), ...entry })
-    appendFileSync(file, `${redact(line)}\n`, 'utf8')
-  }
-  catch {
-    // Auditing is best effort; a full disk must not block approvals.
-  }
-}
 
 /**
  * Parse one audit-log line.
@@ -691,72 +665,6 @@ function cacheAuditTail(key, answer) {
   return answer
 }
 
-/**
- * Read the newest audit records from the end of the log, without loading it.
- *
- * The window grows backwards in fixed chunks until the answer is full or the
- * byte cap is reached, so a busy session answers from the last chunk while a
- * quiet one pays for the history it asked about. A file that did not change
- * since the previous identical request is answered from cache.
- *
- * A line a chunk boundary split is dropped rather than repaired: the reader
- * cannot tell a partial line from a malformed one, and a decision it cannot
- * parse is a decision it must not report.
- * @param file - absolute audit-file path.
- * @param options - session filter, answer size, and baseline inclusion.
- * @returns the newest matching records (oldest first), the bytes read, and
- *   whether older matching records remain outside the window.
- */
-export function readAuditTail(file, { sessionId = null, limit = 200, includeBaseline = false } = {}) {
-  const empty = { entries: [], scannedBytes: 0, truncated: false }
-  if (typeof file !== 'string' || file === '' || limit <= 0) return empty
-  let stat
-  try {
-    stat = statSync(file)
-  }
-  catch {
-    // No audit log yet: a session that decided nothing has nothing to show.
-    return empty
-  }
-  if (!stat.isFile() || stat.size === 0) return empty
-  const cacheKey = [file, stat.size, stat.mtimeMs, sessionId ?? '', limit, includeBaseline ? 1 : 0].join('\u0000')
-  const cached = auditTailCache.get(cacheKey)
-  if (cached !== undefined) return cached
-
-  let descriptor
-  try {
-    descriptor = openSync(file, 'r')
-  }
-  catch {
-    return empty
-  }
-  const entries = []
-  let position = stat.size
-  let scannedBytes = 0
-  let carry = ''
-  try {
-    while (position > 0 && entries.length < limit && scannedBytes < AUDIT_MAX_BYTES) {
-      const length = Math.min(AUDIT_CHUNK_BYTES, position, AUDIT_MAX_BYTES - scannedBytes)
-      const buffer = Buffer.allocUnsafe(length)
-      const read = readSync(descriptor, buffer, 0, length, position - length)
-      if (read <= 0) break
-      position -= read
-      scannedBytes += read
-      const lines = (buffer.subarray(0, read).toString('utf8') + carry).split('\n')
-      // The first line is only whole once the chunk before it has been read.
-      carry = position > 0 ? (lines.shift() ?? '') : ''
-      for (let index = lines.length - 1; index >= 0 && entries.length < limit; index -= 1) {
-        const entry = parseAuditLine(lines[index])
-        if (entry !== null && auditMatches(entry, sessionId, includeBaseline)) entries.push(entry)
-      }
-    }
-  }
-  finally {
-    closeSync(descriptor)
-  }
-  entries.reverse()
-  return cacheAuditTail(cacheKey, { entries, scannedBytes, truncated: position > 0 })
-}
 
 /** The key one pending approval is stored under. */
 export function pendingKey(sessionId, callId) {

@@ -28,8 +28,8 @@ import { evaluateCommandLine } from './decide.js'
 import { createEnforcer } from './enforce.js'
 import { createReviewer } from './reviewer.js'
 import {
-  addRule, addToolRule, appendAudit, clearRules, clearToolRules, countHit, countToolHit, createDecisionLog,
-  createGrantStore, createPendingStore, readAuditTail, readRules, readToolRules, redact, removeRule,
+  addRule, addToolRule, clearRules, clearToolRules, countHit, countToolHit, createDecisionLog,
+  createGrantStore, createPendingStore, readRules, readToolRules, redact, removeRule,
   removeToolRule, resolveConfig, resolveHome,
 } from './store.js'
 
@@ -207,7 +207,9 @@ export function createEngine({ config, home, grants, pendings, ctx = null, enfor
       unknown: decision.unknown.map(entry => entry.reason),
       matchedRules: matchedRulesOf(decision.usedRules),
     }
-    if (config.audit && !silent && !deferAudit) recordDecision(config, audit, exec?.agent?.session ?? null, ctx?.logger ?? null)
+    // The gate records this decision: it already knows whether the reviewer will answer it, and
+    // recording here as well would write the same call twice.
+
     return { decision, policy, workspaceRoot, audit }
   }
 
@@ -310,7 +312,7 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
       const refusal = protectedRefusal(path, target.operation === 'change' ? 'write' : target.operation, config?.protectedFiles ?? [])
       if (refusal === null) return next()
       logger.warn(`dsh-allow: denied a ${String(exec?.name)} of ${path} — ${refusal}`)
-      if (config?.audit === true) {
+      {
         recordDecision(config, {
           tool: exec?.name ?? 'unknown',
           cwd: cwdOf(exec),
@@ -334,7 +336,9 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
     const context = engine.decide({ exec, command, cwd, deferAudit: reviewing })
     const { decision } = context
     if (decision.decision === 'allow') {
-      if (reviewing) recordDecision(config, context.audit, exec?.agent?.session ?? null, logger)
+      // The Session log is the only ledger now, so every decision is recorded here, not only
+      // the ones a deferred audit used to catch.
+      recordDecision(config, context.audit, exec?.agent?.session ?? null, logger)
       markSettled(exec, context.audit?.origin, context.audit, command, cwd)
       return next()
     }
@@ -374,9 +378,9 @@ export function createGate({ engine, pendings, logger, config = null, grants = n
         decision: 'prompt',
         reason: `auto review deferred to the user: ${review.reason}`,
       }, exec?.agent?.session ?? null, logger)
-    } else if (reviewing) {
-      // The reviewer answers prompts only; a decision it was never asked about
-      // still owes the one audit record this layer deferred.
+    } else {
+      // Every decision lands in the Session log, including the forbidding ones and the ones
+      // the reviewer was not asked about.
       recordDecision(config, context.audit, exec?.agent?.session ?? null, logger)
     }
     remember(pendings, exec, context, command, cwd)
@@ -418,15 +422,6 @@ export async function waitForGrantHolder(grants, exec, logger) {
   }
 }
 
-/**
- * The audit file a listener should write to, or null when auditing is off.
- * @param config - resolved plugin configuration, or null.
- * @returns the absolute audit-file path, or null.
- */
-function auditTarget(config) {
-  if (config === null || config === undefined || config.audit === false) return null
-  return config.auditFile ?? null
-}
 
 /** Session record name this plugin records each policy decision under. */
 export const DECISION_EVENT = 'plugin:dsh-allow/decision'
@@ -452,38 +447,12 @@ export const DECISION_EVENT = 'plugin:dsh-allow/decision'
  * @param session - the deciding session, when the caller holds it.
  * @param logger - optional sink for a record that could not be written.
  */
-/**
- * Whether one decision is quiet enough to keep out of the rendered session rows.
- *
- * Under `workspace-write` most calls need nothing beyond the workspace baseline, and a
- * line per call buries the decisions a person would actually read. An allow is only
- * dropped when it came from the baseline or from workspace/system rules: anything a
- * person granted, anything scoped to one call, and every prompt or denial is still
- * rendered. `showAllowedRows` turns the automatic ones back on.
- * @param audit - the decision record about to be written.
- * @param config - resolved plugin configuration.
- * @returns whether this record should be skipped.
- */
-export function isAmbientAllow(audit, config = null) {
-  if (config?.showAllowedRows === true) return false
-  if (audit?.decision !== 'allow') return false
-  if (audit?.origin !== 'rule' && audit?.origin !== 'baseline') return false
-  const rules = Array.isArray(audit?.matchedRules) ? audit.matchedRules : []
-  // A one-shot grant exists because a person pressed a button just now; that is worth a row.
-  return !rules.some(rule => rule?.source === 'session')
-}
-
 export function recordDecision(config, audit, session = null, logger = null) {
-  // The audit file keeps every decision: it is the record of what the layer saw.
-  appendAudit(auditTarget(config), audit)
   if (config?.appendSessionEvents !== true) return
   if (session === null || session === undefined) return
-  // The session record is the visible one. An automatic allow is a row nobody needs, so it
-  // stays out of the conversation unless the deployment asks for every decision to show.
-  if (isAmbientAllow(audit, config)) return
-  // The audit line is the guarantee; the record is the trace the Conversation
-  // draws beside the call it answered. A record that cannot be written must not
-  // take the decision down with it, so it is contained and reported.
+  // The Session log is the only sink: fork, resume and the audit trail all read the same
+  // record, so nothing is kept in a second file that can drift or grow without bound.
+  // A record that cannot be written must not take the decision down with it.
   try {
     appendPluginRecord(session, DECISION_EVENT, JSON.parse(redact(JSON.stringify(audit))))
   } catch (failure) {
@@ -910,24 +879,6 @@ const AUDIT_ACTION_LABELS = {
   unavailable: '无人应答',
 }
 
-/**
- * Render the newest approval decisions from the audit log.
- * @param file - audit-file path.
- * @param limit - largest number of records to render.
- * @returns the command's answer text.
- */
-export function renderAuditLog(file, limit) {
-  const answer = readAuditTail(file, { limit })
-  if (answer.entries.length === 0) return '还没有审批记录。'
-  const lines = [`最近 ${String(answer.entries.length)} 条审批记录${answer.truncated ? '（已截断）' : ''}：`]
-  for (const record of answer.entries.map(auditPayload)) {
-    const at = typeof record.at === 'string' ? new Date(record.at).toLocaleTimeString() : ''
-    const action = AUDIT_ACTION_LABELS[record.action] ?? record.decision ?? record.action ?? '记录'
-    const what = record.subject ?? record.command ?? record.reason ?? ''
-    lines.push(`${at}  ${action}  ${what}`.trim())
-  }
-  return lines.join('\n')
-}
 
 /**
  * Render what the policy grants by default and what the kernel actually fences.
@@ -1039,12 +990,12 @@ export function createRememberCall({ pendings, config, logger, decisions = null 
 
 /**
  * Answer `/allow`.
- * @param options - rules file, audit file, workspace root, the resolved sandbox
+ * @param options - rules file, workspace root, the resolved sandbox
  *   mode, and the host-side "remember this call" operation.
  * @param rawInput - text after the command name.
  * @returns the command result.
  */
-export function runAllowCommand({ file, auditFile = null, workspaceRoot, mode, enforcement = null, remember = null }, rawInput) {
+export function runAllowCommand({ file, workspaceRoot, mode, enforcement = null, remember = null }, rawInput) {
   const input = rawInput.trim()
   if (input === '' || input === 'list') {
     return { kind: 'success', text: `${renderRules(file)}\n\n${renderToolRules(file)}` }
@@ -1086,14 +1037,6 @@ export function runAllowCommand({ file, auditFile = null, workspaceRoot, mode, e
     return outcome.ok === true
       ? { kind: 'success', text: `已记住：${outcome.labels.join(' + ')}` }
       : { kind: 'error', text: outcome.error }
-  }
-  if (verb === 'log') {
-    if (auditFile === null) return { kind: 'error', text: '这个部署没有可读的审批记录。' }
-    const requested = Number(rest[0])
-    const limit = Number.isFinite(requested) && requested > 0
-      ? Math.min(Math.floor(requested), AUDIT_PAGE_MAX)
-      : AUDIT_PAGE
-    return { kind: 'success', text: renderAuditLog(auditFile, limit) }
   }
   if (verb === 'remove') {
     const removed = removeRule(file, Number(rest[0]))
@@ -1174,10 +1117,9 @@ export function apply(ctx, pluginConfig) {
     commandCtx.effect(() => commandCtx.commands.register({
       name: 'allow',
       description: 'List or change the permissions that no longer ask for approval',
-      input: { hint: '[list|status|log [n]|add <operations> <path> [file|folder]|tool [list|add <tool> <action> [target]|remove <number>|clear]|remember <callId>|remove <number>|clear]' },
+      input: { hint: '[list|status|add <operations> <path> [file|folder]|tool [list|add <tool> <action> [target]|remove <number>|clear]|remember <callId>|remove <number>|clear]' },
       handler: invocation => runAllowCommand({
         file: config.rulesFile,
-        auditFile: config.auditFile,
         workspaceRoot: engine.policyOf({ agent: invocation.agent })?.workspaceRoot,
         mode: engine.policyOf({ agent: invocation.agent })?.mode,
         enforcement: enforcement.status(),

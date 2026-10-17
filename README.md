@@ -108,7 +108,7 @@ Tool rules answer under every `escalation` policy, because a rule for one tool o
 
 ## The permission store is not the agent's to change
 
-The rules file and the audit log are **hard-protected**: `write`, `create` and `delete` are refused for every writer, user rules included, and the compiled profile refuses them again after every grant. That covers `$DSH_HOME/dsh-allow.json` and `$DSH_HOME/dsh-allow-audit.ndjson`, wherever the configuration points them.
+The rules file is **hard-protected**: `write`, `create` and `delete` are refused for every writer, user rules included, and the compiled profile refuses them again after every grant. That covers `$DSH_HOME/dsh-allow.json`, wherever the configuration points it.
 
 The same protection is applied to the file-changing tools (`write`, `edit`, `str_replace_editor`), so an agent cannot rewrite its own rules with a file tool either; the harness's own fence stays in charge of every other file tool call.
 
@@ -222,27 +222,21 @@ What it is told is only the analyzed request and the user's own words:
       # model: inherit
 ```
 
-Every review is logged and audited with the command, the requested capabilities, the verdict, the reason, the latency and the model route — never with file contents, secrets, or hidden reasoning.
+Every review is recorded with the command, the requested capabilities, the verdict, the reason, the latency and the model route — never with file contents, secrets, or hidden reasoning.
 
 ## The approval ledger
 
-Every decision this layer makes is audited twice: the audit log the policy layer owns, and one Session record (`plugin:dsh-allow/decision`, written through the harness's `appendPluginRecord`) that the interface renders twice from the same log — a row beside the tool call in **Chat**, and a row in the **Trajectory** ledger. A Session written before the migration keeps its older `dsh-allow/decision` name, and both views fold that too.
+Every decision this layer makes lands in exactly one place: a Session record (`plugin:dsh-allow/decision`, written through the harness's `appendPluginRecord`). Fork, resume and `/allow` all read that log, so nothing is kept in a second file that can drift or grow without bound. A Session written before the migration keeps its older `dsh-allow/decision` name, and both views fold that too.
 
-The trajectory row needs no renderer of its own: it is an `extension` record carrying this plugin's localized summary, its tone, and the raw audit record — the summary and tone label the row, and the shared details payload tab shows the record. Each origin has its own colour in both views: `rule` green, `baseline` grey, `auto-review` blue, `human` amber, `policy` red. Every row also leads with a symbol — `✅` allow once, `♾️` always allow, `🚫` denied, `↩️` cancelled, `⌛` no answerer, `📋` rule, `⚪` baseline, `🤖` auto review — because colour separates origins and the two human outcomes share one.
+The event is log-only and carries the envelope's `ignorable` marker, so it never reaches a model request, and a build that does not know the type skips it instead of refusing the session.
 
-A decision row is one event, so a prompt and the human answer that settled it are two rows and the ledger follows the traffic rather than collapsing it:
+**Rendering is a debug switch.** Records are always written; the Conversation and Trajectory rows appear only when the switch is on:
 
-| origin | what answered |
-| --- | --- |
-| `rule` | a stored rule or a deployment grant — the row names the rule's path and the capabilities it granted |
-| `baseline` | the platform baseline: the workspace, the temp areas, the harness home, the system paths |
-| `auto-review` | the optional reviewer answered `ALLOW`; the row carries its verdict, reason, latency and model route |
-| `human` | the user answered: allow once, always allow (with the rules the button wrote), deny, cancelled, or no answerer |
-| `policy` | this plugin refused on its own: a platform-protected path, or a line the shell grammar cannot parse |
+```js
+localStorage.setItem('dsh-allow:debug', '1')   // then reload the page
+```
 
-The event is log-only and carries the envelope's `ignorable` marker, so it never reaches a model request, and a build that does not know the type skips it instead of refusing the session. Nothing here is served over HTTP: the row reads the session's own log, and the audit file stays what the policy layer consults for history and hit counts.
-
-Records written before this version stay in the audit file only, so a session's ledger starts from the first decision made after the upgrade.
+With it off nothing is registered, which is what a policy layer that holds every workspace-write call should look like by default. With it on, the row renders beside the tool call in **Chat** and in the **Trajectory** ledger, where each origin has its own colour (`rule` green, `baseline` grey, `auto-review` blue, `human` amber, `policy` red) and every row leads with a symbol — `✅` allow once, `♾️` always allow, `🚫` denied, `↩️` cancelled, `⌛` no answerer, `📋` rule, `⚪` baseline, `🤖` auto review.
 
 ## The macOS backend
 
@@ -300,8 +294,6 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
 - id: dsh-allow
   config:
     rulesFile: /path/to/rules.json          # default $DSH_HOME/dsh-allow.json
-    auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
-    audit: true                             # false turns the audit log off
     appendSessionEvents: false              # true also records each decision as a session event
     escalation: ask                         # ask | rule: who answers a sandbox escalation the rule already covers
     sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
@@ -318,24 +310,21 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
         action: list_plugins
 ```
 
-`showAllowedRows` defaults to false. The audit file still holds every decision, automatic allows
-included; what is skipped is the session record, so an allow the baseline or a workspace or system
-rule already covers no longer renders as a row in the conversation. User grants, one-shot grants,
-prompts, denials and auto-review verdicts still show. Set it to true to see the automatic ones too.
+`appendSessionEvents` defaults to false. When on, every decision — automatic allows included — is written to the Session log; nothing is filtered, because the rendering switch above decides what a person sees, not what the layer remembers.
 
 A `rules.json` written by dsh-allow 0.1 (the command-prefix model) reads as empty and is kept as `<rulesFile>.v2.bak` on the first write; those rules said nothing about filesystem capabilities and cannot be translated.
 
 ## Test
 
 ```sh
-npm test              # units, host wiring, card render, the audit ledger, and the real-sandbox suite
-npm run test:unit     # policy, effects, enforcement, reviewer, decisions, audit ledger
+npm test              # units, host wiring, card render, the decision ledger, and the real-sandbox suite
+npm run test:unit     # policy, effects, enforcement, reviewer, decisions, decision ledger
 npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start sandbox-exec)
 ```
 
 `test/reviewer.spec.mjs` injects the model and covers what the reviewer is told (only real user messages, the analyzed permissions, the fixed prompt), every answer shape (`ALLOW`, `ASK`, fenced JSON, prose, an unknown verdict, an empty answer), and every failure path (no route, no LLM service, a provider throw, a terminal error chunk, a timeout, an invalid answer). `test/smoke.mjs` covers the gate integration: an `ALLOW` runs the call through the existing call-scoped one-shot grant and leaves the rules file untouched, while an `ASK`, a failing reviewer and a disabled reviewer all leave the card in charge.
 
-`test/audit.spec.mjs` covers the ledger end to end without a host: which layer a decision records as its origin and which rules it names, the single record one human decision produces whichever half of the card answered, the records a half-written line, a foreign approval or an unrecognized outcome must not produce, and the `/allow log` rendering. `test/smoke.mjs` asserts every decision also lands in the session log as an ignorable event. `test/client.smoke.mjs` renders the decision row through React and asserts its origin badge, its command and the capability it was missing.
+`test/audit.spec.mjs` covers the ledger end to end without a host: which layer a decision records as its origin and which rules it names, the single record one human decision produces whichever half of the card answered, and the records a half-written line, a foreign approval or an unrecognized outcome must not produce. `test/smoke.mjs` asserts every decision also lands in the session log as an ignorable event. `test/client.smoke.mjs` renders the decision row through React and asserts its origin badge, its command and the capability it was missing.
 
 `test/toolrules.spec.mjs` covers the tool-operation vocabulary on its own: which actions a rule may name and what each one needs, what a call reads as, which call is never answered by a rule (`acceptRisk`, `approvedBuilds`, the exemption action, an unreadable action), and that a hand-edited rule never widens itself. `test/smoke.mjs` runs the same questions through the approval waterfall — the card that appears without a rule, the rule that answers the next identical call without one, the target that is not covered, and the human answer the ledger records either way.
 
@@ -356,7 +345,6 @@ CI sets `DSH_ALLOW_REQUIRE_SEATBELT=1` on its macOS job, which turns that skip i
 
 - A Mac whose `xcode-select` points into an Xcode bundle keeps `git`, `python3` and `clang` behind shims that exec into `/Applications/Xcode*.app/Contents/Developer`, which the baseline does not reach: it grants the Command Line Tools under `/Library/Developer`, not an Xcode developer directory. Such a host opens it once — `/allow add read,execute /Applications/Xcode.app/Contents/Developer folder` — or the kernel refuses those commands while the policy allows them.
 - A decision row is rendered from the session log the browser already holds, so a session longer than that window keeps every row it loaded.
-- A chunk boundary that lands inside an audit line drops that line from an answer, rather than reporting a decision the reader could not parse.
 - Records written before this version carry no `sessionId`, so they never appear in a session's ledger.
 - Path resolution still works inside the fenced areas: `stat` and directory listing leak metadata, only file contents are withheld.
 - A tool that keeps its configuration and its token together under the home needs one read grant for that directory: `gh`, `aws`, `docker` and friends report their own error until `~/.config/<tool>` is granted. Denying `hosts.yml`, `credentials` and `id_ed25519` by default is the point; granting them is a deliberate act.

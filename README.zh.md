@@ -112,7 +112,7 @@ the process tree (children, grandchildren, inline code)
 
 ## 权限库不是 agent 能改的
 
-规则文件与审计日志属于**硬保护路径**:`write`/`create`/`delete` 对任何人(包括用户规则)都拒绝,编译出的 profile 还会在所有授权之后再次拒绝。覆盖 `$DSH_HOME/dsh-allow.json` 与 `$DSH_HOME/dsh-allow-audit.ndjson`,配置指到哪就保护到哪。
+规则文件属于**硬保护路径**:`write`/`create`/`delete` 对任何人(包括用户规则)都拒绝,编译出的 profile 还会在所有授权之后再次拒绝。覆盖 `$DSH_HOME/dsh-allow.json`,配置指到哪就保护到哪。
 
 同一道保护也加在写文件的工具上(`write`、`edit`、`str_replace_editor`),所以 agent 也不能用文件工具改写自己的规则;其它文件工具调用仍由 harness 自己的围栏负责。
 
@@ -232,27 +232,21 @@ missing (path, capability)
 
 三个字段读作:`enabled` 默认关闭, 关着时一切照旧由卡片决定;`timeoutMs` 是按 `ASK` 处理的超时;`provider` / `model` 默认继承会话最近一次 model/selection 路由;会话没有选择过时,回退到它最近一次请求实际使用的路由(模型来自 profile 配置的会话就属于这种)。
 
-每次复核都会写日志与审计:命令、请求的能力、判定、理由、耗时、模型路由 —— 不写文件内容、凭据、或隐藏推理。
+每次复核都会记入会话日志:命令、请求的能力、判定、理由、耗时、模型路由 —— 不写文件内容、凭据、或隐藏推理。
 
 ## 审批记录
 
-这一层做出的每一个判定都会记两处:策略层自己的审计日志,以及一条会话记录(`plugin:dsh-allow/decision`,由 harness 的 `appendPluginRecord` 写入)—— 界面从同一份日志把它渲染两次:**对话**里贴着它所回答的那次工具调用一行,**轨迹**账本里再一行。迁移前写下的 Session 保留旧的 `dsh-allow/decision` 名字,两个视图同样折叠它。
+这一层做出的每一个判定只落在**一处**:一条会话记录(`plugin:dsh-allow/decision`,由 harness 的 `appendPluginRecord` 写入)。fork、resume、`/allow` 都读这份日志,所以不再有第二份文件会漂移、也没有无上限增长的日志文件。迁移前写下的 Session 保留旧的 `dsh-allow/decision` 名字,两个视图同样折叠它。
 
-轨迹那一行不需要插件自己写渲染器:它是一个 `extension` 记录,带着本插件的本地化摘要、色调和原始审计记录 —— 摘要与色调决定那一行的样子,原始记录由共用的详情面板负载页展示。两个视图里同一来源同一种颜色:`rule` 绿、`baseline` 灰、`auto-review` 蓝、`human` 琥珀、`policy` 红。每一行还带一个符号 —— `✅` 允许一次、`♾️` 总是允许、`🚫` 拒绝、`↩️` 已取消、`⌛` 无人应答、`📋` 规则放行、`⚪` 默认放行、`🤖` 自动审核 —— 因为颜色只分得开来源,而人工的两种结局同源。
+这条事件是 log-only(非 surface),并且带 envelope 的 `ignorable` 标记 —— 所以它永远不进模型请求,而一个不认识这个类型的构建会直接跳过它、而不是拒绝整个会话。
 
-一行就是一条事件,所以「询问」和解答它的那次人工决定是两行,这张表跟着事件流水走、不做合并:
+**渲染是一个调试开关。** 记录永远写入;对话与轨迹里的行只在开关打开时出现:
 
-| 来源 | 谁拍的板 |
-| --- | --- |
-| `rule` | 命中已存的规则或部署 grants —— 这一行会点名规则的路径和它授予的能力 |
-| `baseline` | 平台基线:工作区、临时目录、harness home、系统路径 |
-| `auto-review` | 可选的自动复核给了 `ALLOW`;这一行带判定、理由、耗时和模型路由 |
-| `human` | 用户拍的板:允许一次、总是允许(连带按钮写入的规则)、拒绝、已取消、无人应答 |
-| `policy` | 本插件自己拒绝的:平台保护路径,或 shell 语法解析不了的一行 |
+```js
+localStorage.setItem('dsh-allow:debug', '1')   // then reload the page
+```
 
-这条事件是 log-only(非 surface),并且带 envelope 的 `ignorable` 标记 —— 所以它永远不进模型请求,而一个不认识这个类型的构建会直接跳过它、而不是拒绝整个会话。这里没有任何东西走 HTTP:这一行读的是会话自己的日志,审计文件仍然只是策略层查历史与命中次数的地方。
-
-这个版本之前写下的记录只留在审计文件里,所以会话的这份记录从这个版本之后的第一个判定开始。
+关着时什么都不注册 —— 对一个接管了所有 workspace-write 调用的权限层来说,这本来就该是默认。打开后:对话里贴着它所回答的那次工具调用一行,轨迹账本里再一行;两个视图里同一来源同一种颜色(`rule` 绿、`baseline` 灰、`auto-review` 蓝、`human` 琥珀、`policy` 红),每一行还带一个符号 —— `✅` 允许一次、`♾️` 总是允许、`🚫` 拒绝、`↩️` 已取消、`⌛` 无人应答、`📋` 规则放行、`⚪` 默认放行、`🤖` 自动审核。
 
 ## macOS 后端
 
@@ -312,8 +306,6 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
 - id: dsh-allow
   config:
     rulesFile: /path/to/rules.json          # default $DSH_HOME/dsh-allow.json
-    auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
-    audit: true                             # false turns the audit log off
     appendSessionEvents: false              # true also records each decision as a session event
     escalation: ask                         # ask | rule: who answers a sandbox escalation the rule already covers
     sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
@@ -330,16 +322,16 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
         action: list_plugins
 ```
 
-每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`appendSessionEvents` 默认关闭:打开后每个判定除审计文件外还写一条带 `ignorable` 标记的会话事件,客户端据此在对话里显示这些行;轨迹里的那一行还需要宿主能渲染扩展行(fork 独有的能力),所以保持选择加入;`escalation` 取 ask 或 rule —— 取 rule 时,若规则已经放行这条命令,它请求的沙箱升级也直接沿用该规则,不再弹卡片;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算;`grants` 与 `toolGrants` 是部署级授权,形状分别与持久规则、持久工具规则一致。
-`showAllowedRows` 默认关闭:审计文件仍然记录每一条判定(包括自动放行),但基线或 workspace/system 规则直接放行的那些不再写进会话记录、不会在对话里渲染成行;用户授予、一次性授权、提示、拒绝、auto-review 的判定照旧显示。想让自动放行也出现在对话里,把它设为 true。
+每一项读作:`rulesFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json`;`appendSessionEvents` 默认关闭:打开后每个判定都写一条带 `ignorable` 标记的会话记录;`escalation` 取 ask 或 rule —— 取 rule 时,若规则已经放行这条命令,它请求的沙箱升级也直接沿用该规则,不再弹卡片;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算;`grants` 与 `toolGrants` 是部署级授权,形状分别与持久规则、持久工具规则一致。
+渲染由上面的调试开关控制,与记录无关 —— 记录永远完整,看与不看是你的事。
 
 dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,并在第一次写入时留成 `<rulesFile>.v2.bak`:那些规则描述的是命令,不是文件能力,无法翻译。
 
 ## 测试
 
 ```sh
-npm test              # units, host wiring, card render, the audit ledger, and the real-sandbox suite
-npm run test:unit     # policy, effects, enforcement, reviewer, decisions, audit ledger
+npm test              # units, host wiring, card render, the decision ledger, and the real-sandbox suite
+npm run test:unit     # policy, effects, enforcement, reviewer, decisions, decision ledger
 npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start sandbox-exec)
 ```
 
@@ -347,7 +339,7 @@ npm run test:sandbox  # macOS Seatbelt integration (needs a host that can start 
 
 `test/reviewer.spec.mjs` 注入模型,覆盖「告诉复核什么」(只有真实用户消息、分析过的权限、固定的 prompt)、各种答案形态(`ALLOW`、`ASK`、带围栏的 JSON、自然语言、未知判定、空答案),以及所有失败路径(没有路由、没有 LLM 服务、provider 抛错、终止错误块、超时、答案不合法)。`test/smoke.mjs` 覆盖闸门接线:`ALLOW` 走既有的按调用一次性授权、规则文件一个字节不改;`ASK`、复核失败、以及复核关闭时,都由卡片接管。
 
-`test/audit.spec.mjs` 不依赖宿主,把审批记录端到端跑一遍:一次判定记成哪个来源、点名了哪些规则;不管卡片是从哪一半回答的,一次人工决定只产出一行;半行、别人的审批、认不出的 outcome 都不能产出记录;以及 `/allow log` 的渲染。`test/smoke.mjs` 断言每条判定同时以可忽略事件落进会话日志。`test/client.smoke.mjs` 另外用 React 渲染那一行,断言来源徽章、命令和缺失的能力。
+`test/audit.spec.mjs` 不依赖宿主,把审批记录端到端跑一遍:一次判定记成哪个来源、点名了哪些规则;不管卡片是从哪一半回答的,一次人工决定只产出一行;半行、别人的审批、认不出的 outcome 都不能产出记录;`test/smoke.mjs` 断言每条判定同时以可忽略事件落进会话日志。`test/client.smoke.mjs` 另外用 React 渲染那一行,断言来源徽章、命令和缺失的能力。
 
 `test/toolrules.spec.mjs` 单独覆盖工具操作的词表:规则能写哪些动作、每个动作需要什么、一次调用读出来是什么、哪次调用永远不由规则回答(`acceptRisk`、`approvedBuilds`、那条豁免动作、读不出动作的调用),以及手改过的规则不会把自己放宽。`test/smoke.mjs` 把同样的问题走一遍审批 waterfall:没有规则时出现的卡片、下一条相同调用被规则直接放行、没被覆盖的另一个目标,以及两种回答在台账里各自记下的那一行。
 
@@ -368,7 +360,6 @@ CI 的 macOS 任务会设 `DSH_ALLOW_REQUIRE_SEATBELT=1`,把这个跳过变成�
 
 - 如果一台 Mac 的 `xcode-select` 指向 Xcode bundle,`git`、`python3`、`clang` 都是 exec 进 `/Applications/Xcode*.app/Contents/Developer` 的 shim,而基线够不到那里:它给的是 `/Library/Developer` 下的 Command Line Tools,不是 Xcode 的 developer 目录。这样的宿主得自己开一次 —— `/allow add read,execute /Applications/Xcode.app/Contents/Developer folder` —— 否则策略层允许、内核却拒绝。
 - 每条判定都由会话日志渲染,浏览器手里就有那条日志,所以更长的会话也不会丢掉已经载入的行。
-- 块边界正好落在一行审计记录中间时,那一行会被丢掉,而不是报出一条读不完整的判定。
 - 这个版本之前写下的记录没有 `sessionId`,所以永远不会出现在会话的审批记录里。
 - 被围住的区域仍然可以解析路径:`stat`、列目录会泄漏 metadata,被扣掉的只是文件内容。
 - 把配置和令牌放在同一个目录下的工具需要一条针对该目录的读授权:`gh`、`aws`、`docker` 之类在授予 `~/.config/<tool>` 之前会报自己的错。默认拒掉 `hosts.yml`、`credentials`、`id_ed25519` 正是目的,想打开是明确的动作。

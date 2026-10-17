@@ -79,6 +79,8 @@ window.__ModuleLoader__.load({
 
 		//#region locale
 		const NS = "dshAllow";
+		/** localStorage key for the debug switch that renders decision rows. */
+		const DEBUG_KEY = "dsh-allow:debug";
 		const zh = {
 			waiting: "需要文件权限",
 			reject: "拒绝",
@@ -602,9 +604,13 @@ window.__ModuleLoader__.load({
 			ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-allow: dictionaries");
 			// 每条决定都由宿主写进会话日志,这里把那条事件折成一行,渲染在它回答的
 			// 工具调用旁边 —— 数据全程来自事件流,没有宿主接口参与。
-			ctx.effect(() => ctx.uiConversation.events.register(allowDecisionDefinition), "dsh-allow: decision definition");
+			// 渲染是调试开关,不是默认行为:每条判定都写进会话日志,但只有打开调试时才在对话与
+			// 轨迹里画出来。开关存在本浏览器,刷新后生效。
+			let debugRows = false;
+			try { debugRows = window.localStorage?.getItem(DEBUG_KEY) === "1" } catch { debugRows = false }
+			if (debugRows) ctx.effect(() => ctx.uiConversation.events.register(allowDecisionDefinition), "dsh-allow: decision definition");
 			// 同一条事件再进轨迹账本一份:轨迹的行类型由宿主提供,文案由本插件的字典生成。
-			ctx.effect(() => ctx.uiConversation.events.register(
+			if (debugRows) ctx.effect(() => ctx.uiConversation.events.register(
 				createTrajectoryDefinition((key, params) => ctx.locale.bind(NS)(key, params))
 			), "dsh-allow: trajectory definition");
 			ctx.slots.inject("conversation.chat.node", () => {
@@ -651,6 +657,7 @@ window.__ModuleLoader__.load({
 		exports.AllowPanel = AllowPanel;
 		exports.AllowDecisionRow = AllowDecisionRow;
 		exports.allowDecisionDefinition = allowDecisionDefinition;
+		exports.DEBUG_KEY = DEBUG_KEY;
 		exports.createTrajectoryDefinition = createTrajectoryDefinition;
 		exports.DECISION_EVENT = DECISION_EVENT;
 		//#endregion

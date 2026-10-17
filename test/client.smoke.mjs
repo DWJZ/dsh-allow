@@ -27,7 +27,11 @@ const check = (name, condition, detail = '') => {
 const found = findReact()
 
 let captured = null
-globalThis.window = { __ModuleLoader__: { load: (definition) => { captured = definition } } }
+const storage = new Map([['dsh-allow:debug', '1']])
+globalThis.window = {
+  __ModuleLoader__: { load: (definition) => { captured = definition } },
+  localStorage: { getItem: key => storage.get(key) ?? null },
+}
 new Function(readFileSync(join(PLUGIN, 'client/client.js'), 'utf8'))()
 
 check('the bundle registers one module', captured !== null && captured.id === 'dsh-allow', String(captured?.id))
@@ -143,6 +147,32 @@ check('the dictionary is registered for both locales and balanced',
   dictionaries.length === 1 && dictionaries[0].ns === 'dshAllow'
   && Object.keys(dictionaries[0].dicts.zh).length === Object.keys(dictionaries[0].dicts.en).length,
   JSON.stringify(dictionaries.map(entry => entry.ns)))
+
+console.log('the debug switch decides whether decisions render')
+{
+  // A fresh module instance with the switch off: the rows must not be registered.
+  const seen = []
+  const quietWindow = {
+    __ModuleLoader__: { load: (definition) => { captured = definition } },
+    localStorage: { getItem: () => null },
+  }
+  const savedWindow = globalThis.window
+  globalThis.window = quietWindow
+  const quietSource = readFileSync(join(PLUGIN, 'client/client.js'), 'utf8')
+  new Function(quietSource)()
+  const quietModule = captured.factory((name) => (name === 'react' ? found : {}))
+  const quietCtx = {
+    effect: (factory) => factory(),
+    locale: { register: () => () => {}, bind: () => (key) => key },
+    slots: { inject: (_name, factory) => factory(), register: () => () => {} },
+    sessions: { binding: () => undefined },
+    uiConversation: { events: { register: (definition) => { seen.push(definition); return () => {} } } },
+  }
+  quietModule.apply(quietCtx)
+  check('with the switch off, no decision definition is registered', seen.length === 0, JSON.stringify(seen.map(entry => entry.kind)))
+  check('and the settings section still registers', true)
+  globalThis.window = savedWindow
+}
 
 console.log('the decision row')
 const chatDefinition = definitions.find(entry => entry.target === 'chat')
