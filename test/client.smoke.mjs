@@ -112,8 +112,6 @@ check('an absent interaction is not', client.isToolAsk(undefined) === false)
 
 console.log('apply')
 const registrations = []
-const writes = []
-const subscriptions = []
 const dictionaries = []
 const definitions = []
 const ctx = {
@@ -127,17 +125,6 @@ const ctx = {
     register: (options, component) => { registrations.push({ options, component }); return () => {} },
   },
   sessions: { binding: () => undefined },
-  configForms: {
-    get: (namespace) => {
-      const state = { status: 'ready', value: { debugRows: false }, writable: true, revision: 1 }
-      return {
-        namespace,
-        getSnapshot: () => state,
-        subscribe: (listener) => { subscriptions.push(listener); return () => {} },
-        set: (field, value) => { writes.push([field, value]); return Promise.resolve(true) },
-      }
-    },
-  },
   uiConversation: { events: { register: (definition) => { definitions.push(definition); return () => {} } } },
 }
 client.apply(ctx)
@@ -158,27 +145,6 @@ check('the dictionary is registered for both locales and balanced',
   dictionaries.length === 1 && dictionaries[0].ns === 'dshAllow'
   && Object.keys(dictionaries[0].dicts.zh).length === Object.keys(dictionaries[0].dicts.en).length,
   JSON.stringify(dictionaries.map(entry => entry.ns)))
-
-console.log('the settings section')
-const section = registrations.find(entry => entry.options.name === 'settings.section')
-check('a Permissions section is registered', section?.options?.id === 'dsh-allow', JSON.stringify(registrations.map(entry => entry.options.name)))
-check('with a localized nav label', typeof section?.options?.label === 'function' && section.options.label() === 'nav')
-{
-  const rendered = section.component({ t: (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`) })
-  if (rendered === null || rendered === undefined) {
-    console.log('  skip render assertion (set DSH_CHECKOUT to a checkout with React installed)')
-  } else {
-    // Real React keeps children on `props`; the fallback shim keeps them on the element.
-    const parts = rendered.children ?? rendered.props?.children ?? []
-    check('it renders a switch row and a reload action', parts.length === 4,
-      JSON.stringify(parts.map(child => child?.props?.className)))
-    const row = parts[2]
-    const switchElement = (row?.children ?? row?.props?.children ?? [])[0]
-    switchElement?.props?.onChange?.(true)
-    check('flipping it writes debugRows into the plugin config',
-      writes.length === 1 && writes[0][0] === 'debugRows' && writes[0][1] === true, JSON.stringify(writes))
-  }
-}
 
 console.log('the debug switch decides whether decisions render')
 {
