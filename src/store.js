@@ -178,11 +178,9 @@ export function resolveConfig(config, home) {
   // path, so `ask` keeps it a human decision. `rule` answers it from the rule
   // that already allowed the call, which is the deployment's call to make.
   // A volatile schema field reaches `apply` as `{ get }` (cosmokit's wrapper), not as the plain
-  // value the patch declared. Accept both: the wrapper on a live host, the boolean in tests.
-  const debugRows = readVolatile(config?.debugRows) ?? false
-  if (typeof debugRows !== 'boolean') {
-    throw new TypeError(`dsh-allow: config debugRows must be a boolean, got ${JSON.stringify(config?.debugRows)}`)
-  }
+  // value the patch declared. A rendering preference must never keep the policy layer from
+  // starting, so anything unreadable reads as off instead of refusing the entry.
+  const debugRows = readVolatile(config?.debugRows) === true
   const escalation = config?.escalation ?? 'ask'
   if (escalation !== 'ask' && escalation !== 'rule') {
     throw new TypeError(`dsh-allow: config escalation must be "ask" or "rule", got ${JSON.stringify(escalation)}`)
