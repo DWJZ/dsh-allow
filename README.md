@@ -230,6 +230,8 @@ Every decision this layer makes lands in exactly one place: a Session record (`p
 
 The event is log-only and carries the envelope's `ignorable` marker, so it never reaches a model request, and a build that does not know the type skips it instead of refusing the session.
 
+A field declared with `.volatile()` does not arrive in `apply` as the value the patch declared: it arrives wrapped, and the wrapper's `get()` returns the live value. Reading the field without unwrapping is what once kept this plugin from starting at all. `readVolatile` does that unwrapping, and a rendering preference is coerced to a boolean rather than validated, so no config edit of that field can disable the permission layer.
+
 **Rendering is a configuration switch.** Records are always written; the Conversation and Trajectory rows appear only when the deployment turns `debugRows` on:
 
 ```yaml
