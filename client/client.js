@@ -89,6 +89,7 @@ window.__ModuleLoader__.load({
 			debugTitle: "在对话与轨迹里显示判定",
 			debugDesc: "每个判定都会写进会话日志；打开后立刻在工具调用旁与轨迹账本里画成一行。改动保存到当前 profile 的补丁文件。",
 			debugFailed: "保存失败：{message}",
+			debugUnavailable: "配置表单不可写（status={status}, writable={writable}）",
 			waiting: "需要文件权限",
 			reject: "拒绝",
 			allowOnce: "允许一次",
@@ -134,6 +135,7 @@ window.__ModuleLoader__.load({
 			debugTitle: "Show decisions in Chat and Trajectory",
 			debugDesc: "Every decision is written to the session log; turning this on renders one row beside the tool call and in the Trajectory ledger right away. The change lands in this profile's patch file.",
 			debugFailed: "Not saved: {message}",
+			debugUnavailable: "The config form is not writable (status={status}, writable={writable})",
 			waiting: "Filesystem permission required",
 			reject: "Deny",
 			allowOnce: "Allow once",
@@ -649,7 +651,11 @@ window.__ModuleLoader__.load({
 						label: t("debugTitle"),
 						onChange: (next) => { toggle(next === true) }
 					}),
-					failed === null ? null : React.createElement("span", { className: "dsha_sectionError", role: "alert" }, failed)));
+					failed === null ? null : React.createElement("span", { className: "dsha_sectionError", role: "alert" }, failed),
+					// While the form is not writable, say what the shell reported: that is the only
+					// way to tell "no config schema" from "still loading" without devtools.
+					ready ? null : React.createElement("span", { className: "dsha_sectionError" },
+						t("debugUnavailable", { status: String(view.status), writable: String(view.writable) }))));
 		}
 		//#endregion
 
