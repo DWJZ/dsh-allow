@@ -21,7 +21,8 @@
  * what answers it is one operation of one tool — see `src/toolrules.js`.
  */
 import { homedir } from 'node:os'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { canonicalPath, describeRule, protectedRefusal } from './fspolicy.js'
 import { describeToolRule, isJudgedTool, matchToolRule, matchedToolRuleOf, toolRequestOf } from './toolrules.js'
@@ -1153,6 +1154,31 @@ export function setDebugRowsInPatch(text, enabled) {
 }
 
 /**
+ * Locate the patch file of the profile that installed this plugin.
+ *
+ * The route has to write the same document the settings form would, and no service promises
+ * that path to a plugin: `profileContext` is absent on a linked install and the settings
+ * document is only published inside the shell. Every profile that installs this plugin names
+ * it in its package.json, so that is the dependable address.
+ * @param harnessHome - the resolved DSH home.
+ * @returns the first profile patch that declares this plugin, or undefined.
+ */
+export function resolvePatchPath(harnessHome) {
+  const profiles = join(harnessHome, 'profiles')
+  let names
+  try { names = readdirSync(profiles) } catch { return undefined }
+  for (const name of names) {
+    const manifest = join(profiles, name, 'package.json')
+    let text
+    try { text = readFileSync(manifest, 'utf8') } catch { continue }
+    if (!text.includes('"dsh-allow"')) continue
+    const patch = join(profiles, name, 'cordis.patch.yml')
+    try { readFileSync(patch); return patch } catch { /* the profile has no patch yet */ }
+  }
+  return undefined
+}
+
+/**
  * Let the browser flip the rendering switch.
  *
  * The settings shell only offers a client-editable form for entries whose namespace it
@@ -1206,7 +1232,9 @@ export function apply(ctx, pluginConfig) {
   // The settings service already knows which patch this profile edits; it is the same file the
   // native configuration editor opens, so the switch writes where the form would have written.
   ctx.inject(['settings'], (settingsCtx) => {
-    const path = settingsCtx.settings?.documentPath
+    // Prefer the shell's own answer, then fall back to the profile manifest that names us.
+    const declared = settingsCtx.settings?.documentPath
+    const path = typeof declared === 'string' && declared.length > 0 ? declared : resolvePatchPath(harnessHome)
     if (typeof path === 'string' && path.length > 0) publishDebugRoute(settingsCtx, pageState, path)
   })
   const pendings = createPendingStore()

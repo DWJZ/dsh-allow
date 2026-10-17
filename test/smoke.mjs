@@ -685,6 +685,14 @@ check('the config schema exposes debugRows as a client-editable field', (() => {
     handled?.status === 200 && after.includes('debugRows: true') && after.includes('escalation: rule') && !before.includes('debugRows'),
     `${String(handled?.status)} ${JSON.stringify(after)}`)
 }
+check('the patch path is found through the profile manifest', (() => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-allow-profile-'))
+  mkdirSync(join(home, 'profiles', 'web'), { recursive: true })
+  writeFileSync(join(home, 'profiles', 'web', 'package.json'), JSON.stringify({ dependencies: { 'dsh-allow': 'link:x' } }))
+  writeFileSync(join(home, 'profiles', 'web', 'cordis.patch.yml'), '- id: dsh-allow\n')
+  const found = host.resolvePatchPath(home)
+  return found !== undefined && found.endsWith(join('profiles', 'web', 'cordis.patch.yml'))
+})(), 'profile patch')
 check('the debug switch has a host route of its own',
   registered.routes.some(route => route.path === '/dsh-allow/debug'), JSON.stringify(registered.routes.map(route => route.path)))
 check('the entry tells the settings shell not to auto-generate a page',
