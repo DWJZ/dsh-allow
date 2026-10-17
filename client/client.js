@@ -68,6 +68,12 @@ window.__ModuleLoader__.load({
 				".dsha_logCommand{font-family:var(--ds-font-family-code);font-size:13px;line-height:20px;word-break:break-all}",
 				".dsha_logDetail{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);word-break:break-all}",
 				".dsha_logReason{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
+				".dsha_section{display:flex;flex-direction:column;gap:8px;padding:16px 0}",
+				".dsha_sectionTitle{font-size:15px;line-height:24px;font-weight:500;color:var(--dsw-alias-label-primary)}",
+				".dsha_sectionDesc{font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary);max-width:64ch}",
+				".dsha_sectionRow{display:flex;align-items:center;gap:12px}",
+				".dsha_sectionError{font-size:12px;line-height:18px;color:var(--dsw-alias-state-error-primary)}",
+				".dsha_sectionAction{align-self:flex-start;height:28px;padding:0 12px;border-radius:8px;cursor:pointer;font:inherit;font-size:12px;background:transparent;color:inherit;border:1px solid var(--dsw-alias-border-secondary)}",
 				".dsha_decision{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;padding:6px 0;font-size:12px;line-height:18px}",
 				".dsha_decisionEmoji{flex:0 0 auto;font-size:12px;line-height:18px}",
 				".dsha_decisionCommand{font-family:var(--ds-font-family-code);font-size:12px;line-height:18px;word-break:break-all}",
@@ -80,6 +86,11 @@ window.__ModuleLoader__.load({
 		//#region locale
 		const NS = "dshAllow";
 		const zh = {
+			nav: "权限",
+			debugTitle: "在对话与轨迹里显示判定",
+			debugDesc: "每个判定都会写进会话日志；打开后才会在工具调用旁与轨迹账本里画成一行。改动保存到当前 profile 的补丁文件，刷新页面后生效。",
+			debugReload: "刷新页面",
+			debugFailed: "保存失败：{message}",
 			waiting: "需要文件权限",
 			reject: "拒绝",
 			allowOnce: "允许一次",
@@ -121,6 +132,11 @@ window.__ModuleLoader__.load({
 			logToolRules: "工具规则:{rules}"
 		};
 		const en = {
+			nav: "Permissions",
+			debugTitle: "Show decisions in Chat and Trajectory",
+			debugDesc: "Every decision is written to the session log; this switch only decides whether it renders as a row beside the tool call and in the Trajectory ledger. The change lands in this profile's patch file and applies after a reload.",
+			debugReload: "Reload page",
+			debugFailed: "Not saved: {message}",
 			waiting: "Filesystem permission required",
 			reject: "Deny",
 			allowOnce: "Allow once",
@@ -594,12 +610,65 @@ window.__ModuleLoader__.load({
 		};
 		//#endregion
 
+		//#region settings section
+		/**
+		 * 设置页里的「权限」一节:一个开关,决定判定是否渲染成行。
+		 *
+		 * 开关写的是本插件这一行的配置(数据落到当前 profile 的 cordis.patch.yml),所以它是
+		 * dsh 自己的配置,不是浏览器本地状态。宿主在启动时把该值注入页面,因此刷新后生效。
+		 * @param props - 插槽注入的翻译函数与配置表单句柄。
+		 */
+		function PermissionsSection({ t, form }) {
+			const read = () => form?.getSnapshot?.() ?? { status: "loading", value: undefined, writable: false };
+			const [snapshot, setSnapshot] = React.useState(read);
+			const [busy, setBusy] = React.useState(false);
+			const [failed, setFailed] = React.useState(null);
+			React.useEffect(() => {
+				if (form === null || form === undefined || typeof form.subscribe !== "function") return undefined;
+				setSnapshot(form.getSnapshot());
+				return form.subscribe(() => { setSnapshot(form.getSnapshot()) });
+			}, []);
+			// A slot can render before the form reports its first snapshot.
+			const view = snapshot ?? read();
+			const enabled = view.value?.debugRows === true;
+			const ready = view.status === "ready" && view.writable === true;
+			const toggle = (next) => {
+				if (form === null || form === undefined) return;
+				setBusy(true);
+				setFailed(null);
+				Promise.resolve(form.set("debugRows", next))
+					.then((accepted) => { if (accepted !== true) setFailed(t("debugFailed", { message: "refused" })) })
+					.catch((cause) => { setFailed(t("debugFailed", { message: String(cause?.message ?? cause) })) })
+					.finally(() => { setBusy(false) });
+			};
+			return React.createElement("div", { className: "dsha_section" },
+				React.createElement("div", { className: "dsha_sectionTitle" }, t("debugTitle")),
+				React.createElement("div", { className: "dsha_sectionDesc" }, t("debugDesc")),
+				React.createElement("div", { className: "dsha_sectionRow" },
+					React.createElement(primitives.Switch, {
+						checked: enabled,
+						disabled: busy || !ready,
+						label: t("debugTitle"),
+						onChange: (next) => { toggle(next === true) }
+					}),
+					failed === null ? null : React.createElement("span", { className: "dsha_sectionError", role: "alert" }, failed)),
+				React.createElement("button", {
+					type: "button",
+					className: "dsha_sectionAction",
+					onClick: () => { window.location.reload() }
+				}, t("debugReload")));
+		}
+		//#endregion
+
 		//#region plugin
 		const inject = ["slots", "locale", "sessions", "uiConversation"];
 
 		/** 注册字典、同款审批卡片,以及每条策略决定在对话流里的一行。 */
 		function apply(ctx) {
 			ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-allow: dictionaries");
+			// Slot registrations take their labels from this binding; the rows themselves get `t`
+			// injected by their locale option.
+			const t = ctx.locale.bind(NS);
 			// 每条决定都由宿主写进会话日志,这里把那条事件折成一行,渲染在它回答的
 			// 工具调用旁边 —— 数据全程来自事件流,没有宿主接口参与。
 			// 渲染由宿主配置决定:每条判定都写进会话日志,但只有部署打开 debugRows 时才在对话与
@@ -612,6 +681,18 @@ window.__ModuleLoader__.load({
 			if (debugRows) ctx.effect(() => ctx.uiConversation.events.register(
 				createTrajectoryDefinition((key, params) => ctx.locale.bind(NS)(key, params))
 			), "dsh-allow: trajectory definition");
+			// 设置页的那一节:表单句柄按本插件的行 id 取,写入落到当前 profile 的补丁。
+			const debugForm = typeof ctx.configForms?.get === "function" ? ctx.configForms.get("dsh-allow") : null;
+			ctx.slots.inject("settings.section", () => {
+				const dispose = ctx.slots.register({
+					name: "settings.section",
+					id: "dsh-allow",
+					order: 80,
+					label: () => t("nav"),
+					locale: NS
+				}, (props) => PermissionsSection({ ...props, form: debugForm }));
+				return () => { dispose(); };
+			});
 			ctx.slots.inject("conversation.chat.node", () => {
 				const dispose = ctx.slots.register({
 					name: "conversation.chat.node",
@@ -656,6 +737,7 @@ window.__ModuleLoader__.load({
 		exports.AllowPanel = AllowPanel;
 		exports.AllowDecisionRow = AllowDecisionRow;
 		exports.allowDecisionDefinition = allowDecisionDefinition;
+		exports.PermissionsSection = PermissionsSection;
 		exports.createTrajectoryDefinition = createTrajectoryDefinition;
 		exports.DECISION_EVENT = DECISION_EVENT;
 		//#endregion

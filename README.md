@@ -230,7 +230,7 @@ Every decision this layer makes lands in exactly one place: a Session record (`p
 
 The event is log-only and carries the envelope's `ignorable` marker, so it never reaches a model request, and a build that does not know the type skips it instead of refusing the session.
 
-**Rendering is a configuration switch.** Records are always written; the Conversation and Trajectory rows appear only when the deployment turns `debugRows` on:
+**Rendering is a configuration switch, editable in Settings.** Records are always written; the Conversation and Trajectory rows appear only when `debugRows` is on. Settings → **Permissions** exposes the same switch, so it can be changed in the app: the write goes through the config form into this profile's patch file, and the page reloads to pick it up. Records are always written; the Conversation and Trajectory rows appear only when the deployment turns `debugRows` on:
 
 ```yaml
 - id: dsh-allow
