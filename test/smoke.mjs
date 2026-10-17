@@ -254,7 +254,8 @@ check('with the effect paths and the decision',
 const secretAudit = join(root, 'secret.ndjson')
 const secretGate = host.createGate({
   engine: host.createEngine({
-    config: { ...config, auditFile: secretAudit },
+    // Automatic allows are filtered out by default; this case needs any recorded line.
+    config: { ...config, auditFile: secretAudit, auditAllows: true },
     home: HOME,
     grants,
     pendings: store.createPendingStore(),
@@ -263,7 +264,9 @@ const secretGate = host.createGate({
   pendings: store.createPendingStore(),
   logger,
 })
-await secretGate(exec('curl -H "Authorization: Bearer abc123" https://example.invalid'), next)
+// A write outside the workspace prompts, so this line is recorded; an automatic allow
+// would now be dropped by isAmbientAllow and leave nothing to redact.
+await secretGate(exec('curl -H "Authorization: Bearer abc123" -o /tmp/dsh-allow-redaction.out https://example.invalid'), next)
 const secretLine = readFileSync(secretAudit, 'utf8')
 check('credential-shaped text is redacted', secretLine.includes('[redacted]') && !secretLine.includes('abc123'), secretLine.slice(0, 200))
 

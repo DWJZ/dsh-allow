@@ -331,6 +331,7 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
 ```
 
 每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`appendSessionEvents` 默认关闭:打开后每个判定除审计文件外还写一条带 `ignorable` 标记的会话事件,客户端据此在对话里显示这些行;轨迹里的那一行还需要宿主能渲染扩展行(fork 独有的能力),所以保持选择加入;`escalation` 取 ask 或 rule —— 取 rule 时,若规则已经放行这条命令,它请求的沙箱升级也直接沿用该规则,不再弹卡片;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算;`grants` 与 `toolGrants` 是部署级授权,形状分别与持久规则、持久工具规则一致。
+`auditAllows` 默认关闭：基线或 workspace/system 规则直接放行的命令不再写审计行（工作区内修改时这一层会占满日志）；用户授予、一次性授权、提示、拒绝、auto-review 的判定都照旧记录。想在审计里看到全部自动放行，把它设为 true。
 
 dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,并在第一次写入时留成 `<rulesFile>.v2.bak`:那些规则描述的是命令,不是文件能力,无法翻译。
 

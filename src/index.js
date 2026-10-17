@@ -442,7 +442,8 @@ export const DECISION_EVENT = 'plugin:dsh-allow/decision'
  * is the same redacted record the audit file holds, so a log reader sees exactly
  * what an audit line holds and nothing more.
  *
- * The audit file follows the `audit` switch. The record follows
+ * The audit file follows the `audit` switch, minus the automatic allows
+ * {@link isAmbientAllow} filters out. The record follows
  * `appendSessionEvents`, off by default: the chat-side row and the trajectory
  * line both read these records, and the trajectory line needs the host to render
  * extension rows, so the record stays opt-in rather than depending on a patched
@@ -452,7 +453,29 @@ export const DECISION_EVENT = 'plugin:dsh-allow/decision'
  * @param session - the deciding session, when the caller holds it.
  * @param logger - optional sink for a record that could not be written.
  */
+/**
+ * Whether one decision is quiet enough to keep out of the audit trail.
+ *
+ * Under `workspace-write` most calls need nothing beyond the workspace baseline, and a
+ * line per call buries the decisions a person would actually read. An allow is only
+ * dropped when it came from the baseline or from workspace/system rules: anything a
+ * person granted, anything scoped to one call, and every prompt or denial is still
+ * recorded. `auditAllows` turns the automatic ones back on.
+ * @param audit - the decision record about to be written.
+ * @param config - resolved plugin configuration.
+ * @returns whether this record should be skipped.
+ */
+export function isAmbientAllow(audit, config = null) {
+  if (config?.auditAllows === true) return false
+  if (audit?.decision !== 'allow') return false
+  if (audit?.origin !== 'rule' && audit?.origin !== 'baseline') return false
+  const rules = Array.isArray(audit?.matchedRules) ? audit.matchedRules : []
+  if (rules.length === 0) return audit?.origin === 'baseline'
+  return rules.every(rule => rule?.source === 'workspace' || rule?.source === 'system')
+}
+
 export function recordDecision(config, audit, session = null, logger = null) {
+  if (isAmbientAllow(audit, config)) return
   appendAudit(auditTarget(config), audit)
   if (config?.appendSessionEvents !== true) return
   if (session === null || session === undefined) return
