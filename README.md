@@ -302,7 +302,7 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
     rulesFile: /path/to/rules.json          # default $DSH_HOME/dsh-allow.json
     auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
     audit: true                             # false turns the audit log off
-    appendSessionEvents: false              # true also records each decision as a session event
+    appendSessionEvents: true               # also records each decision as a session event (default)
     escalation: ask                         # ask | rule: who answers a sandbox escalation the rule already covers
     sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
     enforce: auto                           # auto | full | guarded | process | writes | off

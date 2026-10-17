@@ -714,12 +714,12 @@ console.log('session decision events')
 const switchSession = sessionAt('s-switch')
 const probe = { tool: 'bash', origin: 'rule', decision: 'allow' }
 host.recordDecision(store.resolveConfig({ rulesFile, auditFile }, root), probe, switchSession)
-check('a decision writes no Session record until a deployment asks for it',
-  recordsOf(switchSession).length === 0, JSON.stringify(recordsOf(switchSession)))
-host.recordDecision(store.resolveConfig({ rulesFile, auditFile, appendSessionEvents: true }, root), probe, switchSession)
-check('and writes exactly one, marked, once the switch is on',
+check('a decision writes one Session record by default',
   recordsOf(switchSession).length === 1 && switchSession.eventAt(0)?.ignorable === true,
   JSON.stringify(recordsOf(switchSession)))
+host.recordDecision(store.resolveConfig({ rulesFile, auditFile, appendSessionEvents: false }, root), probe, switchSession)
+check('and a deployment can turn the record off',
+  recordsOf(switchSession).length === 1, JSON.stringify(recordsOf(switchSession)))
 check('the audit file is written either way',
   readFileSync(auditFile, 'utf8').trim().split('\n').length >= 2, String(recordsOf(switchSession).length))
 
