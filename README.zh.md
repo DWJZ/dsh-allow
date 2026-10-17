@@ -314,7 +314,7 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
     rulesFile: /path/to/rules.json          # default $DSH_HOME/dsh-allow.json
     auditFile: /path/to/audit.ndjson        # default $DSH_HOME/dsh-allow-audit.ndjson
     audit: true                             # false turns the audit log off
-    appendSessionEvents: true               # 同时把每个判定写成会话事件（默认开启）
+    appendSessionEvents: false              # true also records each decision as a session event
     escalation: ask                         # ask | rule: who answers a sandbox escalation the rule already covers
     sessionGrantTtlMs: 600000               # backstop lifetime of "allow once"
     enforce: auto                           # auto | full | guarded | process | writes | off
@@ -330,7 +330,7 @@ macOS 上 `delete` 与 `write` **确实可以分开**:在某个子树里允许 `
         action: list_plugins
 ```
 
-每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`appendSessionEvents` 默认开启:每个判定除审计文件外还写一条带 `ignorable` 标记的会话事件,客户端据此在对话与轨迹里显示这些行(想要安静的日志可以关掉);`escalation` 取 ask 或 rule —— 取 rule 时,若规则已经放行这条命令,它请求的沙箱升级也直接沿用该规则,不再弹卡片;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算;`grants` 与 `toolGrants` 是部署级授权,形状分别与持久规则、持久工具规则一致。
+每一项读作:`rulesFile` / `auditFile` 默认落在 `$DSH_HOME` 下的 `dsh-allow.json` 与 `dsh-allow-audit.ndjson`;`audit: false` 关闭审计;`appendSessionEvents` 默认关闭:打开后每个判定除审计文件外还写一条带 `ignorable` 标记的会话事件,客户端据此在对话里显示这些行;轨迹里的那一行还需要宿主能渲染扩展行(fork 独有的能力),所以保持选择加入;`escalation` 取 ask 或 rule —— 取 rule 时,若规则已经放行这条命令,它请求的沙箱升级也直接沿用该规则,不再弹卡片;`sessionGrantTtlMs` 是「允许一次」的兜底有效期;`enforce` 取 auto / full / guarded / process / writes / off;`autoReview` 是可选的自动复核, 关着时卡片说了算;`grants` 与 `toolGrants` 是部署级授权,形状分别与持久规则、持久工具规则一致。
 
 dsh-allow 0.1 写出的 `rules.json`(命令前缀模型)会被读成空规则,并在第一次写入时留成 `<rulesFile>.v2.bak`:那些规则描述的是命令,不是文件能力,无法翻译。
 

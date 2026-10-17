@@ -157,7 +157,7 @@ export function resolveConfig(config, home) {
   const auditFile = text(config?.auditFile, 'auditFile', join(home, AUDIT_FILE_NAME))
   // Recording a decision as a session event needs a reader that honours the
   // envelope's skip marker, so it stays off until a deployment asks for it.
-  const appendSessionEvents = config?.appendSessionEvents ?? true
+  const appendSessionEvents = config?.appendSessionEvents ?? false
   if (typeof appendSessionEvents !== 'boolean') {
     throw new TypeError(`dsh-allow: config appendSessionEvents must be a boolean, got ${JSON.stringify(appendSessionEvents)}`)
   }

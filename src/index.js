@@ -443,10 +443,10 @@ export const DECISION_EVENT = 'plugin:dsh-allow/decision'
  * what an audit line holds and nothing more.
  *
  * The audit file follows the `audit` switch. The record follows
- * `appendSessionEvents`, on by default: the client half folds each record into a
- * row beside the tool call it answered and a line in the trajectory ledger, which
- * is how a person sees why a call was held. A deployment that wants a quiet log
- * turns it off.
+ * `appendSessionEvents`, off by default: the chat-side row and the trajectory
+ * line both read these records, and the trajectory line needs the host to render
+ * extension rows, so the record stays opt-in rather than depending on a patched
+ * harness.
  * @param config - resolved plugin configuration (the audit and session-record switches).
  * @param audit - the decision record.
  * @param session - the deciding session, when the caller holds it.
