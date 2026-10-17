@@ -73,6 +73,7 @@ window.__ModuleLoader__.load({
 				".dsha_sectionDesc{font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary);max-width:64ch}",
 				".dsha_sectionRow{display:flex;align-items:center;gap:12px}",
 				".dsha_sectionError{font-size:12px;line-height:18px;color:var(--dsw-alias-state-error-primary)}",
+				".dsha_sectionNote{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
 				".dsha_decision{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;padding:6px 0;font-size:12px;line-height:18px}",
 				".dsha_decisionEmoji{flex:0 0 auto;font-size:12px;line-height:18px}",
 				".dsha_decisionCommand{font-family:var(--ds-font-family-code);font-size:12px;line-height:18px;word-break:break-all}",
@@ -89,7 +90,7 @@ window.__ModuleLoader__.load({
 			debugTitle: "在对话与轨迹里显示判定",
 			debugDesc: "每个判定都会写进会话日志；打开后立刻在工具调用旁与轨迹账本里画成一行。改动保存到当前 profile 的补丁文件。",
 			debugFailed: "保存失败：{message}",
-			debugUnavailable: "配置表单不可写（status={status}, writable={writable}）",
+			debugRoute: "这个 profile 的配置表单未开放，开关直接写入补丁文件。",
 			waiting: "需要文件权限",
 			reject: "拒绝",
 			allowOnce: "允许一次",
@@ -135,7 +136,7 @@ window.__ModuleLoader__.load({
 			debugTitle: "Show decisions in Chat and Trajectory",
 			debugDesc: "Every decision is written to the session log; turning this on renders one row beside the tool call and in the Trajectory ledger right away. The change lands in this profile's patch file.",
 			debugFailed: "Not saved: {message}",
-			debugUnavailable: "The config form is not writable (status={status}, writable={writable})",
+			debugRoute: "No config form for this profile; the switch writes the patch file directly.",
 			waiting: "Filesystem permission required",
 			reject: "Deny",
 			allowOnce: "Allow once",
@@ -618,7 +619,7 @@ window.__ModuleLoader__.load({
 		 * 两个定义 —— 界面上的行跟着出现或消失,不需要刷新页面。
 		 * @param props - 插槽注入的翻译函数与配置表单句柄。
 		 */
-		function PermissionsSection({ t, form }) {
+		function PermissionsSection({ t, form, applyDebugRows }) {
 			const fallback = { status: "loading", value: undefined, writable: false };
 			const read = () => form?.getSnapshot?.() ?? fallback;
 			const [snapshot, setSnapshot] = React.useState(read);
@@ -630,14 +631,32 @@ window.__ModuleLoader__.load({
 				return form.subscribe(() => { setSnapshot(form.getSnapshot()) });
 			}, []);
 			const view = snapshot ?? read();
-			const enabled = view.value?.debugRows === true;
+			// The route is the fallback for a profile whose namespace the shell does not describe.
+			const [routed, setRouted] = React.useState(undefined);
+			const enabled = routed !== undefined ? routed : view.value?.debugRows === true;
 			const ready = view.status === "ready" && view.writable === true;
 			const toggle = (next) => {
-				if (form === null || form === undefined) return;
 				setBusy(true);
 				setFailed(null);
-				Promise.resolve(form.set("debugRows", next))
-					.then((accepted) => { if (accepted !== true) setFailed(t("debugFailed", { message: "refused" })) })
+				const settle = (accepted) => {
+					if (accepted !== true) { setFailed(t("debugFailed", { message: "refused" })); return }
+					setRouted(next);
+					applyDebugRows?.(next);
+				};
+				if (ready) {
+					Promise.resolve(form.set("debugRows", next))
+						.then(settle)
+						.catch((cause) => { setFailed(t("debugFailed", { message: String(cause?.message ?? cause) })) })
+						.finally(() => { setBusy(false) });
+					return;
+				}
+				Promise.resolve(fetch("/dsh-allow/debug", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ enabled: next })
+				}))
+					.then((response) => response.ok)
+					.then(settle)
 					.catch((cause) => { setFailed(t("debugFailed", { message: String(cause?.message ?? cause) })) })
 					.finally(() => { setBusy(false) });
 			};
@@ -647,15 +666,12 @@ window.__ModuleLoader__.load({
 				React.createElement("div", { className: "dsha_sectionRow" },
 					React.createElement(primitives.Switch, {
 						checked: enabled,
-						disabled: busy || !ready,
+						disabled: busy,
 						label: t("debugTitle"),
 						onChange: (next) => { toggle(next === true) }
 					}),
 					failed === null ? null : React.createElement("span", { className: "dsha_sectionError", role: "alert" }, failed),
-					// While the form is not writable, say what the shell reported: that is the only
-					// way to tell "no config schema" from "still loading" without devtools.
-					ready ? null : React.createElement("span", { className: "dsha_sectionError" },
-						t("debugUnavailable", { status: String(view.status), writable: String(view.writable) }))));
+					ready ? null : React.createElement("span", { className: "dsha_sectionNote" }, t("debugRoute"))));
 		}
 		//#endregion
 
@@ -703,7 +719,7 @@ window.__ModuleLoader__.load({
 					order: 80,
 					label: () => t("nav"),
 					locale: NS
-				}, (props) => PermissionsSection({ ...props, form: debugForm }));
+				}, (props) => PermissionsSection({ ...props, form: debugForm, applyDebugRows: showRows }));
 				return () => { dispose(); };
 			});
 			ctx.slots.inject("conversation.chat.node", () => {

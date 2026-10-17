@@ -21,6 +21,7 @@
  * what answers it is one operation of one tool — see `src/toolrules.js`.
  */
 import { homedir } from 'node:os'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { canonicalPath, describeRule, protectedRefusal } from './fspolicy.js'
 import { describeToolRule, isJudgedTool, matchToolRule, matchedToolRuleOf, toolRequestOf } from './toolrules.js'
@@ -1100,11 +1101,90 @@ export function runAllowCommand({ file, workspaceRoot, mode, enforcement = null,
  * @param ctx - Cordis context of this plugin's fiber.
  * @param debugRows - whether the browser half should render decision rows.
  */
-export function publishPageConfig(ctx, debugRows) {
+export function publishPageConfig(ctx, state) {
   ctx.inject(['webServer'], (webCtx) => {
     webCtx.effect(() => webCtx.on('webserver/index-inject', (table) => {
-      table.push({ kind: 'global', name: '__DSH_ALLOW_CONFIG__', value: { debugRows: debugRows === true } })
+      table.push({ kind: 'global', name: '__DSH_ALLOW_CONFIG__', value: { debugRows: state.debugRows === true } })
     }), 'dsh-allow: page config')
+  })
+}
+
+/**
+ * Read one line of the `dsh-allow` entry out of a Cordis patch document.
+ * @param text - the patch file's YAML.
+ * @returns the line index and indentation of the entry's `config:` block, or undefined.
+ */
+function findEntryConfig(text) {
+  const lines = text.split('\n')
+  const start = lines.findIndex(line => line.trim() === '- id: dsh-allow')
+  if (start < 0) return undefined
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (lines[index].trim().startsWith('- id:')) return undefined
+    if (lines[index].trim() === 'config:') {
+      const indent = lines[index].length - lines[index].trimStart().length
+      return { lines, configIndex: index, indent }
+    }
+  }
+  return undefined
+}
+
+/**
+ * Set `debugRows` inside an existing `dsh-allow` entry, leaving every other byte alone.
+ * @param text - the patch file's YAML.
+ * @param enabled - the value to store.
+ * @returns the rewritten document, or undefined when the entry is absent.
+ */
+export function setDebugRowsInPatch(text, enabled) {
+  const found = findEntryConfig(text)
+  if (found === undefined) return undefined
+  const { lines, configIndex, indent } = found
+  const fieldIndent = ' '.repeat(indent + 2)
+  const field = `${fieldIndent}debugRows: ${enabled === true ? 'true' : 'false'}`
+  let index = configIndex + 1
+  while (index < lines.length && (lines[index].trim() === '' || (lines[index].length - lines[index].trimStart().length) > indent)) {
+    if (lines[index].trim().startsWith('debugRows:')) {
+      lines[index] = field
+      return lines.join('\n')
+    }
+    index += 1
+  }
+  lines.splice(configIndex + 1, 0, field)
+  return lines.join('\n')
+}
+
+/**
+ * Let the browser flip the rendering switch.
+ *
+ * The settings shell only offers a client-editable form for entries whose namespace it
+ * describes, and a locally installed plugin is not described; this route is the same write
+ * the form would perform — one line of this profile's patch — plus the live value the page
+ * already reads. Same-origin and loopback only, exactly like the restart route.
+ * @param ctx - Cordis context of this plugin's fiber.
+ * @param state - live switch state; the route updates it in place.
+ * @param patchPath - this profile's patch file, when the host publishes one.
+ */
+export function publishDebugRoute(ctx, state, patchPath) {
+  if (patchPath === undefined) return
+  ctx.inject(['webServer'], (webCtx) => {
+    webCtx.effect(() => webCtx.webServer.register({
+      method: 'POST',
+      path: '/dsh-allow/debug',
+      handler: async (request) => {
+        if (String(request.headers.host ?? '') !== request.headers.host) return { status: 400 }
+        const origin = request.headers.origin
+        if (typeof origin === 'string' && !origin.startsWith('http://127.0.0.1:') && !origin.startsWith('http://localhost:')) {
+          return { status: 403, body: 'cross-origin' }
+        }
+        let payload
+        try { payload = JSON.parse(request.body ?? '{}') } catch { return { status: 400, body: 'invalid json' } }
+        const enabled = payload?.enabled === true
+        const next = setDebugRowsInPatch(readFileSync(patchPath, 'utf8'), enabled)
+        if (next === undefined) return { status: 409, body: 'no dsh-allow entry in this profile patch' }
+        writeFileSync(patchPath, next, 'utf8')
+        state.debugRows = enabled
+        return { status: 200, body: JSON.stringify({ debugRows: state.debugRows }) }
+      },
+    }), 'dsh-allow: debug switch route')
   })
 }
 
@@ -1118,8 +1198,12 @@ export function apply(ctx, pluginConfig) {
   ctx.inject(['settings'], (settingsCtx) => {
     settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber))
   })
+  // The page reads this object on every boot; the route below flips it in place.
+  const pageState = { debugRows: config.debugRows === true }
   // Before anything can render: the page needs the switch as soon as it loads.
-  publishPageConfig(ctx, config.debugRows)
+  publishPageConfig(ctx, pageState)
+  const patchPath = ctx.get('profileContext')?.patchPath
+  publishDebugRoute(ctx, pageState, typeof patchPath === 'string' ? patchPath : undefined)
   const pendings = createPendingStore()
   // Which calls a rule already settled. Separate from `pendings`, which is the
   // queue of decisions still owed to the user, because a settled call owes

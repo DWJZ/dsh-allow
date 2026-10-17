@@ -646,7 +646,8 @@ const registered = { listeners: [], commands: [], routes: [], effects: [] }
 const pluginCtx = {
   logger,
   on: (name, listener, options) => { registered.listeners.push({ name, options }) },
-  get: () => undefined,
+  // The profile patch is where the debug switch is written.
+  get: (name) => (name === 'profileContext' ? { patchPath: join(root, 'smoke-patch.yml') } : undefined),
   effect: (create) => { registered.effects.push(create()); return () => {} },
   inject: (names, factory) => {
     if (names.includes('webServer')) {
@@ -661,6 +662,7 @@ const pluginCtx = {
     })
   },
 }
+writeFileSync(join(root, 'smoke-patch.yml'), '- id: dsh-allow\n  config:\n    escalation: rule\n', 'utf8')
 host.apply(pluginCtx, { rulesFile, appendSessionEvents: true })
 check('every listener is prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
 check('the config schema exposes debugRows as a client-editable field', (() => {
@@ -668,21 +670,33 @@ check('the config schema exposes debugRows as a client-editable field', (() => {
   // Unknown keys survive validation: the plugin keeps its own config resolution.
   return accepted.debugRows !== undefined && accepted.escalation === 'rule' && accepted.appendSessionEvents === true
 })(), JSON.stringify(host.Config({ debugRows: false })))
+{
+  const route = registered.routes.find(entry => entry.path === '/dsh-allow/debug')
+  const before = route === undefined ? '' : readFileSync(join(root, 'smoke-patch.yml'), 'utf8')
+  const handled = route === undefined ? undefined : await route.handler({ headers: { host: '127.0.0.1:3080' }, body: JSON.stringify({ enabled: true }) })
+  const after = readFileSync(join(root, 'smoke-patch.yml'), 'utf8')
+  check('the route rewrites only the debugRows line of the profile patch',
+    handled?.status === 200 && after.includes('debugRows: true') && after.includes('escalation: rule') && !before.includes('debugRows'),
+    `${String(handled?.status)} ${JSON.stringify(after)}`)
+}
+check('the debug switch has a host route of its own',
+  registered.routes.some(route => route.path === '/dsh-allow/debug'), JSON.stringify(registered.routes.map(route => route.path)))
 check('the entry tells the settings shell not to auto-generate a page',
   registered.presentation?.auto === false, JSON.stringify(registered.presentation))
 check('the rendering switch is published to every served page', (() => {
   const table = []
   let listener
   const pageCtx = { inject: (_deps, cb) => cb({ effect: (fn) => fn(), on: (name, fn) => { listener = fn; return () => {} } }) }
-  host.publishPageConfig(pageCtx, true)
+  host.publishPageConfig(pageCtx, { debugRows: true })
   listener(table)
   return table.length === 1 && table[0].name === '__DSH_ALLOW_CONFIG__' && table[0].value.debugRows === true
 })(), 'page config')
 check('the gate listens on tools/pre-execute', registered.listeners.some(entry => entry.name === 'tools/pre-execute'))
 check('the card listens on approval/request', registered.listeners.some(entry => entry.name === 'approval/request'))
 check('the one-shot grants settle on tools/post-execute', registered.listeners.some(entry => entry.name === 'tools/post-execute'))
-check('no Web route is exposed at all',
-  registered.routes.length === 0, JSON.stringify(registered.routes.map(route => route.path)))
+check('the only Web route is the debug switch',
+  registered.routes.length === 1 && registered.routes[0].path === '/dsh-allow/debug',
+  JSON.stringify(registered.routes.map(route => route.path)))
 check('/allow is registered', registered.commands[0]?.name === 'allow')
 check('the process fence is installed as an effect', registered.effects.length >= 1)
 check('the harness home follows the harness resolver: $DSH_HOME, then the default',
