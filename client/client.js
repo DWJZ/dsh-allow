@@ -90,7 +90,7 @@ window.__ModuleLoader__.load({
 			debugTitle: "在对话与轨迹里显示判定",
 			debugDesc: "每个判定都会写进会话日志；打开后立刻在工具调用旁与轨迹账本里画成一行。改动保存到当前 profile 的补丁文件。",
 			debugFailed: "保存失败：{message}",
-			debugRoute: "这个 profile 的配置表单未开放，开关直接写入补丁文件。",
+			debugUnavailable: "设置外壳没有开放这个命名空间（status={status}, writable={writable}），开关暂不可用。",
 			waiting: "需要文件权限",
 			reject: "拒绝",
 			allowOnce: "允许一次",
@@ -136,7 +136,7 @@ window.__ModuleLoader__.load({
 			debugTitle: "Show decisions in Chat and Trajectory",
 			debugDesc: "Every decision is written to the session log; turning this on renders one row beside the tool call and in the Trajectory ledger right away. The change lands in this profile's patch file.",
 			debugFailed: "Not saved: {message}",
-			debugRoute: "No config form for this profile; the switch writes the patch file directly.",
+			debugUnavailable: "The settings shell does not expose this namespace (status={status}, writable={writable}); the switch is unavailable.",
 			waiting: "Filesystem permission required",
 			reject: "Deny",
 			allowOnce: "Allow once",
@@ -619,7 +619,7 @@ window.__ModuleLoader__.load({
 		 * 两个定义 —— 界面上的行跟着出现或消失,不需要刷新页面。
 		 * @param props - 插槽注入的翻译函数与配置表单句柄。
 		 */
-		function PermissionsSection({ t, form, applyDebugRows }) {
+		function PermissionsSection({ t, form }) {
 			const fallback = { status: "loading", value: undefined, writable: false };
 			const read = () => form?.getSnapshot?.() ?? fallback;
 			const [snapshot, setSnapshot] = React.useState(read);
@@ -631,51 +631,30 @@ window.__ModuleLoader__.load({
 				return form.subscribe(() => { setSnapshot(form.getSnapshot()) });
 			}, []);
 			const view = snapshot ?? read();
-			// The route is the fallback for a profile whose namespace the shell does not describe.
-			const [routed, setRouted] = React.useState(undefined);
-			const enabled = routed !== undefined ? routed : view.value?.debugRows === true;
+			const enabled = view.value?.debugRows === true;
 			const ready = view.status === "ready" && view.writable === true;
 			const toggle = (next) => {
+				if (form === null || form === undefined || ready !== true) return;
 				setBusy(true);
 				setFailed(null);
-				const settle = (accepted) => {
-					if (accepted !== true) { if (failed === null) setFailed(t("debugFailed", { message: "refused" })); return }
-					setRouted(next);
-					applyDebugRows?.(next);
-				};
-				if (ready) {
-					Promise.resolve(form.set("debugRows", next))
-						.then(settle)
-						.catch((cause) => { setFailed(t("debugFailed", { message: String(cause?.message ?? cause) })) })
-						.finally(() => { setBusy(false) });
-					return;
-				}
-				Promise.resolve(fetch("/dsh-allow/debug", {
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify({ enabled: next })
-				}))
-					.then((response) => {
-						if (response.ok) return true;
-						setFailed(t("debugFailed", { message: "HTTP " + String(response.status) }));
-						return false;
-					})
-					.then(settle)
+				Promise.resolve(form.set("debugRows", next))
+					.then((accepted) => { if (accepted !== true) setFailed(t("debugFailed", { message: "refused" })) })
 					.catch((cause) => { setFailed(t("debugFailed", { message: String(cause?.message ?? cause) })) })
 					.finally(() => { setBusy(false) });
-			};
+				};
 			return React.createElement("div", { className: "dsha_section" },
 				React.createElement("div", { className: "dsha_sectionTitle" }, t("debugTitle")),
 				React.createElement("div", { className: "dsha_sectionDesc" }, t("debugDesc")),
 				React.createElement("div", { className: "dsha_sectionRow" },
 					React.createElement(primitives.Switch, {
 						checked: enabled,
-						disabled: busy,
+						disabled: busy || !ready,
 						label: t("debugTitle"),
 						onChange: (next) => { toggle(next === true) }
 					}),
 					failed === null ? null : React.createElement("span", { className: "dsha_sectionError", role: "alert" }, failed),
-					ready ? null : React.createElement("span", { className: "dsha_sectionNote" }, t("debugRoute"))));
+					ready ? null : React.createElement("span", { className: "dsha_sectionNote" },
+						t("debugUnavailable", { status: String(view.status), writable: String(view.writable) }))));
 		}
 		//#endregion
 
@@ -723,7 +702,7 @@ window.__ModuleLoader__.load({
 					order: 80,
 					label: () => t("nav"),
 					locale: NS
-				}, (props) => PermissionsSection({ ...props, form: debugForm, applyDebugRows: showRows }));
+				}, (props) => PermissionsSection({ ...props, form: debugForm }));
 				return () => { dispose(); };
 			});
 			ctx.slots.inject("conversation.chat.node", () => {

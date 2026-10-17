@@ -21,8 +21,6 @@
  * what answers it is one operation of one tool — see `src/toolrules.js`.
  */
 import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { canonicalPath, describeRule, protectedRefusal } from './fspolicy.js'
 import { describeToolRule, isJudgedTool, matchToolRule, matchedToolRuleOf, toolRequestOf } from './toolrules.js'
@@ -1110,111 +1108,6 @@ export function publishPageConfig(ctx, state) {
   })
 }
 
-/**
- * Read one line of the `dsh-allow` entry out of a Cordis patch document.
- * @param text - the patch file's YAML.
- * @returns the line index and indentation of the entry's `config:` block, or undefined.
- */
-function findEntryConfig(text) {
-  const lines = text.split('\n')
-  const start = lines.findIndex(line => line.trim() === '- id: dsh-allow')
-  if (start < 0) return undefined
-  for (let index = start + 1; index < lines.length; index += 1) {
-    if (lines[index].trim().startsWith('- id:')) return undefined
-    if (lines[index].trim() === 'config:') {
-      const indent = lines[index].length - lines[index].trimStart().length
-      return { lines, configIndex: index, indent }
-    }
-  }
-  return undefined
-}
-
-/**
- * Set `debugRows` inside an existing `dsh-allow` entry, leaving every other byte alone.
- * @param text - the patch file's YAML.
- * @param enabled - the value to store.
- * @returns the rewritten document, or undefined when the entry is absent.
- */
-export function setDebugRowsInPatch(text, enabled) {
-  const found = findEntryConfig(text)
-  if (found === undefined) return undefined
-  const { lines, configIndex, indent } = found
-  const fieldIndent = ' '.repeat(indent + 2)
-  const field = `${fieldIndent}debugRows: ${enabled === true ? 'true' : 'false'}`
-  let index = configIndex + 1
-  while (index < lines.length && (lines[index].trim() === '' || (lines[index].length - lines[index].trimStart().length) > indent)) {
-    if (lines[index].trim().startsWith('debugRows:')) {
-      lines[index] = field
-      return lines.join('\n')
-    }
-    index += 1
-  }
-  lines.splice(configIndex + 1, 0, field)
-  return lines.join('\n')
-}
-
-/**
- * Locate the patch file of the profile that installed this plugin.
- *
- * The route has to write the same document the settings form would, and no service promises
- * that path to a plugin: `profileContext` is absent on a linked install and the settings
- * document is only published inside the shell. Every profile that installs this plugin names
- * it in its package.json, so that is the dependable address.
- * @param harnessHome - the resolved DSH home.
- * @returns the first profile patch that declares this plugin, or undefined.
- */
-export function resolvePatchPath(harnessHome) {
-  const profiles = join(harnessHome, 'profiles')
-  let names
-  try { names = readdirSync(profiles) } catch { return undefined }
-  for (const name of names) {
-    const manifest = join(profiles, name, 'package.json')
-    let text
-    try { text = readFileSync(manifest, 'utf8') } catch { continue }
-    if (!text.includes('"dsh-allow"')) continue
-    const patch = join(profiles, name, 'cordis.patch.yml')
-    try { readFileSync(patch); return patch } catch { /* the profile has no patch yet */ }
-  }
-  return undefined
-}
-
-/**
- * Let the browser flip the rendering switch.
- *
- * The settings shell only offers a client-editable form for entries whose namespace it
- * describes, and a locally installed plugin is not described; this route is the same write
- * the form would perform — one line of this profile's patch — plus the live value the page
- * already reads. Same-origin and loopback only, exactly like the restart route.
- * @param ctx - Cordis context of this plugin's fiber.
- * @param state - live switch state; the route updates it in place.
- * @param patchPath - this profile's patch file, when the host publishes one.
- */
-export function publishDebugRoute(ctx, state, patchPath) {
-  if (patchPath === undefined) return
-  ctx.inject(['webServer'], (webCtx) => {
-    webCtx.effect(() => webCtx.webServer.register({
-      method: 'POST',
-      path: '/dsh-allow/debug',
-      handler: async (request) => {
-        if (String(request.headers.host ?? '') !== request.headers.host) return { status: 400 }
-        const origin = request.headers.origin
-        if (typeof origin === 'string' && !origin.startsWith('http://127.0.0.1:') && !origin.startsWith('http://localhost:')) {
-          return { status: 403, body: 'cross-origin' }
-        }
-        let payload
-        try { payload = JSON.parse(request.body ?? '{}') } catch { return { status: 400, body: 'invalid json' } }
-        const enabled = payload?.enabled === true
-        state.route = true
-        const next = setDebugRowsInPatch(readFileSync(patchPath, 'utf8'), enabled)
-        if (next === undefined) return { status: 409, body: 'no dsh-allow entry in this profile patch' }
-        writeFileSync(patchPath, next, 'utf8')
-        state.debugRows = enabled
-        return { status: 200, body: JSON.stringify({ debugRows: state.debugRows }) }
-      },
-    }), 'dsh-allow: debug switch route')
-  })
-}
-
 export function apply(ctx, pluginConfig) {
   const home = homedir()
   const harnessHome = resolveHome()
@@ -1229,14 +1122,7 @@ export function apply(ctx, pluginConfig) {
   const pageState = { debugRows: config.debugRows === true }
   // Before anything can render: the page needs the switch as soon as it loads.
   publishPageConfig(ctx, pageState)
-  // The settings service already knows which patch this profile edits; it is the same file the
-  // native configuration editor opens, so the switch writes where the form would have written.
-  ctx.inject(['settings'], (settingsCtx) => {
-    // Prefer the shell's own answer, then fall back to the profile manifest that names us.
-    const declared = settingsCtx.settings?.documentPath
-    const path = typeof declared === 'string' && declared.length > 0 ? declared : resolvePatchPath(harnessHome)
-    if (typeof path === 'string' && path.length > 0) publishDebugRoute(settingsCtx, pageState, path)
-  })
+
   const pendings = createPendingStore()
   // Which calls a rule already settled. Separate from `pendings`, which is the
   // queue of decisions still owed to the user, because a settled call owes
