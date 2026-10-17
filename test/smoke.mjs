@@ -670,6 +670,14 @@ const pluginCtx = {
 }
 host.apply(pluginCtx, { rulesFile, appendSessionEvents: true })
 check('every listener is prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
+check('a volatile config field is unwrapped before validation', (() => {
+  // A live host passes `.volatile()` fields as `{ get }`; the patch value is a plain boolean.
+  const wrapped = host.Config({ debugRows: true })
+  const direct = store.resolveConfig({ debugRows: true }, root).debugRows
+  const unwrapped = store.resolveConfig({ debugRows: wrapped.debugRows }, root).debugRows
+  const missing = store.resolveConfig({}, root).debugRows
+  return direct === true && unwrapped === true && missing === false
+})(), 'volatile unwrap')
 check('the config schema exposes debugRows as a client-editable field', (() => {
   const accepted = host.Config({ debugRows: true, escalation: 'rule', appendSessionEvents: true })
   // Unknown keys survive validation: the plugin keeps its own config resolution.

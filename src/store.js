@@ -108,6 +108,21 @@ function configToolRule(entry) {
  * @param home - resolved harness home.
  * @returns absolute paths, the configured grants, and the deployment flags.
  */
+/**
+ * Unwrap a volatile config field.
+ *
+ * A field declared with `.volatile()` arrives wrapped in an object that exposes the live value
+ * through `get()`: the host re-reads it when the settings page writes. Everything else arrives
+ * as the plain value.
+ * @param field - the config field as cordis passed it.
+ * @returns the current value, or undefined when the field was absent.
+ */
+export function readVolatile(field) {
+  if (field === undefined || field === null) return undefined
+  if (typeof field === 'object' && typeof field.get === 'function') return field.get()
+  return field
+}
+
 export function resolveConfig(config, home) {
   const text = (value, field, fallback) => {
     if (value === undefined) return fallback
@@ -162,7 +177,9 @@ export function resolveConfig(config, home) {
   // A sandbox escalation widens the process fence rather than asking about a
   // path, so `ask` keeps it a human decision. `rule` answers it from the rule
   // that already allowed the call, which is the deployment's call to make.
-  const debugRows = config?.debugRows ?? false
+  // A volatile schema field reaches `apply` as `{ get }` (cosmokit's wrapper), not as the plain
+  // value the patch declared. Accept both: the wrapper on a live host, the boolean in tests.
+  const debugRows = readVolatile(config?.debugRows) ?? false
   if (typeof debugRows !== 'boolean') {
     throw new TypeError(`dsh-allow: config debugRows must be a boolean, got ${JSON.stringify(config?.debugRows)}`)
   }
