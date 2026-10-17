@@ -658,6 +658,11 @@ const pluginCtx = {
 }
 host.apply(pluginCtx, { rulesFile, appendSessionEvents: true })
 check('every listener is prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
+check('the config schema exposes debugRows as a client-editable field', (() => {
+  const accepted = host.Config({ debugRows: true, escalation: 'rule', appendSessionEvents: true })
+  // Unknown keys survive validation: the plugin keeps its own config resolution.
+  return accepted.debugRows !== undefined && accepted.escalation === 'rule' && accepted.appendSessionEvents === true
+})(), JSON.stringify(host.Config({ debugRows: false })))
 check('the rendering switch is published to every served page', (() => {
   const table = []
   let listener

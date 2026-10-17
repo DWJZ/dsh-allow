@@ -34,6 +34,20 @@ import {
 } from './store.js'
 
 /** Stable Cordis plugin name. */
+import z from '@deepseek-ai/schemastery'
+
+/**
+ * Configuration schema.
+ *
+ * Cordis validates a plugin's config against this before `apply`, and the settings shell
+ * exposes one client-editable namespace per entry whose schema has volatile fields. That is
+ * what makes Settings → Permissions able to write `debugRows` into this profile's patch file;
+ * without a schema the namespace is simply not offered to the browser.
+ */
+export const Config = z.object({
+  debugRows: z.boolean().default(false).volatile(),
+})
+
 export const name = 'dsh-allow'
 
 /** Tools whose call carries a shell command line. */
