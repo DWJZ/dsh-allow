@@ -650,7 +650,7 @@ const pluginCtx = {
   effect: (create) => { registered.effects.push(create()); return () => {} },
   inject: (names, factory) => {
     if (names.includes('webServer')) {
-      factory({ effect: create => create(), webServer: { register: route => { registered.routes.push(route); return () => {} } } })
+      factory({ effect: create => create(), on: () => () => {}, webServer: { register: route => { registered.routes.push(route); return () => {} } } })
       return
     }
     factory({ effect: create => create(), commands: { register: definition => { registered.commands.push(definition); return () => {} } } })
@@ -658,6 +658,14 @@ const pluginCtx = {
 }
 host.apply(pluginCtx, { rulesFile, appendSessionEvents: true })
 check('every listener is prepended', registered.listeners.every(entry => entry.options?.prepend === true), JSON.stringify(registered.listeners))
+check('the rendering switch is published to every served page', (() => {
+  const table = []
+  let listener
+  const pageCtx = { inject: (_deps, cb) => cb({ effect: (fn) => fn(), on: (name, fn) => { listener = fn; return () => {} } }) }
+  host.publishPageConfig(pageCtx, true)
+  listener(table)
+  return table.length === 1 && table[0].name === '__DSH_ALLOW_CONFIG__' && table[0].value.debugRows === true
+})(), 'page config')
 check('the gate listens on tools/pre-execute', registered.listeners.some(entry => entry.name === 'tools/pre-execute'))
 check('the card listens on approval/request', registered.listeners.some(entry => entry.name === 'approval/request'))
 check('the one-shot grants settle on tools/post-execute', registered.listeners.some(entry => entry.name === 'tools/post-execute'))

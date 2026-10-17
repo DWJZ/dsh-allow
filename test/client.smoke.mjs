@@ -27,11 +27,9 @@ const check = (name, condition, detail = '') => {
 const found = findReact()
 
 let captured = null
-const storage = new Map([['dsh-allow:debug', '1']])
-globalThis.window = {
-  __ModuleLoader__: { load: (definition) => { captured = definition } },
-  localStorage: { getItem: key => storage.get(key) ?? null },
-}
+// The host publishes the rendering switch to the page as a global.
+globalThis.__DSH_ALLOW_CONFIG__ = { debugRows: true }
+globalThis.window = { __ModuleLoader__: { load: (definition) => { captured = definition } } }
 new Function(readFileSync(join(PLUGIN, 'client/client.js'), 'utf8'))()
 
 check('the bundle registers one module', captured !== null && captured.id === 'dsh-allow', String(captured?.id))
@@ -152,12 +150,9 @@ console.log('the debug switch decides whether decisions render')
 {
   // A fresh module instance with the switch off: the rows must not be registered.
   const seen = []
-  const quietWindow = {
-    __ModuleLoader__: { load: (definition) => { captured = definition } },
-    localStorage: { getItem: () => null },
-  }
   const savedWindow = globalThis.window
-  globalThis.window = quietWindow
+  const savedConfig = globalThis.__DSH_ALLOW_CONFIG__
+  globalThis.__DSH_ALLOW_CONFIG__ = { debugRows: false }
   const quietSource = readFileSync(join(PLUGIN, 'client/client.js'), 'utf8')
   new Function(quietSource)()
   const quietModule = captured.factory((name) => (name === 'react' ? found : {}))
@@ -172,6 +167,7 @@ console.log('the debug switch decides whether decisions render')
   check('with the switch off, no decision definition is registered', seen.length === 0, JSON.stringify(seen.map(entry => entry.kind)))
   check('and the settings section still registers', true)
   globalThis.window = savedWindow
+  globalThis.__DSH_ALLOW_CONFIG__ = savedConfig
 }
 
 console.log('the decision row')

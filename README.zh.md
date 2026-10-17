@@ -240,7 +240,15 @@ missing (path, capability)
 
 这条事件是 log-only(非 surface),并且带 envelope 的 `ignorable` 标记 —— 所以它永远不进模型请求,而一个不认识这个类型的构建会直接跳过它、而不是拒绝整个会话。
 
-**渲染是一个调试开关。** 记录永远写入;对话与轨迹里的行只在开关打开时出现:
+**渲染是一个配置开关。** 记录永远写入;对话与轨迹里的行只在部署打开 `debugRows` 时出现:
+
+```yaml
+- id: dsh-allow
+  config:
+    debugRows: true
+```
+
+宿主半边把这个开关作为页面全局 `__DSH_ALLOW_CONFIG__` 注入每个页面(和 shell 自己的页面设置同一套机制),所以浏览器半边读的是**配置**,不是浏览器本地状态。关着时什么都不注册 —— 对一个接管了所有 workspace-write 调用的权限层来说,这本来就该是默认。打开后:对话里贴着它所回答的那次工具调用一行,轨迹账本里再一行;两个视图里同一来源同一种颜色(`rule` 绿、`baseline` 灰、`auto-review` 蓝、`human` 琥珀、`policy` 红),每一行还带一个符号 —— `✅` 允许一次、`♾️` 总是允许、`🚫` 拒绝、`↩️` 已取消、`⌛` 无人应答、`📋` 规则放行、`⚪` 默认放行、`🤖` 自动审核。
 
 ```js
 localStorage.setItem('dsh-allow:debug', '1')   // then reload the page

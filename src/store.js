@@ -162,6 +162,10 @@ export function resolveConfig(config, home) {
   // A sandbox escalation widens the process fence rather than asking about a
   // path, so `ask` keeps it a human decision. `rule` answers it from the rule
   // that already allowed the call, which is the deployment's call to make.
+  const debugRows = config?.debugRows ?? false
+  if (typeof debugRows !== 'boolean') {
+    throw new TypeError(`dsh-allow: config debugRows must be a boolean, got ${JSON.stringify(config?.debugRows)}`)
+  }
   const escalation = config?.escalation ?? 'ask'
   if (escalation !== 'ask' && escalation !== 'rule') {
     throw new TypeError(`dsh-allow: config escalation must be "ask" or "rule", got ${JSON.stringify(escalation)}`)
@@ -169,6 +173,7 @@ export function resolveConfig(config, home) {
   return {
     rulesFile,
     appendSessionEvents,
+    debugRows,
     escalation,
     sessionGrantTtlMs,
     grants: grants.map(entry => configGrantRule(entry, home)),

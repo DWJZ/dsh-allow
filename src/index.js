@@ -1076,10 +1076,30 @@ export function runAllowCommand({ file, workspaceRoot, mode, enforcement = null,
  * @param ctx - Cordis context of this plugin's fiber.
  * @param pluginConfig - plugin configuration from cordis.yml.
  */
+
+/**
+ * Publish the rendering switch to the page.
+ *
+ * The host half owns the configuration, the browser half draws the rows, and a Cordis row's
+ * config never crosses that boundary on its own. The shell publishes its own page settings the
+ * same way: a global injected into every served page.
+ * @param ctx - Cordis context of this plugin's fiber.
+ * @param debugRows - whether the browser half should render decision rows.
+ */
+export function publishPageConfig(ctx, debugRows) {
+  ctx.inject(['webServer'], (webCtx) => {
+    webCtx.effect(() => webCtx.on('webserver/index-inject', (table) => {
+      table.push({ kind: 'global', name: '__DSH_ALLOW_CONFIG__', value: { debugRows: debugRows === true } })
+    }), 'dsh-allow: page config')
+  })
+}
+
 export function apply(ctx, pluginConfig) {
   const home = homedir()
   const harnessHome = resolveHome()
   const config = { ...resolveConfig(pluginConfig, harnessHome), harnessHome, home }
+  // Before anything can render: the page needs the switch as soon as it loads.
+  publishPageConfig(ctx, config.debugRows)
   const pendings = createPendingStore()
   // Which calls a rule already settled. Separate from `pendings`, which is the
   // queue of decisions still owed to the user, because a settled call owes
