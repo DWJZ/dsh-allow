@@ -158,9 +158,9 @@ export function resolveConfig(config, home) {
   // Recording a decision as a session event needs a reader that honours the
   // envelope's skip marker, so it stays off until a deployment asks for it.
   const appendSessionEvents = config?.appendSessionEvents ?? false
-  const auditAllows = config?.auditAllows ?? false
-  if (typeof auditAllows !== 'boolean') {
-    throw new TypeError(`dsh-allow: config auditAllows must be a boolean, got ${JSON.stringify(config?.auditAllows)}`)
+  const showAllowedRows = config?.showAllowedRows ?? false
+  if (typeof showAllowedRows !== 'boolean') {
+    throw new TypeError(`dsh-allow: config showAllowedRows must be a boolean, got ${JSON.stringify(config?.showAllowedRows)}`)
   }
   if (typeof appendSessionEvents !== 'boolean') {
     throw new TypeError(`dsh-allow: config appendSessionEvents must be a boolean, got ${JSON.stringify(appendSessionEvents)}`)
@@ -177,7 +177,7 @@ export function resolveConfig(config, home) {
     auditFile,
     audit: config?.audit !== false,
     appendSessionEvents,
-    auditAllows,
+    showAllowedRows,
     escalation,
     sessionGrantTtlMs,
     grants: grants.map(entry => configGrantRule(entry, home)),

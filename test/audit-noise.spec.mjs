@@ -32,9 +32,9 @@ check('an auto-review allow is kept', isAmbientAllow(allow('auto-review', [works
 check('a prompt is kept', isAmbientAllow({ decision: 'prompt', origin: 'rule', matchedRules: [workspaceRule] }, {}) === false)
 check('a denial is kept', isAmbientAllow({ decision: 'forbidden', origin: 'policy', matchedRules: [] }, {}) === false)
 
-console.log('the switch turns automatic allows back on')
-check('auditAllows restores workspace allows', isAmbientAllow(allow('rule', [workspaceRule]), { auditAllows: true }) === false)
-check('auditAllows restores baseline allows', isAmbientAllow(allow('baseline', []), { auditAllows: true }) === false)
+console.log('the switch renders automatic allows again')
+check('showAllowedRows restores workspace allows', isAmbientAllow(allow('rule', [workspaceRule]), { showAllowedRows: true }) === false)
+check('showAllowedRows restores baseline allows', isAmbientAllow(allow('baseline', []), { showAllowedRows: true }) === false)
 
 console.log(failures === 0 ? '\nPASS' : `\n${String(failures)} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

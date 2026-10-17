@@ -318,10 +318,10 @@ How much of the policy reaches the kernel is **probed** at the first call for ea
         action: list_plugins
 ```
 
-`auditAllows` defaults to false: a line is skipped when the baseline or a workspace or
-system rule already allows the call, which under `workspace-write` is nearly every call.
-User grants, one-shot grants, prompts, denials and auto-review verdicts are still recorded;
-set it to true to keep every automatic allow in the trail.
+`showAllowedRows` defaults to false. The audit file still holds every decision, automatic allows
+included; what is skipped is the session record, so an allow the baseline or a workspace or system
+rule already covers no longer renders as a row in the conversation. User grants, one-shot grants,
+prompts, denials and auto-review verdicts still show. Set it to true to see the automatic ones too.
 
 A `rules.json` written by dsh-allow 0.1 (the command-prefix model) reads as empty and is kept as `<rulesFile>.v2.bak` on the first write; those rules said nothing about filesystem capabilities and cannot be translated.
 

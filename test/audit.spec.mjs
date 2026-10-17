@@ -65,14 +65,16 @@ console.log('who answered a decision')
   await gate(exec('rm -rf build', { callId: 'o2' }), next)
   await gate(exec('rm -rf /System/Library/x', { callId: 'o3' }), next)
   const records = auditOf(file)
-  check('the automatic allow is too quiet to record',
-    records.every(entry => entry.decision !== 'allow'), JSON.stringify(records.map(r => r.decision)))
+  check('a command the baseline covers is recorded as such',
+    records[0]?.origin === 'baseline' && records[0]?.decision === 'allow', JSON.stringify(records[0]))
   check('a prompt the baseline cannot answer is still the baseline\'s',
-    records[0]?.origin === 'baseline' && records[0]?.decision === 'prompt', JSON.stringify(records[0]))
+    records[1]?.origin === 'baseline' && records[1]?.decision === 'prompt', JSON.stringify(records[1]))
   check('a platform-protected path is the policy\'s own refusal',
-    records[1]?.origin === 'policy' && records[1]?.decision === 'forbidden', JSON.stringify(records[1]))
+    records[2]?.origin === 'policy' && records[2]?.decision === 'forbidden', JSON.stringify(records[2]))
   check('every record names its session and call',
     records.every(entry => entry.sessionId === 's1' && typeof entry.callId === 'string'), JSON.stringify(records.map(r => [r.sessionId, r.callId])))
+  check('a baseline allow matches no user rule', Array.isArray(records[0]?.matchedRules) && records[0].matchedRules.length > 0
+    && records[0].matchedRules.every(rule => rule.source === 'system'), JSON.stringify(records[0]?.matchedRules))
 
   store.addRule(where.rulesFile, { path: `${WORKSPACE}/build`, recursive: true, access: { delete: true } })
   await gate(exec('rm -rf build', { callId: 'o4' }), next)
