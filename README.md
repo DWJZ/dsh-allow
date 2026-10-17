@@ -238,13 +238,9 @@ The event is log-only and carries the envelope's `ignorable` marker, so it never
     debugRows: true
 ```
 
-The host half publishes that switch to every served page as `__DSH_ALLOW_CONFIG__` (the same mechanism the shell uses for its own page settings), so the browser half reads configuration rather than browser state. With it off nothing is registered, which is what a policy layer that holds every workspace-write call should look like by default. With it on, the row renders beside the tool call in **Chat** and in the **Trajectory** ledger, where each origin has its own colour (`rule` green, `baseline` grey, `auto-review` blue, `human` amber, `policy` red) and every row leads with a symbol — `✅` allow once, `♾️` always allow, `🚫` denied, `↩️` cancelled, `⌛` no answerer, `📋` rule, `⚪` baseline, `🤖` auto review.
+The host half publishes that switch to every served page as `__DSH_ALLOW_CONFIG__` (the same mechanism the shell uses for its own page settings), so the browser half reads configuration rather than browser state. It is also editable at runtime: Settings → **Permissions** renders the same switch, the write goes through the config form into this profile's patch file, and the browser half subscribes to that form, so the rows appear or disappear without reloading the page. With it on, the row renders beside the tool call in **Chat** and in the **Trajectory** ledger, where each origin has its own colour (`rule` green, `baseline` grey, `auto-review` blue, `human` amber, `policy` red) and every row leads with a symbol — `✅` allow once, `♾️` always allow, `🚫` denied, `↩️` cancelled, `⌛` no answerer, `📋` rule, `⚪` baseline, `🤖` auto review.
 
-```js
-localStorage.setItem('dsh-allow:debug', '1')   // then reload the page
-```
-
-With it off nothing is registered, which is what a policy layer that holds every workspace-write call should look like by default. With it on, the row renders beside the tool call in **Chat** and in the **Trajectory** ledger, where each origin has its own colour (`rule` green, `baseline` grey, `auto-review` blue, `human` amber, `policy` red) and every row leads with a symbol — `✅` allow once, `♾️` always allow, `🚫` denied, `↩️` cancelled, `⌛` no answerer, `📋` rule, `⚪` baseline, `🤖` auto review.
+With it on, the row renders beside the tool call in **Chat** and in the **Trajectory** ledger, where each origin has its own colour (`rule` green, `baseline` grey, `auto-review` blue, `human` amber, `policy` red) and every row leads with a symbol — `✅` allow once, `♾️` always allow, `🚫` denied, `↩️` cancelled, `⌛` no answerer, `📋` rule, `⚪` baseline, `🤖` auto review.
 
 ## The macOS backend
 

@@ -77,6 +77,36 @@ const stubRequire = (specifier) => {
 }
 
 const client = captured.factory(stubRequire)
+{
+  // The client context answers only for services the module declared; any other property read
+  // throws exactly as the shell's proxy does. This is the failure that took the page down.
+  const declared = new Set(String(client.inject).split(','))
+  const strict = (values) => new Proxy(values, {
+    get(target, key) {
+      if (typeof key !== 'string') return target[key]
+      if (key in target) return target[key]
+      throw new Error(`cannot get property "${key}" without inject`)
+    },
+  })
+  let failed = null
+  const quietCtx = strict({
+    effect: (factory) => factory(),
+    locale: { register: () => () => {}, bind: () => (key) => key },
+    slots: { inject: (_name, factory) => factory(), register: () => () => {} },
+    sessions: { binding: () => undefined },
+    configForms: { get: () => ({ getSnapshot: () => ({ status: 'unavailable' }), subscribe: () => () => {}, set: () => Promise.resolve(false) }) },
+    uiConversation: { events: { register: () => () => {} } },
+  })
+  try { client.apply(quietCtx) } catch (cause) { failed = cause }
+  check('applying with only the declared services does not read a proxy it did not declare',
+    failed === null, String(failed?.message ?? ''))
+  check('and the declaration names each service the bundle reaches',
+    ['slots', 'locale', 'sessions', 'uiConversation', 'configForms'].every(name => declared.has(name)),
+    JSON.stringify([...declared]))
+}
+check('the bundle declares every service it reaches',
+  String(client.inject).includes('configForms') && String(client.inject).includes('uiConversation'),
+  JSON.stringify(client.inject))
 check('the factory exports apply', typeof client.apply === 'function')
 check('the factory exports inject', Array.isArray(client.inject) && client.inject.includes('slots'))
 
@@ -112,6 +142,10 @@ check('an absent interaction is not', client.isToolAsk(undefined) === false)
 
 console.log('apply')
 const registrations = []
+const writes = []
+const subscriptions = []
+// The live value the config form reports; the switch writes through the same form.
+let debugRowsOn = true
 const dictionaries = []
 const definitions = []
 const ctx = {
@@ -125,6 +159,17 @@ const ctx = {
     register: (options, component) => { registrations.push({ options, component }); return () => {} },
   },
   sessions: { binding: () => undefined },
+  configForms: {
+    get: (namespace) => {
+      const state = { status: 'ready', value: { debugRows: debugRowsOn }, writable: true, revision: 1 }
+      return {
+        namespace,
+        getSnapshot: () => state,
+        subscribe: (listener) => { subscriptions.push(listener); return () => {} },
+        set: (field, value) => { writes.push([field, value]); return Promise.resolve(true) },
+      }
+    },
+  },
   uiConversation: { events: { register: (definition) => { definitions.push(definition); return () => {} } } },
 }
 client.apply(ctx)
@@ -153,6 +198,7 @@ console.log('the debug switch decides whether decisions render')
   const savedWindow = globalThis.window
   const savedConfig = globalThis.__DSH_ALLOW_CONFIG__
   globalThis.__DSH_ALLOW_CONFIG__ = { debugRows: false }
+  debugRowsOn = false
   const quietSource = readFileSync(join(PLUGIN, 'client/client.js'), 'utf8')
   new Function(quietSource)()
   const quietModule = captured.factory((name) => (name === 'react' ? found : {}))
@@ -168,6 +214,7 @@ console.log('the debug switch decides whether decisions render')
   check('and the settings section still registers', true)
   globalThis.window = savedWindow
   globalThis.__DSH_ALLOW_CONFIG__ = savedConfig
+  debugRowsOn = true
 }
 
 console.log('the decision row')
