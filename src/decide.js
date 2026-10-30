@@ -17,7 +17,7 @@
  */
 import { effectsOf } from './effects.js'
 import {
-  baselineRules, canonicalPath, isUsableRule, protectedRefusal, resolveOperation, suggestGrants,
+  baselineRules, canonicalPath, capabilitiesOf, isUsableRule, protectedRefusal, resolveOperation, suggestGrants,
 } from './fspolicy.js'
 import { parseCommandLine } from './parse.js'
 
@@ -97,10 +97,16 @@ export function evaluateCommandLine(request) {
   const blocked = []
   for (const entry of derived.unknown) {
     if (entry.operation === null) continue
-    const resolved = resolveOperation({
-      path: workingDirectory, realPath: workingDirectory, operation: entry.operation, rules: allRules,
-    })
-    if (resolved.granted) usedRules.set(resolved.rule.id, resolved.rule)
+    // A run-time path can be an existing file or one this line creates, so the
+    // answer is every capability the operation expands to: one unanswered
+    // capability would leave the kernel to refuse the call after the gate let
+    // it through.
+    const resolved = capabilitiesOf(entry.operation).map(operation => resolveOperation({
+      path: workingDirectory, realPath: workingDirectory, operation, rules: allRules,
+    }))
+    if (resolved.every(result => result.granted)) {
+      for (const result of resolved) usedRules.set(result.rule.id, result.rule)
+    }
     else blocked.push(entry)
   }
   // Only a wholly opaque program — inline code, an unreadable shell program —
@@ -135,9 +141,14 @@ export function evaluateCommandLine(request) {
   }
 
   const unreachable = opaque.length > 0 && !deferred
+  // A blocked entry names an operation whose path the line computes, so what the
+  // card can grant is the capabilities themselves, at the working directory.
+  const blockedMissing = blocked.flatMap(entry => capabilitiesOf(entry.operation).map(operation => ({
+    operation, path: undefined, command: entry.command, computed: true,
+  })))
   const suggestions = suggestGrants(
     missing.length > 0 || blocked.length > 0
-      ? [...missing, ...blocked.map(entry => ({ operation: entry.operation, path: undefined }))]
+      ? [...missing, ...blockedMissing]
       : ['read', 'write', 'create', 'delete', 'execute'].map(operation => ({ operation })),
     { cwd },
   )
@@ -153,9 +164,7 @@ export function evaluateCommandLine(request) {
     decision: 'prompt',
     reason: why,
     effects: derived.effects,
-    missing: [...missing, ...blocked.map(entry => ({
-      operation: entry.operation, path: undefined, command: entry.command, computed: true,
-    }))],
+    missing: [...missing, ...blockedMissing],
     unknown: derived.unknown,
     suggestions,
     commands: derived.commands,

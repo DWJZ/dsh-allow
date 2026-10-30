@@ -87,6 +87,11 @@ result = derive('mv src/a.txt b.txt')
 check('mv deletes its source', pathsFor(result, 'delete').includes(canon('src/a.txt')))
 check('mv creates its target', pathsFor(result, 'create').includes(canon('b.txt')))
 
+result = derive('mv src/a.txt "$TARGET"')
+check('a computed target stays the change marker, for the policy to expand',
+  result.unknown.some(entry => entry.operation === 'change' && entry.path === null), JSON.stringify(result.unknown))
+check('and nothing is guessed as a capability', pathsFor(result, 'write').length === 0 && pathsFor(result, 'create').length === 0)
+
 console.log('reads')
 result = derive('cat README.md')
 check('cat reads its operand', pathsFor(result, 'read').includes(canon('README.md')))

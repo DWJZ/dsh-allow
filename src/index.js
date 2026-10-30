@@ -30,7 +30,7 @@ import { createReviewer } from './reviewer.js'
 import {
   addRule, addToolRule, clearRules, clearToolRules, countHit, countToolHit, createDecisionLog,
   createGrantStore, createPendingStore, readRules, readToolRules, redact, removeRule,
-  removeToolRule, resolveConfig, resolveHome,
+  removeToolRule, resolveConfig, resolveHome, validateRule,
 } from './store.js'
 
 /** Stable Cordis plugin name. */
@@ -782,38 +782,6 @@ export function createApprovalListener({ engine, pendings, grants = null, logger
   }
 }
 
-
-
-
-
-/** The card's view of one pending decision. */
-function pendingPayload(record) {
-  return {
-    ok: true,
-    rememberable: record.decision !== 'forbidden' && (record.suggestions ?? []).length > 0,
-    command: record.command,
-    cwd: record.cwd,
-    reason: record.reason,
-    mode: record.mode,
-    decision: record.decision,
-    missing: (record.missing ?? []).map(entry => ({
-      operation: entry.operation,
-      path: entry.path ?? '(computed at run time)',
-      label: `${entry.operation} ${entry.path ?? entry.command ?? ''}`.trim(),
-    })),
-    unknown: record.unknown ?? [],
-    suggestions: (record.suggestions ?? []).map(suggestion => ({
-      label: suggestion.label,
-      path: suggestion.path,
-      recursive: suggestion.recursive === true,
-      access: suggestion.access,
-    })),
-  }
-}
-
-
-
-
 /**
  * The `/allow log` view of one recorded decision.
  * @param record - one parsed audit-log record.
@@ -976,6 +944,14 @@ export function createRememberCall({ pendings, config, logger, decisions = null 
     const suggestions = record.suggestions ?? []
     if (suggestions.length === 0 || record.decision === 'forbidden') {
       return { ok: false, error: '这条命令无法被记住' }
+    }
+    // Check the whole set before writing any of it: storing them one by one used
+    // to leave the earlier rules on disk when a later one was refused, so the
+    // card reported a failure for a set that was half stored.
+    const refused = suggestions.map(suggestion => validateRule(suggestion))
+      .find(check => check.ok !== true)
+    if (refused !== undefined) {
+      return { ok: false, error: `${refused.reason}，这次只能用「允许一次」` }
     }
     // One button, and exactly the narrowest rules it named: no folder is opened
     // behind the user's back.

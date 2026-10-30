@@ -31,6 +31,20 @@ import { basename, dirname, normalize } from 'node:path'
 /** The five filesystem capabilities this policy speaks about. */
 export const OPERATIONS = Object.freeze(['read', 'write', 'create', 'delete', 'execute'])
 
+/**
+ * The capabilities a rule must grant to answer one derived effect operation.
+ *
+ * `change` never names a rule: the effects module uses it while a path is still
+ * unknown, when the line may be rewriting an existing file or creating a new
+ * one. The kernel separates the two, so both are required — a write-only grant
+ * would let the gate answer the line and then fail it with EPERM.
+ * @param operation - one operation from the effects module.
+ * @returns the capabilities in the rule vocabulary.
+ */
+export function capabilitiesOf(operation) {
+  return operation === 'change' ? ['write', 'create'] : [operation]
+}
+
 /** Precedence levels; the global default is one past the last level. */
 export const LEVELS = Object.freeze({ user: 1, workspace: 2, baseline: 3 })
 

@@ -200,6 +200,50 @@ check('remembering a stale approval is refused', answer.kind === 'error', JSON.s
 answer = runAllow('remember')
 check('remembering without a call id is a usage error', answer.kind === 'error', JSON.stringify(answer))
 
+console.log('always allow for a path the line computes')
+const OUTSIDE = `${HOME}/elsewhere`
+decision = await gate(exec('touch "$TARGET"', { callId: 'cc1', workdir: OUTSIDE }), next)
+check('a computed change outside the workspace asks', decision.kind === 'ask', JSON.stringify(decision))
+const computed = pendings.get('s1', 'cc1')
+check('and the card offers both capabilities, never the effect marker',
+  computed?.suggestions?.length === 1
+  && computed.suggestions[0].path === OUTSIDE
+  && computed.suggestions[0].access?.write === true
+  && computed.suggestions[0].access?.create === true
+  && computed.suggestions[0].access?.change === undefined,
+  JSON.stringify(computed?.suggestions))
+answer = runAllow('remember cc1')
+check('remembering it succeeds', answer.kind === 'success', JSON.stringify(answer))
+const computedRule = store.readRules(rulesFile).at(-1)
+check('and stores both capabilities on the working directory',
+  computedRule?.path === OUTSIDE && computedRule?.recursive === true
+  && computedRule?.access?.write === true && computedRule?.access?.create === true,
+  JSON.stringify(computedRule))
+decision = await gate(exec('touch "$TARGET"', { callId: 'cc2', workdir: OUTSIDE }), next)
+check('the same line no longer asks', decision.kind === 'allow', JSON.stringify(decision))
+
+console.log('a rule that grants nothing is refused before anything is written')
+const rulesBeforeEmpty = store.readRules(rulesFile).length
+pendings.remember('s1', 'c-empty', {
+  sessionId: 's1',
+  command: 'rm -rf "$DIR"',
+  cwd: CWD,
+  mode: 'workspace-write',
+  decision: 'prompt',
+  reason: 'filesystem permission required: delete(computed at run time)',
+  missing: [],
+  unknown: [],
+  suggestions: [
+    { path: `${HOME}/first`, recursive: false, access: { delete: true } },
+    { path: `${HOME}/second`, recursive: false, access: {} },
+  ],
+})
+answer = runAllow('remember c-empty')
+check('one empty suggestion fails the whole remember',
+  answer.kind === 'error' && answer.text.includes('没有授予任何权限'), JSON.stringify(answer))
+check('and the valid rule beside it was not written',
+  store.readRules(rulesFile).length === rulesBeforeEmpty, JSON.stringify(store.readRules(rulesFile)))
+
 console.log('allow once is the approval answer itself')
 const grantApproval = (callId, outcome) => host
   .createApprovalListener({ engine, pendings, grants, logger, config })

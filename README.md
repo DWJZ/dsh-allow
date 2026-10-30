@@ -153,7 +153,7 @@ Nothing is inferred from a program's name beyond that reading, and only the exec
 
 `python3 -c '…'`, `node -e '…'`, `eval` and a shell program the parser cannot reduce are not judged by their text and are not pinned to it. They are allowed only when the process sandbox can actually hold them to the policy: either the kernel fences all five capabilities — the `guarded` level does, because it withholds user-data reads, writes and executions — or the working directory already grants all five, so there is nothing left to withhold. Anything else — no `sandbox-exec`, a profile that would not apply, a mode that does not confine — makes them ask, with one button that grants the five capabilities for that directory.
 
-A computed path for a visible operation is different: `rm -rf "$DIR"` states a delete whose target cannot be checked, so it asks rather than riding on a grant. Once the operation is granted for the working directory the line stops asking, and the sandbox bounds the run-time path to what was opened.
+A computed path for a visible operation is different: `rm -rf "$DIR"` states a delete whose target cannot be checked, so it asks rather than riding on a grant. Once the operation is granted for the working directory the line stops asking, and the sandbox bounds the run-time path to what was opened. A computed target is also the one case that names no single capability: `touch`, `cp`, `mv`, `tee` and their kin may rewrite an existing file or create a new one, so the card offers `write` and `create` together — the kernel separates the two, and a write-only grant would pass the gate and then fail with EPERM.
 
 ## The card
 

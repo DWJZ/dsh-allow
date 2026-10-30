@@ -152,6 +152,26 @@ check('a grant for the working directory answers it', decision.decision === 'all
 decision = decide('rm -rf "$DIR"', { sessionRules: [rule(join(CWD, 'build'), { delete: true })] })
 check('a grant elsewhere does not', decision.decision === 'prompt', JSON.stringify(decision.reason))
 
+console.log('a computed change is granted as the capabilities the kernel separates')
+decision = decide('touch "$HOME/x"', { mode: 'read-only' })
+check('a computed change asks where nothing grants it', decision.decision === 'prompt', JSON.stringify(decision.reason))
+check('and offers both capabilities, never the effect marker',
+  decision.suggestions.length === 1
+  && decision.suggestions[0].path === CWD
+  && decision.suggestions[0].access?.write === true
+  && decision.suggestions[0].access?.create === true
+  && decision.suggestions[0].access?.change === undefined,
+  JSON.stringify(decision.suggestions))
+check('the missing list names only grantable capabilities',
+  decision.missing.every(entry => entry.operation !== 'change'), JSON.stringify(decision.missing))
+decision = decide('touch "$HOME/x"', { mode: 'read-only', sessionRules: [rule(CWD, { write: true, create: true })] })
+check('both capabilities answer it', decision.decision === 'allow', JSON.stringify(decision.reason))
+decision = decide('touch "$HOME/x"', { mode: 'read-only', sessionRules: [rule(CWD, { write: true })] })
+check('write alone does not: the kernel would still refuse the create',
+  decision.decision === 'prompt', JSON.stringify(decision.reason))
+decision = decide('touch "$HOME/x"')
+check('a writable workspace answers it without a card', decision.decision === 'allow', JSON.stringify(decision.reason))
+
 console.log('wrappers and chains')
 decision = decide('sudo rm -rf build')
 check('sudo does not hide the delete', decision.decision === 'prompt'
