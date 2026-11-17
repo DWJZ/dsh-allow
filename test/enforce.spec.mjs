@@ -54,6 +54,26 @@ check('and it withholds nothing less than everything', !profile.includes('(deny 
 check('the execute fence is present', profile.includes('(deny process-exec)'))
 check('system binaries stay executable', profile.includes('(allow process-exec (subpath "/usr/bin"))') || profile.includes('(allow process-exec (subpath "/bin"))'), profile)
 
+console.log('the harness runtime the fence starts')
+check('a desktop binary is granted through its bundle',
+  enforce.enclosingBundle('/Applications/Some App.app/Contents/MacOS/Some App') === '/Applications/Some App.app')
+check('a plain executable has no bundle', enforce.enclosingBundle('/opt/homebrew/bin/node') === null)
+const selfRule = enforce.hostRuntimeRule('/opt/homebrew/bin/node', HOME)
+check('and is granted read and execute for itself',
+  selfRule.recursive === false && selfRule.access.read === true && selfRule.access.execute === true, JSON.stringify(selfRule))
+const bundleRule = enforce.hostRuntimeRule('/Applications/Some App.app/Contents/MacOS/Some App', HOME)
+check('a bundle grant covers the subtree',
+  bundleRule.path === '/Applications/Some App.app' && bundleRule.recursive === true, JSON.stringify(bundleRule))
+profile = enforce.compileProfile({
+  mode: 'workspace-write',
+  workspaceRoot: WORKSPACE,
+  rules: [...workspaceRules, bundleRule],
+  capabilities: 'process',
+})
+check('the fence re-allows it after the deny',
+  profile.indexOf('(deny process-exec)') !== -1
+  && profile.indexOf('(deny process-exec)') < profile.indexOf('(allow process-exec (subpath "/Applications/Some App.app"))'), profile)
+
 profile = enforce.compileProfile({ mode: 'workspace-write', workspaceRoot: WORKSPACE, rules: workspaceRules, capabilities: 'writes' })
 check('a writes-only profile fences writes without fencing reads',
   profile.includes('(deny file-write*)') && !profile.includes('(deny file-read-data)') && !profile.includes('(deny process-exec)'), profile)

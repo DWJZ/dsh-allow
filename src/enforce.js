@@ -34,7 +34,8 @@
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { OPERATIONS, baselineRules } from './fspolicy.js'
+import { homedir } from 'node:os'
+import { OPERATIONS, baselineRules, canonicalPath } from './fspolicy.js'
 import { seatbeltProfile } from './macos.js'
 import { readRules } from './store.js'
 
@@ -83,6 +84,44 @@ export function commandOfArgv(argv) {
   const flagIndex = argv.findIndex((token, index) => index > 0 && /^-[A-Za-z]*c[A-Za-z]*$/u.test(String(token)))
   if (flagIndex === -1) return null
   return typeof argv[flagIndex + 1] === 'string' ? argv[flagIndex + 1] : null
+}
+
+/**
+ * The bundle a desktop executable lives in, if any:
+ * `/Applications/X.app/Contents/MacOS/X` → `/Applications/X.app`.
+ * @param executable - an absolute executable path.
+ * @returns the enclosing `.app` bundle, or null.
+ */
+export function enclosingBundle(executable) {
+  if (typeof executable !== 'string' || executable === '' || !executable.startsWith('/')) return null
+  const parts = executable.split('/')
+  const index = parts.findIndex(part => part.endsWith('.app'))
+  return index === -1 ? null : parts.slice(0, index + 1).join('/')
+}
+
+/**
+ * The rule that keeps the harness's own runtime startable under the fence.
+ *
+ * DSH starts its tool runtime as `process.execPath`. The platform baseline grants
+ * `/Applications` read only, so once `(deny process-exec)` is in place the harness
+ * cannot start the process it is already running inside, and every tool call fails
+ * before the command it belongs to. A desktop app binary is granted through its
+ * bundle because its helpers are started the same way.
+ *
+ * This is not extra authority: the fence itself runs inside that executable.
+ * @param executable - the harness executable; defaults to `process.execPath`.
+ * @param home - the home directory paths are canonicalized against.
+ * @returns the rule to append to a policy's rules.
+ */
+export function hostRuntimeRule(executable = process.execPath, home = homedir()) {
+  const bundle = enclosingBundle(executable)
+  return {
+    path: canonicalPath(bundle ?? executable, { cwd: '/', home }),
+    recursive: bundle !== null,
+    access: { read: true, execute: true },
+    source: 'system',
+    note: 'the harness runtime the fence itself starts',
+  }
 }
 
 /**
@@ -220,6 +259,15 @@ export function createEnforcer({
    * and root, the stored rules, and the one-shot grant that belongs to the
    * command this confinement is about to run.
    */
+  /**
+   * The host-runtime rule for this deployment, canonicalized once. The
+   * executable is the process this fence already lives in.
+   */
+  const hostRuntime = (() => {
+    let rule = null
+    return () => (rule ??= hostRuntimeRule(process.execPath, config.home))
+  })()
+
   const rulesFor = (policy, command) => [
     ...readRules(config.rulesFile),
     ...config.grants,
@@ -229,6 +277,9 @@ export function createEnforcer({
       home: config.home,
       mode: policy.mode,
     }),
+    // The harness starts its tool runtime as `process.execPath`; without this the
+    // fence denies the process it is protecting (see hostRuntimeRule).
+    hostRuntime(),
     ...grants.forCommand(policy.sessionId, command),
   ]
 
