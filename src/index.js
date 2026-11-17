@@ -1109,10 +1109,18 @@ export function apply(ctx, pluginConfig) {
   // The process fence is refined before anything can be judged against it, so
   // the first decision already knows what the kernel enforces.
   const enforcement = createEnforcer({ config, grants, logger: ctx.logger })
-  ctx.effect(() => {
-    enforcement.install(ctx)
-    return () => { enforcement.uninstall() }
-  }, 'dsh-allow: process fence')
+  // The sandbox provider may mount after this plugin: profile load order is not
+  // fixed, and `install()` wraps whatever provider is registered at that instant
+  // and never retries, so one early miss left the fence off for the rest of the
+  // process lifetime while the decision layer kept working. Waiting on the
+  // service instead of probing it once is the same shape the `settings` and
+  // `commands` injections below already use.
+  ctx.inject(['sandbox'], (sandboxCtx) => {
+    sandboxCtx.effect(() => {
+      enforcement.install(sandboxCtx)
+      return () => { enforcement.uninstall() }
+    }, 'dsh-allow: process fence')
+  })
   const engine = createEngine({ config, home, grants, pendings, ctx, enforcement })
   const reviewer = createReviewer({
     config,
